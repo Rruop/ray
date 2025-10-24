@@ -111,6 +111,7 @@ from ray._private.state import (  # noqa: E402,F401
     cluster_resources,
     available_resources,
 )
+# 这里引入 ray 常用的一些方法
 from ray._private.worker import (  # noqa: E402,F401
     LOCAL_MODE,
     SCRIPT_MODE,

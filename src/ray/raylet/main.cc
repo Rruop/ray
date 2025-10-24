@@ -179,6 +179,8 @@ absl::flat_hash_map<std::string, std::string> parse_node_labels(
 int main(int argc, char *argv[]) {
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
+// 如果是开发者，在源代码中设置默认值（C++ gflags 示例）：#include <gflags/gflags.h>
+// DEFINE_string(stdout_filepath, "/default/path/output.log", "Output file path");
   if (!FLAGS_stdout_filepath.empty()) {
     ray::StreamRedirectionOption stdout_redirection_options;
     stdout_redirection_options.file_path = FLAGS_stdout_filepath;
@@ -298,6 +300,7 @@ int main(int argc, char *argv[]) {
   absl::flat_hash_map<std::string, double> static_resource_conf;
   SetThreadName("raylet");
   // IO Service for node manager.
+  // main service 定义了个instrumented_io_context 类对象
   instrumented_io_context main_service{
       /*emit_metrics=*/RayConfig::instance().emit_main_service_metrics(),
       /*running_on_single_thread=*/true,
@@ -305,6 +308,7 @@ int main(int argc, char *argv[]) {
 
   // Ensure that the IO service keeps running. Without this, the service will exit as soon
   // as there is no more work to be processed.
+  // 构建通信进程，定义了一个 main_service_work 对象？
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
       main_service_work(main_service.get_executor());
 
@@ -1048,6 +1052,7 @@ int main(int argc, char *argv[]) {
 #else
   signals.add(SIGTERM);
 #endif
+// 注册 raylet 关闭句柄
   signals.async_wait(signal_handler);
 
   main_service.run();

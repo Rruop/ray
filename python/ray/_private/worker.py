@@ -1424,6 +1424,7 @@ def _maybe_modify_runtime_env(
 
 @PublicAPI
 @client_mode_hook
+# 这个是入口
 def init(
     address: Optional[str] = None,
     *,
@@ -1673,6 +1674,7 @@ def init(
     )
 
     # terminate any signal before connecting driver
+    # 允许方法中再去定义方法
     def sigterm_handler(signum, frame):
         sys.exit(signum)
 
@@ -1875,6 +1877,7 @@ def init(
             usage_lib.set_usage_stats_enabled_via_env_var(False)
 
         # Use a random port by not specifying Redis port / GCS server port.
+        # 创建 ray params 传入到底层
         ray_params = ray._private.parameter.RayParams(
             node_ip_address=_node_ip_address,
             driver_mode=driver_mode,
@@ -1908,6 +1911,8 @@ def init(
         # shutdown the node in the ray.shutdown call that happens in the atexit
         # handler. We still spawn a reaper process in case the atexit handler
         # isn't called.
+
+        # 关键点：启动ray的进程
         _global_node = ray._private.node.Node(
             ray_params=ray_params,
             head=True,

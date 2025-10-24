@@ -18,12 +18,22 @@ load("@rules_proto//proto:defs.bzl", "proto_library")
 load("@rules_python//python:defs.bzl", "py_binary", "py_library", "py_runtime", "py_runtime_pair")
 load("//bazel:ray.bzl", "COPTS", "PYX_COPTS", "PYX_SRCS", "ray_cc_library")
 
+# 导入各种 Bazel 规则和宏，
+# 举例：
+# load("@rules_cc//cc:defs.bzl", "cc_binary")
+#
+#cc_binary(
+#    name = "hello-world",
+#    srcs = ["hello-world.cc"],
+#)
+# BUILD 文件首先通过 load 函数将 @rules_cc//cc:defs.bzl 文件中的 cc_binary 函数导入，
+# 该函数用以定义构建 C++ 可执行文件的规则；而后调用 cc_binary 函数定义构建目标 (target) hello-world 的规则，其中参数 src 指定了源文件
 package(
     default_visibility = ["//visibility:public"],
 )
 
 # Hermetic python environment, currently only used for CI infra and scripts.
-
+# 定义 Python 3 运行时，使用 Python 3.9 解释器
 py_runtime(
     name = "python3_runtime",
     interpreter = python39,
@@ -31,6 +41,7 @@ py_runtime(
     visibility = ["//visibility:private"],
 )
 
+# 创建 Python 运行时对，只包含 Python 3，不包含 Python 2
 py_runtime_pair(
     name = "python_runtime_pair",
     py2_runtime = None,
@@ -76,6 +87,11 @@ config_setting(
     values = {"compilation_mode": "opt"},
 )
 
+# 定义不同编译器和编译模式的配置设置
+# msvc-cl: Microsoft Visual C++ 编译器
+# clang-cl: Clang 编译器（Windows 兼容模式）
+# opt: 优化编译模式
+
 bool_flag(
     name = "jemalloc_flag",
     build_setting_default = True,
@@ -87,6 +103,8 @@ config_setting(
     flag_values = {":jemalloc_flag": "true"},
 )
 
+# 定义 jemalloc 内存分配器的布尔标志，默认启用
+# 只在 Linux 平台上启用 jemalloc
 alias(
     name = "uv_file",
     actual = select({
@@ -95,6 +113,7 @@ alias(
         "//conditions:default": "@uv_x86_64-linux//:file",
     }),
 )
+# 根据平台选择合适的 uv（Python 包管理器）二进制文件
 
 # bazel run :refresh_compile_commands for compile_commands generation for clangd
 # https://github.com/hedronvision/bazel-compile-commands-extractor?tab=readme-ov-file#vscode - directions for clangd config
@@ -313,6 +332,17 @@ py_library(
     visibility = ["__subpackages__"],
 )
 
+# 这段代码定义了一个跨平台的文件包，将 Ray 的共享库文件（_raylet.so）打包为可重用的形式，并根据操作系统自动调整文件扩展名（在 Windows 上变为 _raylet.pyd）。这确保了 Ray 在不同系统上都能正确部署。
+
+# 这个配置将 Ray 的 C++ 后端共享库（_raylet.so）打包为一个可管理的单元。
+# 在构建过程中：
+# Linux/macOS: 文件将保持为 ray/_raylet.so。
+# Windows: 文件将重命名为 ray/_raylet.pyd，以匹配 Windows 的 Python 动态库格式。
+# 这有助于确保 Ray 在不同操作系统上都能正确加载其底层组件。
+
+# pkg_files：这是一个 Bazel 宏 或自定义规则（可能由 Ray 或其他库定义），用于创建文件包
+# name: 定义文件包的名称，这里是 "raylet_so_files"。其他目标可以依赖这个名称。
+# srcs: 指定要打包的文件列表。这里只有一个文件："python/ray/_raylet.so"（Ray 的 C++ 后端共享库）
 pkg_files(
     name = "raylet_so_files",
     srcs = ["python/ray/_raylet.so"],

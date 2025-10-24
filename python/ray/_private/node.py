@@ -331,10 +331,12 @@ class Node:
             self._ray_params.update_pre_selected_port()
 
         # Start processes.
+        # head 节点，启动进程
         if head:
             self.start_head_processes()
 
         if not connect_only:
+            # 启动 ray 进程
             self.start_ray_processes()
             # Wait for the node info to be available in the GCS so that
             # we know it's started up.
@@ -1351,6 +1353,7 @@ class Node:
         assert self._gcs_address is None
         assert self._gcs_client is None
 
+        # 启动 gcs_serer
         self.start_gcs_server()
         assert self.get_gcs_client() is not None
         self._write_cluster_info_to_kv()
@@ -1380,6 +1383,8 @@ class Node:
 
         if not self.head:
             # Get the system config from GCS first if this is a non-head node.
+
+            # 这个 raylet 是怎么生成和使用的
             gcs_options = ray._raylet.GcsClientOptions.create(
                 self.gcs_address,
                 self.cluster_id.hex(),
@@ -1430,7 +1435,7 @@ class Node:
 
         if self._ray_params.include_log_monitor:
             self.start_log_monitor()
-
+        # 启动 raylet 进程
         self.start_raylet(plasma_directory, fallback_directory, object_store_memory)
 
     def _get_system_processes_for_resource_isolation(self) -> str:

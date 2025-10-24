@@ -49,6 +49,7 @@ AUTOSCALER_PRIVATE_DIR = os.path.join("autoscaler", "_private")
 AUTOSCALER_V2_DIR = os.path.join("autoscaler", "v2")
 
 # Location of the raylet executables.
+# 这个 raylet.exe
 RAYLET_EXECUTABLE = os.path.join(
     RAY_PATH, "core", "src", "ray", "raylet", "raylet" + EXE_SUFFIX
 )
@@ -265,6 +266,7 @@ class ConsolePopen(subprocess.Popen):
             if flags_to_add:
                 kwargs[flags_key] = (kwargs.get(flags_key) or 0) | flags_to_add
             self._use_signals = kwargs[flags_key] & new_pgroup
+            # Python 接口启动进程
             super(ConsolePopen, self).__init__(*args, **kwargs)
 
 
@@ -1049,6 +1051,11 @@ def start_ray_process(
 def start_reaper(fate_share=None):
     """Start the reaper process.
 
+    这是一个轻量级进程，它只需
+    等待其父进程终止，然后终止其自身的
+    进程组。这使我们能够确保 Ray 进程始终
+    能够正确终止，只要该进程本身没有被 SIGKILL 信号触发
+
     This is a lightweight process that simply
     waits for its parent process to die and then terminates its own
     process group. This allows us to ensure that ray processes are always
@@ -1523,6 +1530,7 @@ def start_gcs_server(
     if stderr_filepath:
         stderr_file = open(os.devnull, "w")
 
+    # 传入命令
     process_info = start_ray_process(
         command,
         ray_constants.PROCESS_TYPE_GCS_SERVER,
