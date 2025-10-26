@@ -3627,6 +3627,9 @@ cdef class CoreWorker:
                 f" | PlacementGroupSchedulingStrategy"
                 f" | NodeAffinitySchedulingStrategy]")
 
+    # 在 SubmitTask 里面。生成一个 task id ，然后通过 BuildCommonTaskSpec 函数，
+    # 把 Task 所有信息封装成一个 TaskSpecification 实例。然后把这个 TaskSpecification
+    # 提交到 Task 的任务队列里面。
     def submit_task(self,
                     Language language,
                     FunctionDescriptor function_descriptor,
@@ -3695,6 +3698,7 @@ cdef class CoreWorker:
             current_c_task_id = current_task.native()
 
             with nogil:
+                #
                 return_refs = CCoreWorkerProcess.GetCoreWorker().SubmitTask(
                     ray_function, args_vector, task_options,
                     max_retries, retry_exceptions,

@@ -391,7 +391,7 @@ bool WorkerContext::ShouldReleaseResourcesOnBlockingCalls() const {
   return worker_type_ != WorkerType::DRIVER && !CurrentActorIsDirectCall() &&
          CurrentThreadIsMain();
 }
-
+// is_direct_call 是针对 Actor worker 的直接调用
 // TODO(edoakes): simplify these checks now that we only support direct call mode.
 bool WorkerContext::CurrentActorIsDirectCall() const {
   absl::ReaderMutexLock lock(&mutex_);

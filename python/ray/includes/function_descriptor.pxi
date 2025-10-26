@@ -181,6 +181,9 @@ cdef class PythonFunctionDescriptor(FunctionDescriptor):
                                         typed_descriptor.FunctionHash())
 
     @classmethod
+    """
+    PythonFunctionDescriptor 是用 cython 实现的的对 python 函数的封装，如下
+    """
     def from_function(cls, function, function_uuid):
         """Create a FunctionDescriptor from a function instance.
 

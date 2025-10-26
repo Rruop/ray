@@ -2370,6 +2370,9 @@ Status CoreWorker::SubmitActorTask(
   // The depth of the actor task is depth of the caller + 1
   // The caller is not necessarily the creator of the actor.
   int64_t depth = worker_context_->GetTaskDepth() + 1;
+  // 生成一个 task id ，然后通过 BuildCommonTaskSpec 函数，
+  // 把 Task 所有信息封装成一个 TaskSpecification 实例。
+  // 然后把这个 TaskSpecification 提交到 Task 的任务队列里面。
   BuildCommonTaskSpec(builder,
                       actor_handle->CreationJobID(),
                       actor_task_id,
@@ -2665,6 +2668,7 @@ std::unique_ptr<worker::ProfileEvent> CoreWorker::CreateProfileEvent(
       *task_event_buffer_, *worker_context_, options_.node_ip_address, event_name);
 }
 
+// 调用到这里？RunTaskExecutionLoop
 void CoreWorker::RunTaskExecutionLoop() {
   auto signal_checker = PeriodicalRunner::Create(task_execution_service_);
   if (options_.check_signals) {
@@ -2745,6 +2749,8 @@ Status CoreWorker::AllocateReturnObject(const ObjectID &object_id,
   return Status::OK();
 }
 
+// 上面描述了 Ray 是怎么封装 Python 代码成一个 hash 和 pickle 化了的代码。下面再看看 worker 是怎么调用这个代码的
+// Ray 的 Worker 执行部分的代码如下：
 Status CoreWorker::ExecuteTask(
     const TaskSpecification &task_spec,
     std::optional<ResourceMappingType> resource_ids,

@@ -12,6 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/*
+Client/Driver
+    │
+    ▼
+Raylet (Local Scheduler)
+    │
+    ▼
+GCS (Global Control Store)
+    │
+    ▼
+Redis/Other Storage Backend
+*/
+
 #include "ray/gcs/gcs_server.h"
 
 #include <memory>
@@ -213,11 +226,14 @@ void GcsServer::Start() {
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
   // Init KV Manager. This needs to be initialized first here so that
   // it can be used to retrieve the cluster ID.
+  // 1. 初始化 KV 管理器
   InitKVManager();
+  // 2. 异步加载 GCS 表数据
   gcs_init_data->AsyncLoad({[this, gcs_init_data] {
                               GetOrGenerateClusterId(
                                   {[this, gcs_init_data](ClusterID cluster_id) {
                                      rpc_server_.SetClusterId(cluster_id);
+                                     // 3. 初始化各个管理器
                                      DoStart(*gcs_init_data);
                                    },
                                    io_context_provider_.GetDefaultIOContext()});
@@ -262,10 +278,17 @@ void GcsServer::GetOrGenerateClusterId(
        io_context});
 }
 
+// 启动 gcs server, 3. 初始化各个管理器
 void GcsServer::DoStart(const GcsInitData &gcs_init_data) {
   InitClusterResourceScheduler();
+  // 1.节点管理 (GcsNodeManager),负责管理集群中的节点
+  // 负责管理集群中的节点
+  // 处理节点注册、心跳和故障检测
   InitGcsNodeManager(gcs_init_data);
   InitClusterLeaseManager();
+  // 资源管理 (GcsResourceManager)
+  // 管理集群资源
+  // 追踪节点资源使用情况
   InitGcsResourceManager(gcs_init_data);
   InitGcsHealthCheckManager(gcs_init_data);
   InitRaySyncer(gcs_init_data);
@@ -283,9 +306,15 @@ void GcsServer::DoStart(const GcsInitData &gcs_init_data) {
       metrics_.placement_group_creation_latency_in_ms_histogram,
       metrics_.placement_group_scheduling_latency_in_ms_histogram,
       metrics_.placement_group_count_gauge);
+
+  // 管理 Actor 的创建、销毁和重建
+  // 管理 Actor 的创建、销毁和重建
+  // 处理 Actor 调度和故障恢复
   InitGcsActorManager(
       gcs_init_data, metrics_.actor_by_state_gauge, metrics_.gcs_actor_by_state_gauge);
   InitGcsWorkerManager();
+
+  // 任务管理 (GcsTaskManager),管理任务的调度和执行
   InitGcsTaskManager(metrics_.task_events_reported_gauge,
                      metrics_.task_events_dropped_gauge,
                      metrics_.task_events_stored_gauge);
@@ -308,6 +337,7 @@ void GcsServer::DoStart(const GcsInitData &gcs_init_data) {
 
   // Start RPC server when all tables have finished loading initial
   // data.
+  // 4. 启动 RPC 服务
   rpc_server_.Run();
 
   periodical_runner_->RunFnPeriodically(
@@ -353,6 +383,10 @@ void GcsServer::Stop() {
 
 void GcsServer::InitGcsNodeManager(const GcsInitData &gcs_init_data) {
   RAY_CHECK(gcs_table_storage_ && gcs_publisher_);
+
+  // 节点管理 (GcsNodeManager) ： 负责管理集群中的节点
+  // 负责管理集群中的节点
+  // 处理节点注册、心跳和故障检测
   gcs_node_manager_ = std::make_unique<GcsNodeManager>(
       gcs_publisher_.get(),
       gcs_table_storage_.get(),
@@ -585,13 +619,16 @@ void GcsServer::InitGcsPlacementGroupManager(
       RayConfig::instance().gcs_max_active_rpcs_per_handler()));
 }
 
+// GCS 支持两种存储模式:
 GcsServer::StorageType GcsServer::GetStorageType() const {
   if (RayConfig::instance().gcs_storage() == kInMemoryStorage) {
     if (!config_.redis_address.empty()) {
       RAY_LOG(INFO) << "Using external Redis for KV storage: "
                     << BuildAddress(config_.redis_address, config_.redis_port);
+      // Redis 持久化存储
       return StorageType::REDIS_PERSIST;
     }
+    // // 内存存储
     return StorageType::IN_MEMORY;
   }
   if (RayConfig::instance().gcs_storage() == kRedisStorage) {
@@ -812,6 +849,7 @@ void GcsServer::InitGcsTaskManager(
       RayConfig::instance().gcs_max_active_rpcs_per_handler()));
 }
 
+// 事件监听机制
 void GcsServer::InstallEventListeners() {
   // Install node event listeners.
   gcs_node_manager_->AddNodeAddedListener(
@@ -837,6 +875,7 @@ void GcsServer::InstallEventListeners() {
         cluster_lease_manager_->ScheduleAndGrantLeases();
       },
       io_context_provider_.GetDefaultIOContext());
+  // 节点事件
   gcs_node_manager_->AddNodeRemovedListener(
       [this](const std::shared_ptr<const rpc::GcsNodeInfo> &node) {
         auto node_id = NodeID::FromBinary(node->node_id());
@@ -856,6 +895,7 @@ void GcsServer::InstallEventListeners() {
       io_context_provider_.GetDefaultIOContext());
 
   // Install worker event listener.
+  // Worker 事件
   gcs_worker_manager_->AddWorkerDeadListener(
       [this](const std::shared_ptr<rpc::WorkerTableData> &worker_failure_data) {
         auto &worker_address = worker_failure_data->worker_address();
@@ -879,6 +919,7 @@ void GcsServer::InstallEventListeners() {
       });
 
   // Install job event listeners.
+  // Job 事件
   gcs_job_manager_->AddJobFinishedListener([this](const rpc::JobTableData &job_data) {
     const auto job_id = JobID::FromBinary(job_data.job_id());
     gcs_task_manager_->OnJobFinished(job_id, job_data.end_time());

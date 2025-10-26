@@ -350,6 +350,7 @@ class RemoteFunction:
             not self._is_cross_language
             and self._last_export_cluster_and_job != worker.current_cluster_and_job
         ):
+            # 然后用 PythonFunctionDescriptor 来打包前后两个函数，PythonFunctionDescriptor 是用 cython 实现的的对 python 函数的封装
             self._function_descriptor = PythonFunctionDescriptor.from_function(
                 self._function, self._uuid
             )
@@ -362,6 +363,11 @@ class RemoteFunction:
             # independent of whether or not the function was invoked by the
             # first driver. This is an argument for repickling the function,
             # which we do here.
+            # 这里面注释说了一个内容。就是如果一个 Remote 调用了另外一个 Remote。那前面这个 Remote 是不是需要把后面这个包含进去。
+            # 如果放在一起，如果后面这个改变了，第一个也需要改变。
+            # 所以这里就处理成，第二个 Remote 是第一个的参数，叫做 pickled_function
+            # 后面的代码就是表达了这个意思。
+            # 首先把 pickled_function 用 pickle 来序列化。
             self._pickled_function = pickle_dumps(
                 self._function,
                 f"Could not serialize the function {self._function_descriptor.repr}",
@@ -472,6 +478,7 @@ class RemoteFunction:
         labels = task_options.get("_labels")
         label_selector = task_options.get("label_selector")
 
+        # 调用 f.remote() 提交这个计算任务。在 remote_function.py 的 _remote 函数里的 invocation ，如下:
         def invocation(args, kwargs):
             if self._is_cross_language:
                 list_args = cross_language._format_args(worker, args, kwargs)
@@ -486,8 +493,10 @@ class RemoteFunction:
                 assert (
                     not self._is_cross_language
                 ), "Cross language remote function cannot be executed locally."
+                # 调用了 Core Worker 的 SubmitTask
             object_refs = worker.core_worker.submit_task(
                 self._language,
+                # 里面的 _function_descriptor 就包含了刚才处理过的 python 函数代码
                 self._function_descriptor,
                 list_args,
                 name if name is not None else "",

@@ -1029,6 +1029,9 @@ class Worker:
 
         return values, debugger_breakpoint
 
+    # 每个Worker执行一个主循环main_loop，循环不断地接受任务，处理任务返回……
+    # 这部分代码见ray/python/ray/workers/default_worker.py。
+    # main_loop的代码如下
     def main_loop(self):
         """The main loop a worker runs to receive and execute tasks."""
 
@@ -2568,6 +2571,10 @@ def connect(
             driver_name = "INTERACTIVE MODE"
     elif not LOCAL_MODE:
         raise ValueError("Invalid worker mode. Expected DRIVER, WORKER or LOCAL.")
+    # SCRIPT_MODE：如果Worker是driver，且由Python脚本启动或者在shell中交互式运行的话，使用脚本模式。会打印任务失败信息。
+    # WORKER_MODE：如果Worker不是driver，只是slave的话，启动WORKER_MODE，不打印关于task的任何信息。
+    # PYTHON_MODE：如果要顺序运行或是调试，可以使用PYTHON_MODE，此时的Worker即是driver。此模式下，不会发送remote函数到调度器，而是直接以阻塞的形式执行。
+    # SILENT_MODE：测试的时候使用SILENT_MODE。不会打印error信息，因为许多测试时故意失败的。
 
     gcs_options = ray._raylet.GcsClientOptions.create(
         node.gcs_address,
