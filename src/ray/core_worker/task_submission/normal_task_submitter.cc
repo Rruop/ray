@@ -29,6 +29,9 @@
 namespace ray {
 namespace core {
 
+// Task 和 Actor 是两个核心概念
+// Task：表示一组被远程执行的函数，可以是无状态的（通过 function.remote() 调用），执行后会返回结果的引用（objectRefs）。任务是异步执行的，具有依赖关系和容错能力。
+// Actor：是一种有状态的计算任务，意味着它可以内部保存一些状态。Actor是通过 @ray.remote 装饰的类的实例，能够维护状态并封装方法。
 void NormalTaskSubmitter::SubmitTask(TaskSpecification task_spec) {
   RAY_CHECK(task_spec.IsNormalTask());
   RAY_LOG(DEBUG) << "Submit task " << task_spec.TaskId();
