@@ -475,6 +475,7 @@ Windows powershell users need additional escaping:
         else ""
     ),
 )
+# ray start 进行分析。该命令对应脚本中的 358 行 start 函数，通过 @click.option 添加对各种命令信息的支持
 @click.option(
     "--head",
     is_flag=True,
@@ -674,6 +675,9 @@ Windows powershell users need additional escaping:
     "Cgroup memory and cpu controllers be enabled for this cgroup. "
     "This option only works if --enable-resource-isolation is set.",
 )
+
+#Ray 中，命令行启动的起点对应的是 python/ray/scripts/scripts.py .该脚本中提供了对所有 ray 命令的执行入口。
+#以最核心的 ray start 进行分析。该命令对应脚本中的 start 函数。
 @add_click_logging_options
 @PublicAPI
 def start(
@@ -793,7 +797,7 @@ def start(
     has_ray_client = get_ray_client_dependency_error() is None
     if has_ray_client and ray_client_server_port is None:
         ray_client_server_port = 10001
-
+# 将数据通过 ray_params = ray.parameter.RayParams 构建为 ray 内部通用的参数，然后判断该命令是否为头节点启动命令
     ray_params = ray._private.parameter.RayParams(
         node_ip_address=node_ip_address,
         node_name=node_name if node_name else node_ip_address,
@@ -812,7 +816,7 @@ def start(
         num_gpus=num_gpus,
         resources=resources,
         labels=labels_dict,
-        autoscaling_config=autoscaling_config,
+        autoscaling_config=autoscaling_config,# 用于自动扩容相关配置，指向自动扩容相关 yaml 文件的路径
         plasma_directory=plasma_directory,
         object_spilling_directory=object_spilling_directory,
         huge_pages=False,
@@ -835,7 +839,7 @@ def start(
 
     if ray_constants.RAY_START_HOOK in os.environ:
         load_class(os.environ[ray_constants.RAY_START_HOOK])(ray_params, head)
-
+    # 然后判断该命令是否为头节点启动命令。如果为头节点，则第一步对参数信息进行相关校验
     if head:
         # Start head node.
 
@@ -874,7 +878,7 @@ def start(
             # not provided.
             num_redis_shards = len(redis_shard_ports)
 
-        # This logic is deprecated and will be removed later.
+        # This logic is deprecated and will be removed later.，这里的address 是 redis 的address
         if address is not None:
             cli_logger.warning(
                 "Specifying {} for external Redis address is deprecated. "
@@ -936,13 +940,13 @@ def start(
                     "Please specify a different port using the `--port`"
                     " flag of `ray start` command."
                 )
-
+        # 第二步通过 node = ray.node.Node(ray_params, head=True, shutdown_at_exit=block, spawn_reaper=block)启动头节点
         node = ray._private.node.Node(
             ray_params, head=True, shutdown_at_exit=block, spawn_reaper=block
         )
 
         bootstrap_address = node.address
-
+        # 第三步将结果输出到命令行中。
         # this is a noop if new-style is not set, so the old logger calls
         # are still in place
         cli_logger.newline()
@@ -1026,6 +1030,10 @@ def start(
                 )
         ray_params.gcs_address = bootstrap_address
     else:
+        # 如果不为头节点，则第一步对参数信息进行相关校验，然后等待连接 redis 服务并创建客户端
+        # (该步中创建客户端仅为校验同节点是否启动多个 worker).
+        # 第二步通过 ray.node.Node(ray_params, head=False, shutdown_at_exit=block, spawn_reaper=block) 启动工作节点。
+        # 第三步将结果输出到命令行中。
         # Start worker node.
         if not ray_constants.ENABLE_RAY_CLUSTER:
             cli_logger.abort(
@@ -1040,7 +1048,7 @@ def start(
                 f"`{ray_constants.ENABLE_RAY_CLUSTERS_ENV_VAR}=1` to proceed "
                 "anyway.",
             )
-
+        # start 函数所有节点最后都利用 ray.node.Node 进行启动，该脚本位于 python/ray/node.py. 构建函数在  __init__ 中。
         # Ensure `--address` flag is specified.
         if address is None:
             cli_logger.abort(

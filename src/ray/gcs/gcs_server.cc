@@ -220,7 +220,7 @@ GcsServer::GcsServer(const ray::gcs::GcsServerConfig &config,
 }
 
 GcsServer::~GcsServer() { Stop(); }
-
+// 在 src/ray/gcs/gcs_server/gcs_server.cc 中，void GcsServer::Start()函数执行以下过程：
 void GcsServer::Start() {
   // Load gcs tables data asynchronously.
   auto gcs_init_data = std::make_shared<GcsInitData>(*gcs_table_storage_);
