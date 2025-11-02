@@ -175,8 +175,9 @@ absl::flat_hash_map<std::string, std::string> parse_node_labels(
   }
   return labels;
 }
-
+// 同理分析，raylet 最终的源码入口路径为 src/ray/raylet/main.cc 的 main 函数，其执行过程如下
 int main(int argc, char *argv[]) {
+// 通过 gflags 工具对传入的参数进行预处理
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   if (!FLAGS_stdout_filepath.empty()) {
@@ -305,6 +306,7 @@ int main(int argc, char *argv[]) {
 
   // Ensure that the IO service keeps running. Without this, the service will exit as soon
   // as there is no more work to be processed.
+  // 构建通信进程 boost::asio::io_service::work work(main_service)
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
       main_service_work(main_service.get_executor());
 
@@ -323,7 +325,7 @@ int main(int argc, char *argv[]) {
   ray::gcs::GcsClientOptions client_options(FLAGS_gcs_address,
                                             cluster_id,
                                             /*allow_cluster_id_nil=*/false,
-                                            /*fetch_cluster_id_if_nil=*/false);
+ // 构建 GcsClientOptions 并通过 std::make_shared<ray::gcs::GcsClient>(client_options) 启动 gcs_client.                                           /*fetch_cluster_id_if_nil=*/false);
   gcs_client = std::make_unique<ray::gcs::GcsClient>(client_options, node_ip_address);
 
   RAY_CHECK_OK(gcs_client->Connect(main_service));
@@ -498,7 +500,8 @@ int main(int argc, char *argv[]) {
     int num_cpus = num_cpus_it != static_resource_conf.end()
                        ? static_cast<int>(num_cpus_it->second)
                        : 0;
-
+   //在异步读取过程中通过 raylet_config 初始化 RayConfig;
+   //从 RayConfig 中获取信息创建 node_manager_config 和 object_manager_config
     node_manager_config.raylet_config = *stored_raylet_config;
     node_manager_config.resource_config = ray::ResourceSet(static_resource_conf);
     RAY_LOG(DEBUG) << "Starting raylet with static resource configuration: "
@@ -964,6 +967,7 @@ int main(int argc, char *argv[]) {
         {ray::stats::VersionKey, kRayVersion},
         {ray::stats::NodeAddressKey, node_ip_address},
         {ray::stats::SessionNameKey, session_name}};
+    // 初始化监控 ray::stats::Init(global_tags, metrics_agent_port)
     ray::stats::Init(global_tags, metrics_agent_port, ray::WorkerID::Nil());
     metrics_agent_client = std::make_unique<ray::rpc::MetricsAgentClientImpl>(
         "127.0.0.1", metrics_agent_port, main_service, *client_call_manager);

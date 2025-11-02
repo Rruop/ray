@@ -55,7 +55,7 @@ class Node:
             ProcessInfo objects. All lists have length one except for the Redis
             server list, which has multiple.
     """
-
+# start 函数所有节点最后都利用 ray.node.Node 进行启动，该脚本位于 python/ray/node.py. 构建函数在  __init__ 中。
     def __init__(
         self,
         ray_params,
@@ -329,12 +329,14 @@ class Node:
             self.start_reaper_process()
         if not connect_only:
             self._ray_params.update_pre_selected_port()
-
+# 若为 head 节点，则调用 self.start_head_processes() 启动进程，
+# 然后创建 redis_client 并存储 head 节点 session_name,session_dir,temp_dir等信息。
         # Start processes.
         if head:
             self.start_head_processes()
 
         if not connect_only:
+            # 调用 self.start_ray_processes()启动进程
             self.start_ray_processes()
             # Wait for the node info to be available in the GCS so that
             # we know it's started up.
@@ -1350,12 +1352,15 @@ class Node:
         )
         assert self._gcs_address is None
         assert self._gcs_client is None
-
+        # 该函数内部通过 self.start_gcs_server(),
+        # self.start_monitor(),
+        # self.start_dashboard(require_dashboard) 四步启动对应进程。
         self.start_gcs_server()
         assert self.get_gcs_client() is not None
         self._write_cluster_info_to_kv()
 
         if not self._ray_params.no_monitor:
+            # self.start_monitor() 最终调用 ray.services.start_monitor启动监控进程，该进程同时负责自动扩容工作
             self.start_monitor()
 
         if self._ray_params.ray_client_server_port:

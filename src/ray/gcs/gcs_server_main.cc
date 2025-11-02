@@ -49,6 +49,7 @@ DEFINE_string(session_name, "", "session_name: The current Ray session name.");
 DEFINE_string(ray_commit, "", "The commit hash of Ray.");
 
 int main(int argc, char *argv[]) {
+  // 通过 gflags 工具对传入的参数进行预处理，读取参数并配置到 config_map 中
   gflags::ParseCommandLineFlags(&argc, &argv, true);
 
   if (!FLAGS_stdout_filepath.empty()) {
@@ -118,6 +119,7 @@ int main(int argc, char *argv[]) {
       "gcs_server_main_io_context");
   // Ensure that the IO service keeps running. Without this, the main_service will exit
   // as soon as there is no more work to be processed.
+  // 然后构建通信进程 boost::asio::io_service::work work(main_service)
   boost::asio::executor_work_guard<boost::asio::io_context::executor_type> work(
       main_service.get_executor());
 
@@ -128,6 +130,8 @@ int main(int argc, char *argv[]) {
                                             {ray::stats::VersionKey, kRayVersion},
                                             {ray::stats::NodeAddressKey, node_ip_address},
                                             {ray::stats::SessionNameKey, session_name}};
+
+  // 通过 ray::stats::Init 启动监控进程
   ray::stats::Init(global_tags, metrics_agent_port, ray::WorkerID::Nil());
 
   // Initialize event framework.
@@ -147,7 +151,8 @@ int main(int argc, char *argv[]) {
                       RayConfig::instance().event_level(),
                       RayConfig::instance().emit_event_to_log_file());
   }
-
+// 紧跟着构建 GCS_SERVER 参数 gcs_server_config
+// 并通过 ray::gcs::GcsServer gcs_server(gcs_server_config, main_service) 创建 GCS_SERVER 并注册关闭句
   ray::gcs::GcsServerConfig gcs_server_config;
   gcs_server_config.grpc_server_name = "GcsServer";
   gcs_server_config.grpc_server_port = gcs_server_port;
@@ -210,7 +215,8 @@ int main(int argc, char *argv[]) {
       storage_operation_latency_in_ms_histogram,
       /*storage_operation_count_counter=*/storage_operation_count_counter,
   };
-
+// 通过 gcs_server.Start() 启动 gcs_server 并通过 main_service.run()保持通信服务工作。
+// 在 src/ray/gcs/gcs_server/gcs_server.cc 中，void GcsServer::Start()函数执行以下过程：
   ray::gcs::GcsServer gcs_server(gcs_server_config, gcs_server_metrics, main_service);
 
   // Destroy the GCS server on a SIGTERM. The pointer to main_service is
