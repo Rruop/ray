@@ -3526,12 +3526,17 @@ def remote(
 
 
 @overload
+#@overload 装饰器：
+#这个装饰器来自 typing 模块，用于定义函数的重载版本。
+#它允许你为同一个函数名定义多个签名（参数类型组合），以便支持不同的参数类型。
+#在实际运行时，@overload 不会创建实际的函数调用，它仅用于类型检查（例如在IDE中提供代码补全和类型提示）。
+#这个意思是说明 overload
 def remote(
     __function: Callable[[T0, T1, T2, T3, T4, T5, T6, T7, T8, T9], R]
 ) -> RemoteFunction9[R, T0, T1, T2, T3, T4, T5, T6, T7, T8, T9]:
     ...
 
-
+# 在函数体中写 ... 表示这是一个占位符，实际的实现可能在其他地方。通常在文档或类型定义中使用。
 # Passing options
 @overload
 def remote(
@@ -3558,6 +3563,7 @@ def remote(
 
 
 @PublicAPI
+# remote 注解的入口
 def remote(
     *args, **kwargs
 ) -> Union[ray.remote_function.RemoteFunction, ray.actor.ActorClass]:
@@ -3787,6 +3793,38 @@ def remote(
     if len(args) == 1 and len(kwargs) == 0 and callable(args[0]):
         # This is the case where the decorator is just @ray.remote.
         # "args[0]" is the class or function under the decorator.
+        # 关键入口，不包含其他参数，只有 remote 方法/类
+        # @ray.remote  # 符合此条件
+        # def my_func():
         return _make_remote(args[0], {})
     assert len(args) == 0 and len(kwargs) > 0, ray_option_utils.remote_args_error_string
+
+    # 将关键字参数封装为 options
+    # 返回一个部分应用函数（通过 functools.partial 冻结 options）
+    # 等待后续传入目标函数时再调用 _make_remote
     return functools.partial(_make_remote, options=kwargs)
+
+
+# 无参数装饰器：
+# @ray.remote  # 相当于 ray.remote(my_func)
+# def my_func(): ...
+# 此时 ray.remote 被调用时，my_func 作为 唯一的位置参数 传入（即 args = (my_func,)）。
+#
+# 带参数装饰器：
+#  @ray.remote(num_gpus=1)  # 相当于 ray.remote(num_gpus=1)(my_func)
+#  def my_func(): ...
+#  ray.remote(num_gpus=1) 先返回一个 函数（例如 partial_obj）。
+# 当目标函数 my_func 被解释器传入时，会调用 partial_obj(my_func)。
+# 此时 my_func 才会作为位置参数传入，而之前的 num_gpus=1 是作为 配置参数 保存在 partial_obj 内部
+# 当调用 ray.remote(num_gpus=1) 时：
+# args = ()（无位置参数）
+# kwargs = {"num_gpus": 1}（有关键字参数）
+# 返回 functools.partial 对象：
+# 内部保存了 options = {"num_gpus": 1}。
+# 当目标函数 my_func 被传入时（在装饰器作用时）：
+# 调用 partial_obj(my_func) → 相当于 _make_remote(my_func, options={"num_gpus": 1})。
+# 此时 my_func 才作为 args[0] 传入，但已不在最初的 ray.remote 调用中。
+#
+#
+#
+#
