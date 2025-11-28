@@ -438,6 +438,7 @@ class StandardAutoscaler:
         )
 
         # Dict[NodeType, int], List[ResourceDict]
+        # 这里是根据 ray 集群去获取当前所需的worker 资源信息
         to_launch, unfulfilled = self.resource_demand_scheduler.get_nodes_to_launch(
             self.non_terminated_nodes.all_node_ids,
             self.pending_launches.breakdown(),

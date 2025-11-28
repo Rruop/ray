@@ -28,11 +28,11 @@ SUPPORTED_PYTHONS = [(3, 9), (3, 10), (3, 11), (3, 12), (3, 13)]
 # in WORKSPACE file as well.
 
 ROOT_DIR = os.path.dirname(__file__)
-BUILD_CORE = os.getenv("RAY_BUILD_CORE", "1") == "1"
-BUILD_JAVA = os.getenv("RAY_INSTALL_JAVA", "0") == "1"
-BUILD_CPP = os.getenv("RAY_DISABLE_EXTRA_CPP") != "1"
-BUILD_REDIS = os.getenv("RAY_BUILD_REDIS", "1") == "1"
-SKIP_BAZEL_BUILD = os.getenv("SKIP_BAZEL_BUILD") == "1"
+BUILD_CORE = os.getenv("RAY_BUILD_CORE", "1") == "1" #编译 C++ 核心
+BUILD_JAVA = os.getenv("RAY_INSTALL_JAVA", "0") == "1" #默认不编译 Java
+BUILD_CPP = os.getenv("RAY_DISABLE_EXTRA_CPP") != "1"#编译额外 C++ 代码
+BUILD_REDIS = os.getenv("RAY_BUILD_REDIS", "1") == "1"#编译 Redis
+SKIP_BAZEL_BUILD = os.getenv("SKIP_BAZEL_BUILD") == "1"#跳过 Bazel 构建
 BAZEL_ARGS = os.getenv("BAZEL_ARGS")
 BAZEL_LIMIT_CPUS = os.getenv("BAZEL_LIMIT_CPUS")
 
@@ -148,6 +148,11 @@ else:
 # manually.
 
 # NOTE: The lists below must be kept in sync with ray/BUILD.bazel.
+#     # C++ 编译产物
+#    "ray/_raylet.pyd/.so",              # ✅ Cython 扩展（核心！）
+#    "ray/core/src/ray/gcs/gcs_server",  # ✅ GCS 服务器
+#    "ray/core/src/ray/raylet/raylet",   # ✅ Raylet（Worker 节点）
+#
 ray_files = [
     "ray/_raylet" + pyd_suffix,
     "ray/core/src/ray/gcs/gcs_server" + exe_suffix,
@@ -224,6 +229,7 @@ ray_files += [
 # If you're adding dependencies for ray extras, please
 # also update the matching section of requirements/requirements.txt
 # in this directory
+# 2️⃣ 收集文件列表
 if setup_spec.type == SetupType.RAY:
     pandas_dep = "pandas >= 1.3"
     numpy_dep = "numpy >= 1.20"
@@ -536,7 +542,11 @@ if is_conda_forge_build and is_native_windows_or_msys():
 
 
 def build(build_python, build_java, build_cpp, build_redis):
+    """
+    使用 Bazel 编译 Ray 的 C++/Java 组件
+    """
     if tuple(sys.version_info[:2]) not in SUPPORTED_PYTHONS:
+        # 1️⃣ 检查 Python 版本
         msg = (
             "Detected Python version {}, which is not supported. "
             "Only Python {} are supported."
@@ -546,7 +556,9 @@ def build(build_python, build_java, build_cpp, build_redis):
         )
         raise RuntimeError(msg)
 
+    # 2️⃣ 检查 Windows 平台
     if is_invalid_windows_platform():
+          # 必须是原生 Python，不能是 MinGW/Cygwin
         msg = (
             "Please use official native CPython on Windows,"
             " not Cygwin/MSYS/MSYS2/MinGW/etc.\n"
@@ -559,6 +571,7 @@ def build(build_python, build_java, build_cpp, build_redis):
     # TODO(ray-core, ray-ci): the version of these vendored packages should be
     # pinned, so that the build is reproducible.
     if not os.getenv("SKIP_THIRDPARTY_INSTALL_CONDA_FORGE"):
+        # 3️⃣ 安装第三方依赖到 vendored 目录
         pip_packages = ["psutil", "colorama"]
         subprocess.check_call(
             [
@@ -587,7 +600,8 @@ def build(build_python, build_java, build_cpp, build_redis):
             ]
             + runtime_env_agent_pip_packages
         )
-
+ 
+    # 4️⃣ 准备 Bazel 编译目标
     bazel_targets = []
     if build_python:
         bazel_targets.append("//:gen_ray_pkg")
@@ -601,6 +615,7 @@ def build(build_python, build_java, build_cpp, build_redis):
     if not bazel_targets:
         return
 
+    # 5️⃣ 配置 Bazel 环境和标志
     bazel_env = os.environ.copy()
     bazel_env["PYTHON3_BIN_PATH"] = sys.executable
 
@@ -666,8 +681,11 @@ def build(build_python, build_java, build_cpp, build_redis):
     if setup_spec.build_type == BuildType.TSAN:
         bazel_flags.append("--config=tsan")
 
+    # 6️⃣ 执行 Bazel 编译
     bazel_bin = _find_bazel_bin()
     # Build all things first.
+
+    # 先编译
     subprocess.check_call(
         [bazel_bin]
         + bazel_precmd_flags
@@ -678,6 +696,7 @@ def build(build_python, build_java, build_cpp, build_redis):
         env=bazel_env,
     )
     # Then run the actions.
+    # 再执行 action（生成文件）
     for action in bazel_targets:
         subprocess.check_call(
             [bazel_bin] + bazel_precmd_flags + ["run"] + bazel_flags + [action],
@@ -699,6 +718,28 @@ def _walk_thirdparty_dir(directory):
 
 
 def copy_file(target_dir, filename, rootdir):
+    """
+    参数：
+    target_dir - 目标目录（来自 build_ext.build_lib）
+                 例如：/path/to/build/lib
+    filename - 要复制的文件
+    rootdir - 源代码根目录
+    """
+
+
+# build_ext.build_lib 是 setuptools 的标准属性
+# 它指向构建输出目录
+
+# 当执行 pip install -e . 时：
+# build_ext.build_lib = /Users/franke/Desktop/git/ray/python/build/lib
+
+# 当执行 python setup.py build_ext --inplace 时：
+# build_ext.build_lib = /Users/franke/Desktop/git/ray/python/ray
+
+# 可以通过环境变量或命令行参数控制：
+# python setup.py build_ext --build-lib=/custom/path
+
+
     # TODO(rkn): This feels very brittle. It may not handle all cases. See
     # https://github.com/apache/arrow/blob/master/python/setup.py for an
     # example.
@@ -719,17 +760,26 @@ def copy_file(target_dir, filename, rootdir):
 
 
 def pip_run(build_ext):
+    # 1️⃣ 执行 Bazel 编译
     if SKIP_BAZEL_BUILD or setup_spec.build_type == BuildType.DEPS_ONLY:
-        build(False, False, False, False)
+        build(False, False, False, False) # 最小编译
     else:
-        build(BUILD_CORE, BUILD_JAVA, BUILD_CPP, BUILD_REDIS)
+        build(BUILD_CORE, BUILD_JAVA, BUILD_CPP, BUILD_REDIS) # 完整编译, 这会执行 Bazel，生成 .so/.pyd 文件
 
+    # 2️⃣ 收集文件列表
     if setup_spec.type == SetupType.RAY:
         if setup_spec.build_type == BuildType.DEPS_ONLY:
             setup_spec.files_to_include = []
             return
+        # 添加编译产物
         setup_spec.files_to_include += ray_files
+        # 包括：
+        # - ray/_raylet.so
+        # - ray/core/src/ray/gcs/gcs_server
+        # - ray/core/src/ray/raylet/raylet
+        # - ray/autoscaler/ 配置文件
 
+        # 添加第三方依赖
         thirdparty_dir = os.path.join(ROOT_DIR, THIRDPARTY_SUBDIR)
         setup_spec.files_to_include += _walk_thirdparty_dir(thirdparty_dir)
 
@@ -741,16 +791,18 @@ def pip_run(build_ext):
         )
 
         # Copy over the autogenerated protobuf Python bindings.
+        # 添加 protobuf 生成的文件
         for directory in generated_python_directories:
             for filename in os.listdir(directory):
                 if filename[-3:] == ".py":
                     setup_spec.files_to_include.append(
                         os.path.join(directory, filename)
                     )
-
+    # 3️⃣ 复制文件到构建输出目录
     copied_files = 0
     for filename in setup_spec.files_to_include:
-        copied_files += copy_file(build_ext.build_lib, filename, ROOT_DIR)
+        # ✅ 核心：使用 build_ext.build_lib 作为目标目录
+        copied_files += copy_file(build_ext.build_lib, filename, ROOT_DIR)# ← 从 build_ext 对象获取
     print("# of files copied to {}: {}".format(build_ext.build_lib, copied_files))
 
 
@@ -759,6 +811,7 @@ if __name__ == "__main__":
     import setuptools.command.build_ext
 
     class build_ext(setuptools.command.build_ext.build_ext):
+        # run 方法
         def run(self):
             return pip_run(self)
 

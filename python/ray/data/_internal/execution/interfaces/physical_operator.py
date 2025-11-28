@@ -161,7 +161,7 @@ class DataOpTask(OpTask):
                     "metadata. So, if we have a reference to metadata but not the "
                     "block, it means there's an error in the implementation."
                 )
-
+                # 这里是通过 generator 去获取结果输出的 block Ref
                 try:
                     self._pending_block_ref = self._streaming_gen._next_sync(
                         timeout_s=0
@@ -175,7 +175,7 @@ class DataOpTask(OpTask):
                     # The generator currently doesn't have new output.
                     # And it's not stopped yet.
                     break
-
+                # 调用回调函数
                 self._block_ready_callback(self._pending_block_ref)
 
             if self._pending_meta_ref.is_nil():

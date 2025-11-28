@@ -205,11 +205,14 @@ class Node:
         # It creates a session_dir.
         self._init_temp()
 
+        #
+
         node_ip_address = ray_params.node_ip_address
         if node_ip_address is None:
             if connect_only:
                 node_ip_address = self._wait_and_get_for_node_address()
             else:
+                # 这里最终调用的是 services 里面的 get_node_ip_address
                 node_ip_address = ray.util.get_node_ip_address()
 
         assert node_ip_address is not None
@@ -664,6 +667,7 @@ class Node:
         return self._gcs_client
 
     def _init_gcs_client(self):
+        # 获取 gcs client
         if self.head:
             gcs_process = self.all_processes[ray_constants.PROCESS_TYPE_GCS_SERVER][
                 0
@@ -677,6 +681,7 @@ class Node:
             gcs_address = None
             last_ex = None
             try:
+                # 这里获取到 gcs address
                 gcs_address = self.gcs_address
                 client = GcsClient(
                     address=gcs_address,
@@ -1148,6 +1153,7 @@ class Node:
         # e.g. https://github.com/ray-project/ray/issues/15780
         # TODO(mwtian): figure out a way to use 127.0.0.1 for local connection
         # when possible.
+        # 这里启动 gcs client 之后，建立连接
         self._gcs_address = build_address(self._node_ip_address, gcs_server_port)
 
     def start_raylet(

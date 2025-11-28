@@ -68,6 +68,7 @@ def run_kuberay_autoscaler(cluster_name: str, cluster_namespace: str):
     )
 
     gcs_client = GcsClient(ray_address)
+    # 看着这里是入口
     if is_autoscaler_v2(fetch_from_server=True, gcs_client=gcs_client):
         from ray.autoscaler.v2.monitor import AutoscalerMonitor as MonitorV2
 

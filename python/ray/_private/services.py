@@ -240,7 +240,7 @@ def propagate_jemalloc_env_var(
         env_vars.update({"MALLOC_CONF": jemalloc_conf})
     return env_vars
 
-
+# Python 里面是这样继承的，ConsolePopen 是继承 subprocess.Popen
 class ConsolePopen(subprocess.Popen):
     if sys.platform == "win32":
 

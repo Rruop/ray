@@ -381,6 +381,7 @@ class Monitor:
             except Exception:
                 logger.exception("Error parsing resource requests")
 
+    # 入口1
     def _run(self):
         """Run the monitor loop."""
 
@@ -593,7 +594,7 @@ class Monitor:
         except Exception:
             logger.exception("Monitor: Failure in signal handler.")
         sys.exit(sig + 128)
-
+    # 入口2
     def run(self):
         # Register signal handlers for autoscaler termination.
         # Signals will not be received on windows
@@ -619,7 +620,7 @@ def log_resource_batch_data_if_desired(
         logger.info(resources_batch_data)
         logger.info("Done logging raw resource message.")
 
-
+# monito人执行
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=("Parse GCS server for the monitor to connect to.")

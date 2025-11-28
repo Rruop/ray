@@ -173,11 +173,11 @@ if __name__ == "__main__":
     # Link all packages using a for loop
     for package, local_path in packages_to_link.items():
         do_link(
-            package,
-            force=args.yes,
-            skip_list=args.skip,
-            allow_list=args.allow,
-            local_path=local_path,
+            package, # 要链接的包名（在已安装Ray中的路径）
+            force=args.yes, # 强制模式（跳过所有确认）
+            skip_list=args.skip, # 要跳过的包列表
+            allow_list=args.allow, # 仅允许的包列表（与skip_list互斥）
+            local_path=local_path,  # 本地源码的路径
         )
 
     if args.extras is not None:
