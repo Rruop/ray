@@ -27,5 +27,3 @@ source/_static/versions.json
 
 # Ignore rllib generated files
 source/rllib/package_ref/
-
-doc/data/MNIST/raw/train-images-idx3-ubyte
