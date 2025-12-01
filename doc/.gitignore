@@ -30,3 +30,5 @@ source/rllib/package_ref/
 
 # Ignore generated collections
 source/_collections/
+
+doc/data/MNIST/raw/train-images-idx3-ubyte
