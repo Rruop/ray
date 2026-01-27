@@ -14,14 +14,7 @@ from ray.data._internal.execution.interfaces import (
 )
 from ray.data._internal.logging import configure_logging
 from ray.data.context import DataContext, DatasetContext
-from ray.data.dataset import (
-    Dataset,
-    Schema,
-    SinkMode,
-    ClickHouseTableSettings,
-    SaveMode,
-)
-from ray.data.stats import DatasetSummary
+from ray.data.dataset import Dataset, Schema, SinkMode, ClickHouseTableSettings
 from ray.data.datasource import (
     BlockBasedFileDatasink,
     Datasink,
@@ -29,11 +22,12 @@ from ray.data.datasource import (
     FileShuffleConfig,
     ReadTask,
     RowBasedFileDatasink,
+    SaveMode,
 )
 from ray.data.iterator import DataIterator, DatasetIterator
 from ray.data.preprocessor import Preprocessor
 from ray.data.read_api import (  # noqa: F401
-    KafkaAuthConfig,  # noqa: F401
+    KafkaAuthConfig,
     from_arrow,
     from_arrow_refs,
     from_blocks,
@@ -129,7 +123,6 @@ __all__ = [
     "Dataset",
     "DataContext",
     "DatasetContext",  # Backwards compatibility alias.
-    "DatasetSummary",
     "DataIterator",
     "DatasetIterator",  # Backwards compatibility alias.
     "Datasink",
@@ -140,9 +133,9 @@ __all__ = [
     "NodeIdStr",
     "ReadTask",
     "RowBasedFileDatasink",
+    "SaveMode",
     "Schema",
     "SinkMode",
-    "SaveMode",
     "TaskPoolStrategy",
     "from_daft",
     "from_dask",
@@ -181,6 +174,7 @@ __all__ = [
     "read_numpy",
     "read_mongo",
     "read_parquet",
+    "read_parquet_bulk",
     "read_snowflake",
     "read_sql",
     "read_tfrecords",

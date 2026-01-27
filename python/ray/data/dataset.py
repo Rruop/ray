@@ -126,6 +126,9 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.widgets import Template
 from ray.widgets.util import repr_with_fallback
 
+from ray.data._internal.datasource.utils.serializer import Serializer
+from ray.data._internal.datasource.kafka_datasink import KafkaDatasink
+
 if TYPE_CHECKING:
     import daft
     import dask
@@ -5308,6 +5311,74 @@ class Dataset:
 
         self.write_datasink(
             datasink,
+            ray_remote_args=ray_remote_args,
+            concurrency=concurrency,
+        )
+
+    @ConsumptionAPI(pattern="Time complexity:")
+    def write_kafka(
+        self,
+        topic: str,
+        bootstrap_servers: str,
+        key_fn: Optional[Callable[[Dict[str, Any]], Optional[bytes]]] = None,
+        serializer: Optional[Serializer] = None,
+        topic_schema_message_type: Optional[str] = None,
+        headers_fn: Optional[
+            Callable[[Dict[str, Any]], Optional[Iterable[Tuple[str, bytes]]]]
+        ] = None,
+        producer_config: Optional[Dict[str, Any]] = None,
+        kafka_auth_config: Optional[Any] = None,
+        ray_remote_args: Dict[str, Any] = None,
+        concurrency: Optional[int] = None,
+    ) -> None:
+        """Write the dataset to a Kafka topic.
+
+        Time complexity: O(dataset size / parallelism)
+
+        Example:
+            >>> ds = ray.data.range(100)
+            >>> ds.write_kafka("my-topic", "localhost:9092")
+        Returns:
+            Write statistics
+        Args:
+            topic: The Kafka topic to write to.
+            bootstrap_servers: A comma-separated list of Kafka bootstrap servers.
+            key_fn: A function that takes in a record and returns the key as bytes.
+                If None, messages will be sent without keys.
+            serializer: A :class:`~ray.data.io.Serializer` used to serialize records
+                before sending to Kafka. If None, the default JSON serializer is used.
+            topic_schema_message_type: Topic schema binding message type to load serializer
+                from topic schema if serializer is None. Only used if serializer is None.
+            headers_fn: A function that takes in a record and returns an iterable of
+                key-value pairs to be used as headers. If None, messages will be sent
+                without headers.
+            producer_config: Additional configuration options for the Kafka producer.
+                See `KafkaProducer
+                <https://kafka-python.readthedocs.io/en/master/apidoc/KafkaProducer.html>`_
+                for more details.
+            kafka_auth_config: Authentication configuration for Kafka. The type of this
+                parameter depends on the authentication method used. Refer to the
+                `kafka-python documentation
+                <https://kafka-python.readthedocs.io/en/master/usage.html#authentication>`_
+                for more details.
+            ray_remote_args: Kwargs passed to :func:`ray.remote` in the write tasks.
+            concurrency: The maximum number of Ray tasks to run concurrently. Set this
+                to control number of tasks to run concurrently. This doesn't change the
+                total number of tasks run. By default, concurrency is dynamically
+                decided based on the available resources.
+        """
+        sink = KafkaDatasink(
+            topic=topic,
+            bootstrap_servers=bootstrap_servers,
+            key_fn=key_fn,
+            serializer=serializer,
+            topic_schema_message_type=topic_schema_message_type,
+            headers_fn=headers_fn,
+            producer_config=producer_config,
+            kafka_auth_config=kafka_auth_config,
+        )
+        self.write_datasink(
+            sink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
         )

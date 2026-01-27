@@ -6,10 +6,11 @@ import pytest
 import ray
 from ray.data._internal.datasource.kafka_datasource import (
     KafkaAuthConfig,
-    _add_authentication_to_config,
+    add_authentication_to_config,
     _build_consumer_config_for_discovery,
     _build_consumer_config_for_read,
 )
+from ray.data._internal.datasource.utils.serializer import Serializer
 
 pytest.importorskip("kafka")
 
@@ -46,14 +47,39 @@ def kafka_producer(bootstrap_server):
     producer.close()
 
 
+def _unique_topic(prefix: str) -> str:
+    return f"{prefix}-{int(time.time() * 1000)}"
+
+
+def _consume_kafka_messages(bootstrap_server, topic, expected_count):
+    from kafka import KafkaConsumer
+
+    consumer = KafkaConsumer(
+        topic,
+        bootstrap_servers=[bootstrap_server],
+        auto_offset_reset="earliest",
+        enable_auto_commit=False,
+        consumer_timeout_ms=5000,
+        value_deserializer=lambda v: v,
+        key_deserializer=lambda k: k,
+    )
+    try:
+        messages = list(consumer)
+    finally:
+        consumer.close()
+
+    assert len(messages) == expected_count
+    return messages
+
+
 def test_add_authentication_to_config():
     """Test authentication config passthrough with all kafka-python auth parameters."""
     # Test empty authentication
     config = {}
-    _add_authentication_to_config(config, None)
+    add_authentication_to_config(config, None)
     assert config == {}
 
-    _add_authentication_to_config(config, {})
+    add_authentication_to_config(config, {})
     assert config == {}
 
     # Test all authentication parameters at once
@@ -83,7 +109,7 @@ def test_add_authentication_to_config():
         ssl_crlfile="/path/to/crl.pem",
     )
 
-    _add_authentication_to_config(config, kafka_auth_config)
+    add_authentication_to_config(config, kafka_auth_config)
 
     # Verify all parameters are passed through correctly
     assert config["security_protocol"] == "SASL_SSL"
@@ -431,6 +457,112 @@ def test_read_kafka_invalid_offsets(
         )
         ds.take_all()
 
+
+def test_write_kafka_datasink_basic(bootstrap_server, ray_start_regular_shared):
+    topic = _unique_topic("test-datasink-basic")
+
+    items = [{"id": i, "key": f"key-{i}", "value": f"value-{i}"} for i in range(25)]
+    ds = ray.data.from_items(items)
+    ds = ds.repartition(2).materialize()
+
+    ds.write_kafka(
+        topic=topic,
+        bootstrap_servers=[bootstrap_server],
+        key_fn=lambda row: row["key"].encode("utf-8"),
+    )
+
+    time.sleep(1)
+    messages = _consume_kafka_messages(bootstrap_server, topic, len(items))
+
+    first = messages[0]
+    assert first.topic == topic
+    assert isinstance(first.key, bytes)
+    payload = json.loads(first.value.decode("utf-8"))
+    assert "id" in payload
+    assert "key" in payload
+    assert "value" in payload
+
+
+def test_write_kafka_datasink_with_headers(
+    bootstrap_server, ray_start_regular_shared
+):
+    topic = _unique_topic("test-datasink-headers")
+
+    items = [
+        {"id": i, "value": f"value-{i}", "header": f"h-{i}"} for i in range(10)
+    ]
+    ds = ray.data.from_items(items)
+
+    def headers_fn(row):
+        return [
+            ("source", b"ray"),
+            ("row-id", str(row["id"]).encode("utf-8")),
+        ]
+
+    ds.write_kafka(
+        topic=topic,
+        bootstrap_servers=[bootstrap_server],
+        headers_fn=headers_fn,
+    )
+
+    time.sleep(1)
+    messages = _consume_kafka_messages(bootstrap_server, topic, len(items))
+    ids = {str(item["id"]) for item in items}
+
+    for msg in messages:
+        assert msg.key is None
+        headers = dict(msg.headers)
+        assert headers["source"] == b"ray"
+        assert headers["row-id"].decode("utf-8") in ids
+
+
+def test_write_kafka_datasink_with_custom_serializer(
+    bootstrap_server, ray_start_regular_shared
+):
+    topic = _unique_topic("test-datasink-serializer")
+
+    class PrefixSerializer(Serializer):
+        def serialize(self, row) -> bytes:
+            return f"custom-{row['id']}".encode("utf-8")
+
+    items = [{"id": i, "value": f"value-{i}"} for i in range(12)]
+    ds = ray.data.from_items(items)
+    ds.write_kafka(
+        topic=topic,
+        bootstrap_servers=[bootstrap_server],
+        serializer=PrefixSerializer(),
+    )
+
+    time.sleep(1)
+    messages = _consume_kafka_messages(bootstrap_server, topic, len(items))
+    values = {msg.value.decode("utf-8") for msg in messages}
+    expected = {f"custom-{i}" for i in range(len(items))}
+    assert values == expected
+
+def test_write_kafka_datasink_set_concurrency(bootstrap_server, ray_start_regular_shared):
+    topic = _unique_topic("test-datasink-basic")
+
+    items = [{"id": i, "key": f"key-{i}", "value": f"value-{i}"} for i in range(100)]
+    ds = ray.data.from_items(items)
+    ds = ds.repartition(10)
+
+    ds.write_kafka(
+        topic=topic,
+        bootstrap_servers=[bootstrap_server],
+        key_fn=lambda row: row["key"].encode("utf-8"),
+        concurrency=5
+    )
+
+    time.sleep(1)
+    messages = _consume_kafka_messages(bootstrap_server, topic, len(items))
+
+    first = messages[0]
+    assert first.topic == topic
+    assert isinstance(first.key, bytes)
+    payload = json.loads(first.value.decode("utf-8"))
+    assert "id" in payload
+    assert "key" in payload
+    assert "value" in payload
 
 if __name__ == "__main__":
     import sys
