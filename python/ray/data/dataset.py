@@ -133,6 +133,8 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from ray.widgets import Template
 from ray.widgets.util import repr_with_fallback
 
+from ray.data._internal.datasource.utils.serializer import Serializer
+
 if TYPE_CHECKING:
     import daft
     import dask
@@ -5635,39 +5637,52 @@ class Dataset:
             concurrency=concurrency,
         )
 
-    @ConsumptionAPI
-    @PublicAPI(stability="alpha", api_group=IOC_API_GROUP)
+    @ConsumptionAPI(pattern="Time complexity:")
     def write_kafka(
         self,
         topic: str,
         bootstrap_servers: str,
-        key_field: Optional[str] = None,
-        key_serializer: str = "string",
-        value_serializer: str = "json",
+        key_fn: Optional[Callable[[Dict[str, Any]], Optional[bytes]]] = None,
+        serializer: Optional[Serializer] = None,
+        topic_schema_message_type: Optional[str] = None,
+        headers_fn: Optional[
+            Callable[[Dict[str, Any]], Optional[Iterable[Tuple[str, bytes]]]]
+        ] = None,
         producer_config: Optional[Dict[str, Any]] = None,
-        *,
-        ray_remote_args: Optional[Dict[str, Any]] = None,
+        kafka_auth_config: Optional[Any] = None,
+        ray_remote_args: Dict[str, Any] = None,
         concurrency: Optional[int] = None,
     ) -> None:
-        """
-        Convenience method to write Ray Dataset to Kafka.
+        """Write the dataset to a Kafka topic.
 
-        Examples:
-            .. testcode::
-                :skipif: True
+        Time complexity: O(dataset size / parallelism)
 
-                import ray
-
-                ds = ray.data.range(100)
-                ds.write_kafka("my-topic", "localhost:9092")
-
+        Example:
+            >>> ds = ray.data.range(100)
+            >>> ds.write_kafka("my-topic", "localhost:9092")
+        Returns:
+            Write statistics
         Args:
-            topic: Kafka topic name
-            bootstrap_servers: Comma-separated Kafka broker addresses
-            key_field: Optional field name to use as message key
-            key_serializer: Key serialization format ('json', 'string', or 'bytes')
-            value_serializer: Value serialization format ('json', 'string', or 'bytes')
-            producer_config: Additional Kafka producer configuration (confluent-kafka/librdkafka format)
+            topic: The Kafka topic to write to.
+            bootstrap_servers: A comma-separated list of Kafka bootstrap servers.
+            key_fn: A function that takes in a record and returns the key as bytes.
+                If None, messages will be sent without keys.
+            serializer: A :class:`~ray.data.io.Serializer` used to serialize records
+                before sending to Kafka. If None, the default JSON serializer is used.
+            topic_schema_message_type: Topic schema binding message type to load serializer
+                from topic schema if serializer is None. Only used if serializer is None.
+            headers_fn: A function that takes in a record and returns an iterable of
+                key-value pairs to be used as headers. If None, messages will be sent
+                without headers.
+            producer_config: Additional configuration options for the Kafka producer.
+                See `KafkaProducer
+                <https://kafka-python.readthedocs.io/en/master/apidoc/KafkaProducer.html>`_
+                for more details.
+            kafka_auth_config: Authentication configuration for Kafka. The type of this
+                parameter depends on the authentication method used. Refer to the
+                `kafka-python documentation
+                <https://kafka-python.readthedocs.io/en/master/usage.html#authentication>`_
+                for more details.
             ray_remote_args: Kwargs passed to :func:`ray.remote` in the write tasks.
             concurrency: The maximum number of Ray tasks to run concurrently. Set this
                 to control number of tasks to run concurrently. This doesn't change the
@@ -5677,10 +5692,12 @@ class Dataset:
         sink = KafkaDatasink(
             topic=topic,
             bootstrap_servers=bootstrap_servers,
-            key_field=key_field,
-            key_serializer=key_serializer,
-            value_serializer=value_serializer,
+            key_fn=key_fn,
+            serializer=serializer,
+            topic_schema_message_type=topic_schema_message_type,
+            headers_fn=headers_fn,
             producer_config=producer_config,
+            kafka_auth_config=kafka_auth_config,
         )
         self.write_datasink(
             sink,
