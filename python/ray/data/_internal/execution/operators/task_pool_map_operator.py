@@ -1,3 +1,4 @@
+import logging
 import warnings
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
@@ -38,6 +39,7 @@ class TaskPoolMapOperator(MapOperator):
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
+        id: Optional[str] = None,
     ):
         """Create an TaskPoolMapOperator instance.
 
@@ -65,6 +67,7 @@ class TaskPoolMapOperator(MapOperator):
             ray_remote_args: Customize the :func:`ray.remote` args for this op's tasks.
             on_start: Optional callback invoked with the schema from the first input
                 bundle before any tasks are submitted.
+            id: Optional user-defined identifier for this operator.
         """
         super().__init__(
             map_transformer,
@@ -79,6 +82,7 @@ class TaskPoolMapOperator(MapOperator):
             ray_remote_args_fn,
             ray_remote_args,
             on_start,
+            id,
         )
 
         if max_concurrency is not None and max_concurrency <= 0:

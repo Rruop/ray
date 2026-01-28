@@ -330,7 +330,9 @@ class PhysicalOperator(Operator):
         input_dependencies: List["PhysicalOperator"],
         data_context: DataContext,
         target_max_block_size_override: Optional[int] = None,
+        id: Optional[str] = None,
     ):
+        # Use user-defined name if provided, otherwise use the default name
         super().__init__(name, input_dependencies)
 
         for x in input_dependencies:
@@ -352,7 +354,8 @@ class PhysicalOperator(Operator):
         # Set via `PhysicalOperator.set_logical_operators()`.
         self._logical_operators: List[LogicalOperator] = []
         self._data_context = data_context
-        self._id = str(uuid.uuid4())
+        # Use user-defined id if provided, otherwise generate a UUID
+        self._id = id if id is not None else str(uuid.uuid4())
         # Initialize metrics after data_context is set
         self._metrics = OpRuntimeMetrics(self)
 

@@ -102,6 +102,8 @@ class AbstractUDFMap(AbstractMap):
         compute: Optional[ComputeStrategy] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
     ):
         """Initialize AbstractUDFMap.
 
@@ -130,8 +132,11 @@ class AbstractUDFMap(AbstractMap):
                 always override the args in ``ray_remote_args``. Note: this is an
                 advanced, experimental feature.
             ray_remote_args: Args to provide to :func:`ray.remote`.
+            custom_id: Optional user-defined identifier for this operator.
+            custom_name: Optional user-defined name for this operator.
         """
-        name = self._get_operator_name(name, fn)
+        # Use user-defined name if provided, otherwise use the default name
+        name = custom_name if custom_name is not None else self._get_operator_name(name, fn)
         super().__init__(
             name,
             input_op,
@@ -146,6 +151,7 @@ class AbstractUDFMap(AbstractMap):
         self.fn_constructor_args = fn_constructor_args
         self.fn_constructor_kwargs = fn_constructor_kwargs
         self.ray_remote_args_fn = ray_remote_args_fn
+        self._id = custom_id
 
     def _get_operator_name(self, op_name: str, fn: UserDefinedFunction):
         """Gets the Operator name including the map `fn` UDF name."""
@@ -196,6 +202,8 @@ class MapBatches(AbstractUDFMap):
         compute: Optional[ComputeStrategy] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
     ):
         super().__init__(
             "MapBatches",
@@ -210,6 +218,8 @@ class MapBatches(AbstractUDFMap):
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
         self.batch_size = batch_size
         self.batch_format = batch_format
@@ -230,6 +240,8 @@ class MapRows(AbstractUDFMap):
         compute: Optional[ComputeStrategy] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
     ):
         super().__init__(
             "Map",
@@ -243,6 +255,8 @@ class MapRows(AbstractUDFMap):
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
 
 
@@ -261,6 +275,8 @@ class Filter(AbstractUDFMap):
         compute: Optional[ComputeStrategy] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
     ):
         # Ensure exactly one of fn, or predicate_expr is provided
         provided_params = sum([fn is not None, predicate_expr is not None])
@@ -283,6 +299,8 @@ class Filter(AbstractUDFMap):
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
 
     def is_expression_based(self) -> bool:
@@ -407,6 +425,8 @@ class FlatMap(AbstractUDFMap):
         compute: Optional[ComputeStrategy] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
     ):
         super().__init__(
             "FlatMap",
@@ -420,6 +440,8 @@ class FlatMap(AbstractUDFMap):
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
 
 
