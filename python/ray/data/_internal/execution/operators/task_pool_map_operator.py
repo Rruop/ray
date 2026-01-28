@@ -17,8 +17,11 @@ from ray.data._internal.execution.operators.map_operator import (
     _map_task,
 )
 from ray.data._internal.execution.operators.map_transformer import MapTransformer
+from ray.data._internal.execution.config import OperatorConfig, TaskPoolOperatorConfig
 from ray.data._internal.remote_fn import cached_remote_fn
 from ray.data.context import DataContext
+
+logger = logging.getLogger(__name__)
 
 
 class TaskPoolMapOperator(MapOperator):
@@ -86,7 +89,8 @@ class TaskPoolMapOperator(MapOperator):
         )
 
         if max_concurrency is not None and max_concurrency <= 0:
-            raise ValueError(f"max_concurrency have to be > 0 (got {max_concurrency})")
+            raise ValueError(
+                f"max_concurrency have to be > 0 (got {max_concurrency})")
 
         self._max_concurrency = max_concurrency
         self._current_logical_usage = ExecutionResources.zero()
@@ -202,6 +206,41 @@ class TaskPoolMapOperator(MapOperator):
         )
 
         return min_resource_usage, max_resource_usage
+
+    def apply_parallelism_config(self, op_config: "OperatorConfig") -> None:
+        """Apply a new parallelism configuration to the operator at runtime.
+
+        Args:
+            op_config: The new configuration to apply. If max_concurrency is None,
+                the concurrency limit will be removed (unlimited).
+        """
+        if not isinstance(op_config, TaskPoolOperatorConfig):
+            warnings.warn(
+                f"Cannot apply config of type {type(op_config)} to "
+                f"TaskPoolMapOperator {self.name}. Expecting TaskPoolOperatorConfig."
+            )
+            return
+
+        max_concurrency = op_config.max_concurrency
+
+        # Skip if no change needed
+        if max_concurrency == self._max_concurrency:
+            return
+
+        # Validate the new value (None is valid, meaning unlimited)
+        if max_concurrency is not None and max_concurrency <= 0:
+            warnings.warn(
+                f"Invalid max_concurrency value ({max_concurrency}) in config "
+                f"for operator {self.name}. Must be > 0 or None."
+            )
+            return
+
+        # Apply the update
+        logger.info(
+            f"Updating max_concurrency for operator {self.name} from "
+            f"{self._max_concurrency} to {max_concurrency}."
+        )
+        self._max_concurrency = max_concurrency
 
     def all_inputs_done(self):
         super().all_inputs_done()

@@ -144,8 +144,30 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
         # For visibility, store the integer center of the band
         self._queue_level_thresholds[op] = max(1, int(level))
 
+    def _refresh_cap(self, op: "PhysicalOperator") -> None:
+        """Sync the concurrency cap from the operator if it has changed.
+
+        This ensures runtime config changes (e.g. via apply_parallelism_config)
+        are reflected in the backpressure policy without requiring a restart.
+        """
+        if isinstance(op, TaskPoolMapOperator):
+            limit = op.get_max_concurrency_limit()
+            new_cap = limit if limit is not None else float("inf")
+        else:
+            new_cap = float("inf")
+        old_cap = self._concurrency_caps.get(op, float("inf"))
+        if new_cap != old_cap:
+            logger.info(
+                f"ConcurrencyCapBackpressurePolicy: updated cap for {op.name} "
+                f"from {old_cap} to {new_cap}"
+            )
+            self._concurrency_caps[op] = new_cap
+
     def can_add_input(self, op: "PhysicalOperator") -> bool:
         """Return whether `op` may accept another input now."""
+        # Sync cap from operator in case it was updated at runtime.
+        self._refresh_cap(op)
+
         num_tasks_running = op.metrics.num_tasks_running
 
         # Skip dynamic backpressure if:

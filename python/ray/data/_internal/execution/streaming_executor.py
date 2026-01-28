@@ -1,9 +1,11 @@
 import logging
+import os
 import threading
 import time
 import typing
 from typing import Dict, List, Optional, Tuple
 
+import ray
 from ray.data._internal.actor_autoscaler import (
     create_actor_autoscaler,
 )
@@ -21,10 +23,12 @@ from ray.data._internal.execution.interfaces import (
     PhysicalOperator,
     RefBundle,
 )
+from ray.data._internal.execution.operators.actor_pool_map_operator import ActorPoolMapOperator
 from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
 )
 from ray.data._internal.execution.operators.input_data_buffer import InputDataBuffer
+from ray.data._internal.execution.operators.task_pool_map_operator import TaskPoolMapOperator
 from ray.data._internal.execution.resource_manager import (
     ResourceManager,
 )
@@ -115,6 +119,9 @@ class StreamingExecutor(Executor, threading.Thread):
         self._has_op_completed: Optional[Dict[PhysicalOperator, bool]] = None
         self._max_errored_blocks = self._data_context.max_errored_blocks
         self._num_errored_blocks = 0
+
+        # Job configuration synchronization components (lazy initialized)
+        self._config_controller = None
 
         self._last_debug_log_time = 0
 
@@ -213,6 +220,10 @@ class StreamingExecutor(Executor, threading.Thread):
             self._resource_manager,
             config=self._data_context.autoscaling_config,
         )
+
+        # Initialize operator configuration synchronization if enabled
+        # This sets up dynamic configuration updates during execution
+        self._initialize_operator_config_sync()
 
         self._has_op_completed = dict.fromkeys(self._topology, False)
 
@@ -327,6 +338,105 @@ class StreamingExecutor(Executor, threading.Thread):
             self._data_context.set_dataset_logger_id(
                 unregister_dataset_logger(self._dataset_id)
             )
+
+    def _initialize_operator_config_sync(self) -> None:
+        """Initialize operator configuration synchronization if enabled."""
+        if not self._data_context.enable_dynamic_execution_config_sync:
+            return
+
+        # Lazy import to avoid loading kconf when not needed
+        from ray.data._internal.execution.config import (
+            ConfigController,
+            create_execution_config_store,
+        )
+
+        job_id = self._get_job_submission_id_or_job_id()
+        if not job_id:
+            logger.debug("No job_id or job_submission_id available")
+            return
+
+        try:
+            store = create_execution_config_store(
+                data_context=self._data_context,
+                job_id=job_id,
+            )
+            if store is None:
+                return
+
+            store.init(self._generate_initial_operator_config(job_id))
+            self._config_controller = ConfigController(self._topology, store)
+            logger.info("Operator configuration synchronization initialized")
+        except Exception as e:
+            logger.warning(f"Failed to initialize operator config sync: {e}")
+
+    def _generate_initial_operator_config(self, job_id: str):
+        """Generate initial operator configuration from topology.
+
+        Args:
+            job_id: The job ID or submission ID for this execution.
+
+        Returns:
+            ExecutionConfig: Configuration object with current operator settings.
+        """
+        # Lazy import to avoid loading kconf when not needed
+        from ray.data._internal.execution.config import (
+            ExecutionConfig,
+            TaskPoolOperatorConfig,
+            ActorPoolOperatorConfig,
+        )
+
+        config = ExecutionConfig(job_id=job_id)
+
+        for op in self._topology.keys():
+            if isinstance(op, TaskPoolMapOperator):
+                config.add_operator(TaskPoolOperatorConfig(
+                    id=op.id,
+                    name=op.name,
+                    max_concurrency=op.get_max_concurrency_limit()
+                ))
+            elif isinstance(op, ActorPoolMapOperator):
+                actor_pools = op.get_autoscaling_actor_pools()
+                for actor_pool in actor_pools:
+                    config.add_operator(ActorPoolOperatorConfig(
+                        id=op.id,
+                        name=op.name,
+                        min_size=actor_pool.min_size(),
+                        max_size=actor_pool.max_size(),
+                        size=actor_pool.current_size()
+                    ))
+
+        return config
+
+    def _get_job_submission_id_or_job_id(self) -> Optional[str]:
+        """Get job_submission_id or fall back to internal job_id.
+
+        Resolution order:
+        1. Parse job_submission_id from RAY_JOB_CONFIG_JSON_ENV_VAR env var
+           (set by JobSupervisor when using `ray job submit`)
+        2. Fall back to ray.get_runtime_context().get_job_id() (internal job ID)
+
+        Returns:
+            The job_submission_id if available, otherwise the internal job_id,
+            or None if neither can be obtained.
+        """
+        import json
+        from ray._private.runtime_env.constants import RAY_JOB_CONFIG_JSON_ENV_VAR
+
+        # Try to get job_submission_id from the injected job config env var.
+        job_config_json = os.environ.get(RAY_JOB_CONFIG_JSON_ENV_VAR)
+        if job_config_json:
+            try:
+                submission_id = json.loads(job_config_json).get(
+                    "metadata", {}
+                ).get("job_submission_id")
+                if submission_id:
+                    logger.info(f"Got job_submission_id from env: {submission_id}")
+                    return submission_id
+            except json.JSONDecodeError:
+                pass
+
+        # Fall back to the internal job_id from runtime context.
+        return ray.get_runtime_context().get_job_id() or None
 
     def run(self):
         """Run the control loop in a helper thread.
@@ -452,6 +562,13 @@ class StreamingExecutor(Executor, threading.Thread):
         # Trigger autoscaling
         self._cluster_autoscaler.try_trigger_scaling()
         self._actor_autoscaler.try_trigger_scaling()
+
+        # Synchronize job configuration if controller is available
+        if self._config_controller:
+            try:
+                self._config_controller.try_apply_config()
+            except Exception as e:
+                logger.warning(f"Failed to apply job configuration: {e}")
 
         update_operator_states(topology)
         self._refresh_progress_manager(topology)

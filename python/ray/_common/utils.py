@@ -61,6 +61,10 @@ def env_bool(key, default):
         return val == "true" or val == "1"
     return default
 
+def env_string(key, default=None):
+    if key in os.environ:
+        return os.environ[key]
+    return default
 
 def import_module_and_attr(
     full_path: str, *, reload_module: bool = False

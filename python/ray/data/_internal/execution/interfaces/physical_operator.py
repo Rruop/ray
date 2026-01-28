@@ -970,6 +970,10 @@ class PhysicalOperator(Operator):
         )
         return upstream_op_num_outputs
 
+    def apply_parallelism_config(self, op_config: "OperatorConfig") -> None:
+        """Apply a new parallelism configuration to the operator at runtime."""
+        # Default implementation does nothing.
+        pass
 
 class ReportsExtraResourceUsage(abc.ABC):
     @abc.abstractmethod

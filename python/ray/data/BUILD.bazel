@@ -2155,3 +2155,45 @@ py_test(
         "//:ray_lib",
     ],
 )
+
+py_test(
+    name = "test_execution_config",
+    size = "small",
+    srcs = ["tests/test_execution_config.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_execution_config_store",
+    size = "small",
+    srcs = ["tests/test_execution_config_store.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)
+
+py_test(
+    name = "test_config_controller",
+    size = "small",
+    srcs = ["tests/test_config_controller.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)

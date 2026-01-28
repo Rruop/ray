@@ -9,7 +9,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Type, Union
 
-from ray._common.utils import env_bool, env_float, env_integer
+from ray._common.utils import env_bool, env_float, env_integer, env_string
 from ray.data._internal.logging import update_dataset_logger_for_worker
 from ray.data.checkpoint import CheckpointBackend, CheckpointConfig
 from ray.util.annotations import DeveloperAPI
@@ -301,6 +301,22 @@ DEFAULT_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE: bool = env_bool(
     "RAY_DATA_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE", False
 )
 
+DEFAULT_ENABLE_DYNAMIC_EXECUTION_CONFIG_SYNC: bool = env_bool(
+    "RAY_DATA_ENABLE_DYNAMIC_EXECUTION_CONFIG_SYNC", False
+)
+
+# Execution config store settings
+# Store type: "gcs" (default), "memory", or "kconf"
+DEFAULT_EXECUTION_CONFIG_STORE_TYPE: Optional[str] = env_string(
+    "RAY_DATA_EXECUTION_CONFIG_STORE_TYPE", "gcs"
+)
+# Kconf settings (only used when store_type is "kconf")
+DEFAULT_EXECUTION_CONFIG_KCONF_KEY: Optional[str] = env_string(
+    "RAY_DATA_EXECUTION_CONFIG_KCONF_KEY", "KAIWorks.rayExecutionConfig"
+)
+DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN: Optional[str] = env_string(
+    "RAY_DATA_EXECUTION_CONFIG_KCONF_TOKEN", "kconf_flemiaczh7l9uelx696col56fo"
+)
 
 DEFAULT_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO: float = env_float(
     "RAY_DATA_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO", 10.0
@@ -800,6 +816,16 @@ class DataContext:
     custom_execution_callback_classes: List[Type["ExecutionCallback"]] = field(
         default_factory=list
     )
+
+    enable_dynamic_execution_config_sync: bool = DEFAULT_ENABLE_DYNAMIC_EXECUTION_CONFIG_SYNC
+
+    # Execution config store settings for dynamic operator parallelism
+    # Store type: "gcs" (default), "memory", or "kconf"
+    execution_config_store_type: Optional[str] = DEFAULT_EXECUTION_CONFIG_STORE_TYPE
+    # Kconf key prefix (only used when store_type is "kconf")
+    execution_config_kconf_key: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_KEY
+    # Kconf token (only used when store_type is "kconf")
+    execution_config_kconf_token: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN
 
     def __post_init__(self):
         # The additonal ray remote args that should be added to
