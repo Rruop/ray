@@ -195,6 +195,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]],
         ray_remote_args: Optional[Dict[str, Any]],
         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
+        id: Optional[str] = None,
     ):
         # NOTE: This constructor should not be called directly; use MapOperator.create()
         # instead.
@@ -223,7 +224,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         self._metadata_tasks: Dict[int, MetadataOpTask] = {}
         self._next_metadata_task_idx = 0
         # Keep track of all finished streaming generators.
-        super().__init__(name, input_op, data_context, target_max_block_size_override)
+        super().__init__(name, input_op, data_context, target_max_block_size_override, id)
 
         # If set, then all output blocks will be split into
         # this many sub-blocks. This is to avoid having
@@ -348,6 +349,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
         ray_remote_args: Optional[Dict[str, Any]] = None,
         per_block_limit: Optional[int] = None,
         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
+        id: Optional[str] = None,
     ) -> "MapOperator":
         """Create a MapOperator.
 
@@ -383,6 +385,8 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 bundle before any tasks are submitted. Used for deferred initialization
                 that requires schema from actual data (e.g., schema evolution for
                 Iceberg writes).
+            id: Optional user-defined identifier for this operator.
+
         """
         if (ref_bundler is not None and min_rows_per_bundle is not None) or (
             min_rows_per_bundle is not None and ref_bundler is not None
@@ -419,6 +423,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 ray_remote_args_fn=ray_remote_args_fn,
                 ray_remote_args=ray_remote_args,
                 on_start=on_start,
+                id=id,
             )
         elif isinstance(compute_strategy, ActorPoolStrategy):
             from ray.data._internal.execution.operators.actor_pool_map_operator import (
@@ -439,6 +444,7 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
                 ray_remote_args_fn=ray_remote_args_fn,
                 ray_remote_args=ray_remote_args,
                 on_start=on_start,
+                id=id,
             )
         else:
             raise ValueError(f"Unsupported execution strategy {compute_strategy}")

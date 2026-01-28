@@ -80,6 +80,7 @@ class OneToOneOperator(PhysicalOperator):
         input_op: PhysicalOperator,
         data_context: DataContext,
         target_max_block_size_override: Optional[int] = None,
+        id: Optional[str] = None,
     ):
         """Create a OneToOneOperator.
         Args:
@@ -87,8 +88,9 @@ class OneToOneOperator(PhysicalOperator):
             name: The name of this operator.
             target_max_block_size_override: The target maximum number of bytes to
                 include in an output block.
+            id: Optional user-defined identifier for this operator.
         """
-        super().__init__(name, [input_op], data_context, target_max_block_size_override)
+        super().__init__(name, [input_op], data_context, target_max_block_size_override, id=id)
 
     @property
     def input_dependency(self) -> PhysicalOperator:

@@ -108,6 +108,8 @@ class AbstractUDFMap(AbstractMap):
         compute: Optional[ComputeStrategy] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         ray_remote_args: Optional[Dict[str, Any]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
     ):
         """Initialize AbstractUDFMap.
 
@@ -136,8 +138,11 @@ class AbstractUDFMap(AbstractMap):
                 always override the args in ``ray_remote_args``. Note: this is an
                 advanced, experimental feature.
             ray_remote_args: Args to provide to :func:`ray.remote`.
+            custom_id: Optional user-defined identifier for this operator.
+            custom_name: Optional user-defined name for this operator.
         """
-        name = self._get_operator_name(name, fn)
+        # Use user-defined name if provided, otherwise use the default name
+        name = custom_name if custom_name is not None else self._get_operator_name(name, fn)
         super().__init__(
             name,
             input_op,
@@ -152,6 +157,7 @@ class AbstractUDFMap(AbstractMap):
         self.fn_constructor_args = fn_constructor_args
         self.fn_constructor_kwargs = fn_constructor_kwargs
         self.ray_remote_args_fn = ray_remote_args_fn
+        self._id = custom_id
 
     def _get_operator_name(self, op_name: str, fn: UserDefinedFunction):
         """Gets the Operator name including the map `fn` UDF name."""
@@ -205,18 +211,22 @@ class MapBatches(AbstractUDFMap):
     _name: str = field(init=False, repr=False)
     _input_dependencies: list[LogicalOperator] = field(init=False, repr=False)
     _num_outputs: Optional[int] = field(init=False, default=None, repr=False)
+    custom_id: Optional[str] = None
+    custom_name: Optional[str] = None
 
     def __post_init__(self, input_op: LogicalOperator):
         assert isinstance(input_op, LogicalOperator), input_op
         if self.compute is None:
             object.__setattr__(self, "compute", TaskPoolStrategy())
-        object.__setattr__(
-            self,
-            "_name",
-            self._get_operator_name(self.__class__.__name__, self.fn),
+        name = (
+            self.custom_name
+            if self.custom_name is not None
+            else self._get_operator_name(self.__class__.__name__, self.fn)
         )
+        object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_input_dependencies", [input_op])
         object.__setattr__(self, "_num_outputs", None)
+        object.__setattr__(self, "_id", self.custom_id)
 
     def _apply_transform(
         self, transform: Callable[[LogicalOperator], LogicalOperator]
@@ -249,14 +259,22 @@ class MapRows(AbstractUDFMap):
     _name: str = field(init=False, repr=False)
     _input_dependencies: list[LogicalOperator] = field(init=False, repr=False)
     _num_outputs: Optional[int] = field(init=False, default=None, repr=False)
+    custom_id: Optional[str] = None
+    custom_name: Optional[str] = None
 
     def __post_init__(self, input_op: LogicalOperator):
         assert isinstance(input_op, LogicalOperator), input_op
         if self.compute is None:
             object.__setattr__(self, "compute", TaskPoolStrategy())
-        object.__setattr__(self, "_name", self._get_operator_name("Map", self.fn))
+        name = (
+            self.custom_name
+            if self.custom_name is not None
+            else self._get_operator_name("Map", self.fn)
+        )
+        object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_input_dependencies", [input_op])
         object.__setattr__(self, "_num_outputs", None)
+        object.__setattr__(self, "_id", self.custom_id)
 
     def _apply_transform(
         self, transform: Callable[[LogicalOperator], LogicalOperator]
@@ -290,6 +308,8 @@ class Filter(AbstractUDFMap):
     _name: str = field(init=False, repr=False)
     _input_dependencies: list[LogicalOperator] = field(init=False, repr=False)
     _num_outputs: Optional[int] = field(init=False, default=None, repr=False)
+    custom_id: Optional[str] = None
+    custom_name: Optional[str] = None
 
     def __post_init__(self, input_op: LogicalOperator):
         assert isinstance(input_op, LogicalOperator), input_op
@@ -301,13 +321,15 @@ class Filter(AbstractUDFMap):
             )
         if self.compute is None:
             object.__setattr__(self, "compute", TaskPoolStrategy())
-        object.__setattr__(
-            self,
-            "_name",
-            self._get_operator_name(self.__class__.__name__, self.fn),
+        name = (
+            self.custom_name
+            if self.custom_name is not None
+            else self._get_operator_name(self.__class__.__name__, self.fn)
         )
+        object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_input_dependencies", [input_op])
         object.__setattr__(self, "_num_outputs", None)
+        object.__setattr__(self, "_id", self.custom_id)
 
     def _apply_transform(
         self, transform: Callable[[LogicalOperator], LogicalOperator]
@@ -460,18 +482,22 @@ class FlatMap(AbstractUDFMap):
     _name: str = field(init=False, repr=False)
     _input_dependencies: list[LogicalOperator] = field(init=False, repr=False)
     _num_outputs: Optional[int] = field(init=False, default=None, repr=False)
+    custom_id: Optional[str] = None
+    custom_name: Optional[str] = None
 
     def __post_init__(self, input_op: LogicalOperator):
         assert isinstance(input_op, LogicalOperator), input_op
         if self.compute is None:
             object.__setattr__(self, "compute", TaskPoolStrategy())
-        object.__setattr__(
-            self,
-            "_name",
-            self._get_operator_name(self.__class__.__name__, self.fn),
+        name = (
+            self.custom_name
+            if self.custom_name is not None
+            else self._get_operator_name(self.__class__.__name__, self.fn)
         )
+        object.__setattr__(self, "_name", name)
         object.__setattr__(self, "_input_dependencies", [input_op])
         object.__setattr__(self, "_num_outputs", None)
+        object.__setattr__(self, "_id", self.custom_id)
 
     def _apply_transform(
         self, transform: Callable[[LogicalOperator], LogicalOperator]

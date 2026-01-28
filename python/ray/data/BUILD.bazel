@@ -2141,3 +2141,17 @@ py_test(
         "//:ray_lib",
     ],
 )
+
+py_test(
+    name = "test_custom_operator_id",
+    size = "small",
+    srcs = ["tests/test_custom_operator_id.py"],
+    tags = [
+        "exclusive",
+        "team:data",
+    ],
+    deps = [
+        ":conftest",
+        "//:ray_lib",
+    ],
+)

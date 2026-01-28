@@ -271,6 +271,7 @@ def plan_filter_op(
         compute_strategy=compute,
         ray_remote_args=op.ray_remote_args,
         ray_remote_args_fn=op.ray_remote_args_fn,
+        id=op._id,
     )
 
 
@@ -338,6 +339,7 @@ def plan_udf_map_op(
         ray_remote_args_fn=op.ray_remote_args_fn,
         ray_remote_args=op.ray_remote_args,
         per_block_limit=op.per_block_limit,
+        id=op._id,
     )
 
 

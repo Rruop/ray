@@ -108,6 +108,7 @@ class ActorPoolMapOperator(MapOperator):
         ray_actor_task_remote_args: Optional[Dict[str, Any]] = None,
         target_max_block_size_override: Optional[int] = None,
         on_start: Optional[Callable[[Optional["pa.Schema"]], None]] = None,
+        id: Optional[str] = None,
     ):
         """Create an ActorPoolMapOperator instance.
 
@@ -139,6 +140,7 @@ class ActorPoolMapOperator(MapOperator):
                 include in an output block.
             on_start: Optional callback invoked with the schema from the first input
                 bundle before any tasks are submitted.
+            id: Optional user-defined identifier for this operator.
         """
         super().__init__(
             map_transformer,
@@ -153,6 +155,7 @@ class ActorPoolMapOperator(MapOperator):
             ray_remote_args_fn,
             ray_remote_args,
             on_start,
+            id,
         )
 
         self._min_rows_per_bundle = min_rows_per_bundle
@@ -1257,3 +1260,18 @@ class _ActorPool(AutoscalingActorPool):
         # Pick the best candidate: prefer highest locality (most data on-node),
         # breaking ties by fewest tasks in flight.
         return min(actor_ranks, key=lambda x: (x[1], x[2]))[0]
+
+    def get_pool_util(self) -> float:
+        if self.num_running_actors() == 0:
+            return 0.0
+        else:
+            # We compute utilization as a ration of
+            #  - Number of submitted tasks over
+            #  - Max number of tasks that Actor Pool could currently run
+            #
+            # This value could exceed 100%, since by default actors are allowed
+            # to queue tasks (to pipeline task execution by overlapping block
+            # fetching with the execution of the previous task)
+            return self.num_tasks_in_flight() / (
+                self._max_actor_concurrency * self.num_running_actors()
+            )

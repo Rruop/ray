@@ -320,6 +320,8 @@ class Dataset:
         num_gpus: Optional[float] = None,
         memory: Optional[float] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         **ray_remote_args,
     ) -> "Dataset":
@@ -405,6 +407,12 @@ class Dataset:
                 worker.
             memory: The heap memory in bytes to reserve for each parallel map worker.
             concurrency: This argument is deprecated. Use ``compute`` argument.
+            custom_id: Optional custom identifier for this operation.
+                This can be used to track and identify specific operations
+                in your pipeline.
+            custom_name: Optional custom name for this operation.
+                If provided, this will be displayed in logs and metrics
+                instead of the default operation name.
             ray_remote_args_fn: A function that returns a dictionary of remote args
                 passed to each map worker. The purpose of this argument is to generate
                 dynamic arguments for each actor/task, and will be called each time prior
@@ -452,6 +460,8 @@ class Dataset:
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
         logical_plan = LogicalPlan(map_op, self.context)
         return Dataset(plan, logical_plan)
@@ -501,6 +511,8 @@ class Dataset:
         memory: Optional[float] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
         udf_modifying_row_count: bool = True,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         **ray_remote_args,
     ) -> "Dataset":
@@ -679,6 +691,12 @@ class Dataset:
             udf_modifying_row_count: If your UDF produces the same number of output rows
                 as it receives, set this parameter to False. It allows Ray Data to
                 perform more optimizations like limit pushdown.
+            custom_id: Optional custom identifier for this operation.
+                This can be used to track and identify specific operations
+                in your pipeline.
+            custom_name: Optional custom name for this operation.
+                If provided, this will be displayed in logs and metrics
+                instead of the default operation name.
             ray_remote_args_fn: A function that returns a dictionary of remote args
                 passed to each map worker. The purpose of this argument is to generate
                 dynamic arguments for each actor/task, and will be called each time prior
@@ -750,6 +768,8 @@ class Dataset:
             memory=memory,
             concurrency=concurrency,
             udf_modifying_row_count=udf_modifying_row_count,
+            custom_id=custom_id,
+            custom_name=custom_name,
             ray_remote_args_fn=ray_remote_args_fn,
             **ray_remote_args,
         )
@@ -771,6 +791,8 @@ class Dataset:
         memory: Optional[float],
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]],
         udf_modifying_row_count: bool,
+        custom_id: Optional[str],
+        custom_name: Optional[str],
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]],
         **ray_remote_args,
     ):
@@ -822,6 +844,8 @@ class Dataset:
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
         logical_plan = LogicalPlan(map_batches_op, self.context)
         return Dataset(plan, logical_plan)
@@ -1342,6 +1366,8 @@ class Dataset:
         num_gpus: Optional[float] = None,
         memory: Optional[float] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         **ray_remote_args,
     ) -> "Dataset":
@@ -1421,6 +1447,12 @@ class Dataset:
                 worker.
             memory: The heap memory in bytes to reserve for each parallel map worker.
             concurrency: This argument is deprecated. Use ``compute`` argument.
+            custom_id: Optional custom identifier for this operation.
+                This can be used to track and identify specific operations
+                in your pipeline.
+            custom_name: Optional custom name for this operation.
+                If provided, this will be displayed in logs and metrics
+                instead of the default operation name.
             ray_remote_args_fn: A function that returns a dictionary of remote args
                 passed to each map worker. The purpose of this argument is to generate
                 dynamic arguments for each actor/task, and will be called each time
@@ -1466,6 +1498,8 @@ class Dataset:
             compute=compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
         logical_plan = LogicalPlan(op, self.context)
         return Dataset(plan, logical_plan)
@@ -1485,6 +1519,8 @@ class Dataset:
         num_gpus: Optional[float] = None,
         memory: Optional[float] = None,
         concurrency: Optional[Union[int, Tuple[int, int], Tuple[int, int, int]]] = None,
+        custom_id: Optional[str] = None,
+        custom_name: Optional[str] = None,
         ray_remote_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         **ray_remote_args,
     ) -> "Dataset":
@@ -1555,6 +1591,12 @@ class Dataset:
                 worker.
             memory: The heap memory in bytes to reserve for each parallel map worker.
             concurrency: This argument is deprecated. Use ``compute`` argument.
+            custom_id: Optional custom identifier for this operation.
+                This can be used to track and identify specific operations
+                in your pipeline.
+            custom_name: Optional custom name for this operation.
+                If provided, this will be displayed in logs and metrics
+                instead of the default operation name.
             ray_remote_args_fn: A function that returns a dictionary of remote args
                 passed to each map worker. The purpose of this argument is to generate
                 dynamic arguments for each actor/task, and will be called each time
@@ -1666,6 +1708,8 @@ class Dataset:
             compute=filter_compute,
             ray_remote_args_fn=ray_remote_args_fn,
             ray_remote_args=ray_remote_args,
+            custom_id=custom_id,
+            custom_name=custom_name,
         )
 
         plan = self._plan.copy()
