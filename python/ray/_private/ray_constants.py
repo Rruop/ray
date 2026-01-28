@@ -48,6 +48,12 @@ def env_bool(key, default):
     return default
 
 
+def env_string(key, default=None):
+    if key in os.environ:
+        return os.environ[key]
+    return default
+
+
 def env_set_by_user(key):
     return key in os.environ
 

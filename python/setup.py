@@ -240,6 +240,17 @@ if setup_spec.type == SetupType.RAY:
             *pyarrow_deps,
             "fsspec",
         ],
+        "data-kconf": [
+            numpy_dep,
+            pandas_dep,
+            *pyarrow_deps,
+            "fsspec",
+            "setuptools_scm",
+            "infra-framework",
+            # Explicitly constrain protobuf to be compatible with Ray.
+            # This overrides any lower version requirements from infra-framework.
+            "protobuf>=3.20.3",
+        ],
         "default": [
             # If adding dependencies necessary to launch the dashboard api server,
             # please add it to python/ray/dashboard/optional_deps.py as well.
