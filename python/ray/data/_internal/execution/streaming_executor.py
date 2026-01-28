@@ -706,6 +706,44 @@ class StreamingExecutor(Executor, threading.Thread):
 
     def _get_state_dict(self, state):
         last_op, last_state = list(self._topology.items())[-1]
+
+        # Build operator info dict with pool-specific metrics
+        operators_dict = {}
+        for i, (op, op_state) in enumerate(self._topology.items()):
+            op_id = self._get_operator_id(op, i)
+            op_info = {
+                "name": op.name,
+                "progress": op_state.num_completed_tasks,
+                "total": op.num_outputs_total(),
+                "total_rows": op.num_output_rows_total(),
+                "queued_blocks": op_state.total_enqueued_input_blocks(),
+                "state": DatasetState.FINISHED.name
+                if op.has_execution_finished()
+                else state,
+            }
+
+            # Add TaskPool metrics
+            if isinstance(op, TaskPoolMapOperator):
+                op_info["task_pool"] = {
+                    "active_tasks": op.num_active_tasks(),
+                    "max_concurrency": op.get_max_concurrency_limit(),
+                }
+
+            # Add ActorPool metrics
+            elif isinstance(op, ActorPoolMapOperator):
+                actor_pools = op.get_autoscaling_actor_pools()
+                if actor_pools:
+                    pool = actor_pools[0]  # Usually there's only one pool
+                    op_info["actor_pool"] = {
+                        "current_size": pool.current_size(),
+                        "running": pool.num_running_actors(),
+                        "pending": pool.num_pending_actors(),
+                        "min_size": pool.min_size(),
+                        "max_size": pool.max_size(),
+                    }
+
+            operators_dict[op_id] = op_info
+
         return {
             "state": state,
             "progress": last_state.num_completed_tasks,
@@ -714,19 +752,7 @@ class StreamingExecutor(Executor, threading.Thread):
             "end_time": time.time()
             if state in (DatasetState.FINISHED.name, DatasetState.FAILED.name)
             else None,
-            "operators": {
-                f"{self._get_operator_id(op, i)}": {
-                    "name": op.name,
-                    "progress": op_state.num_completed_tasks,
-                    "total": op.num_outputs_total(),
-                    "total_rows": op.num_output_rows_total(),
-                    "queued_blocks": op_state.total_enqueued_input_blocks(),
-                    "state": DatasetState.FINISHED.name
-                    if op.has_execution_finished()
-                    else state,
-                }
-                for i, (op, op_state) in enumerate(self._topology.items())
-            },
+            "operators": operators_dict,
         }
 
     def _update_stats_metrics(self, state: str, force_update: bool = False):
@@ -769,7 +795,29 @@ def _log_op_metrics(topology: Topology) -> None:
     log_str = "Operator Metrics:\n"
     for op in topology:
         metrics_dict = op.metrics.as_dict(skip_internal_metrics=True)
-        log_str += f"{op.name}: {metrics_dict}\n"
+        op_info = f"{op.name}: {metrics_dict}"
+
+        # Add concurrency info for TaskPoolMapOperator
+        if isinstance(op, TaskPoolMapOperator):
+            max_concurrency = op.get_max_concurrency_limit()
+            active_tasks = op.num_active_tasks()
+            op_info += (
+                f" | TaskPool: active_tasks={active_tasks}, "
+                f"max_concurrency={max_concurrency}"
+            )
+
+        # Add actor pool info for ActorPoolMapOperator
+        elif isinstance(op, ActorPoolMapOperator):
+            actor_pools = op.get_autoscaling_actor_pools()
+            for pool in actor_pools:
+                op_info += (
+                    f" | ActorPool: current_size={pool.current_size()}, "
+                    f"running={pool.num_running_actors()}, "
+                    f"pending={pool.num_pending_actors()}, "
+                    f"min={pool.min_size()}, max={pool.max_size()}"
+                )
+
+        log_str += op_info + "\n"
     logger.debug(log_str)
 
 

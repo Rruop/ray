@@ -48,7 +48,6 @@ DATASET_METRICS = {
     "ray_data_gpu_usage_cores": (PrometheusQuery.VALUE, PrometheusQuery.MAX),
 }
 
-
 class DataHead(SubprocessModule):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -61,6 +60,16 @@ class DataHead(SubprocessModule):
                 DEFAULT_PROMETHEUS_HEADERS,
             )
         )
+        self._execution_config_client = None
+
+    def _get_execution_config_client(self):
+        """Lazily initialize the ExecutionConfigStorageClient."""
+        if self._execution_config_client is None:
+            from ray.dashboard.modules.data.config_client import (
+                ExecutionConfigStorageClient,
+            )
+            self._execution_config_client = ExecutionConfigStorageClient(self.gcs_client)
+        return self._execution_config_client
 
     @routes.get("/api/data/datasets/{job_id}")
     @optional_utils.init_ray_and_catch_exceptions()
@@ -159,3 +168,250 @@ class DataHead(SubprocessModule):
 
             message = await resp.text()
             raise PrometheusQueryError(resp.status, message)
+
+    @routes.get("/api/data/{job_id}/execution_config")
+    @optional_utils.init_ray_and_catch_exceptions()
+    async def get_execution_config(self, req: Request) -> Response:
+        """Get the execution configuration for a specific job.
+
+        Args:
+            req: The HTTP request containing job_id
+        Returns:
+            Response with execution configuration JSON or 404 if not found.
+        """
+        job_id = req.match_info["job_id"]
+
+        try:
+            client = self._get_execution_config_client()
+            config = await client.get_config(job_id)
+
+            if config is None:
+                return Response(
+                    text=json.dumps({"error": f"Execution config not found for job: {job_id}"}),
+                    content_type="application/json",
+                    status=404,
+                )
+
+            return Response(
+                text=json.dumps({"job_id": job_id, "config": config.to_dict()}),
+                content_type="application/json",
+                status=200,
+            )
+        except Exception as e:
+            logger.exception(f"Failed to get execution config for job {job_id}")
+            return Response(
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+                status=500,
+            )
+
+    @routes.put("/api/data/{job_id}/execution_config")
+    @optional_utils.init_ray_and_catch_exceptions()
+    async def put_execution_config(self, req: Request) -> Response:
+        """Set or update the execution configuration for a specific job.
+
+        Args:
+            req: The HTTP request containing job_id in path and config in body.
+
+        Returns:
+            Response indicating sucilure.
+        """
+        job_id = req.match_info["job_id"]
+
+        try:
+            # Parse request body
+            try:
+                body = await req.json()
+            except json.JSONDecodeError as e:
+                return Response(
+                    text=json.dumps({"error": f"Invalid JSON in request body: {e}"}),
+                    content_type="application/json",
+                    status=400,
+                )
+
+            # Validate config data
+            config_data = body.get("config")
+            if config_data is None:
+                return Response(
+                    text=json.dumps({"error": "Missing 'config' field in request body"}),
+                    content_type="application/json",
+                    status=400,
+                )
+
+            # Parse config
+            try:
+                from ray.data._internal.execution.config import ExecutionConfig
+                config = ExecutionConfig.from_dict(config_data)
+            except (ValueError, KeyError) as e:
+                return Response(
+                    text=json.dumps({"error": f"Invalid config format: {e}"}),
+                    content_type="application/json",
+                    status=400,
+                )
+
+            # Store config
+            client = self._get_execution_config_client()
+            is_new = await client.put_config(job_id, config)
+
+            return Response(
+                text=json.dumps({
+                    "success": True,
+                    "job_id": job_id,
+                    "created": is_new,
+                    "config": config.to_dict(),
+                }),
+                content_type="application/json",
+                status=201 if is_new else 200,
+            )
+        except Exception as e:
+            logger.exception(f"Failed to put execution config for job {job_id}")
+            return Response(
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+                status=500,
+            )
+
+    @routes.delete("/api/data/{job_id}/execution_config")
+    @optional_utils.init_ray_and_catch_exceptions()
+    async def delete_execution_config(self, req: Request) -> Response:
+        """Delete the execution configuration for a specific job.
+
+        Args:
+            req: The HTTP request containing job_id in path.
+
+        Returns:
+            Response indicating success or failure.
+        """
+        job_id = req.match_info["job_id"]
+
+        try:
+            client = self._get_execution_config_client()
+            deleted = await client.delete_config(job_id)
+
+            if not deleted:
+                return Response(
+                    text=json.dumps({"error": f"Execution config not found for job: {job_id}"}),
+                    content_type="application/json",
+                    status=404,
+                )
+
+            return Response(
+                text=json.dumps({"success": True, "job_id": job_id, "deleted": True}),
+                content_type="application/json",
+                status=200,
+            )
+        except Exception as e:
+            logger.exception(f"Failed to delete execution config for job {job_id}")
+            return Response(
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+                status=500,
+            )
+
+    @routes.get("/api/data/execution_configs")
+    @optional_utils.init_ray_and_catch_exceptions()
+    async def list_execution_configs(self, req: Request) -> Response:
+        """List all execution configurations.
+
+        Returns:
+            Response with all execution configurations.
+        """
+        try:
+            client = self._get_execution_config_client()
+            configs = await client.get_all_configs()
+
+            result = {
+                job_id: config.to_dict()
+                for job_id, config in configs.items()
+            }
+
+            return Response(
+                text=json.dumps({"configs": result}),
+                content_type="application/json",
+                status=200,
+            )
+        except Exception as e:
+            logger.exception("Failed to list execution configs")
+            return Response(
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+                status=500,
+            )
+
+    @routes.get("/api/data/{job_id}/operators")
+    @optional_utils.init_ray_and_catch_exceptions()
+    async def get_operators(self, req: Request) -> Response:
+        """Get operator runtime metrics for a specific job.
+
+        This endpoint returns detailed runtime metrics for all operators in
+        the job, including TaskPool and ActorPool specific information.
+
+        Args:
+            req: The HTTP request containing job_id in path.
+
+        Returns:
+            Response with operator metrics including:
+            - For TaskPoolMapOperator: active_tasks, max_concurrency
+            - For ActorPoolMapOperator: current_size, running, pending, min_size, max_size
+        """
+        job_id = req.match_info["job_id"]
+
+        try:
+            from ray.data._internal.stats import get_or_create_stats_actor
+
+            _stats_actor = get_or_create_stats_actor()
+            datasets = await _stats_actor.get_datasets.remote(job_id)
+
+            if not datasets:
+                return Response(
+                    text=json.dumps({
+                        "error": f"No datasets found for job: {job_id}",
+                        "job_id": job_id,
+                    }),
+                    content_type="application/json",
+                    status=404,
+                )
+
+            # Extract operator information with pool-specific metrics
+            result = []
+            for dataset_tag, dataset_info in datasets.items():
+                operators_info = dataset_info.get("operators", {})
+                dataset_state = dataset_info.get("state", "UNKNOWN")
+
+                for op_id, op_data in operators_info.items():
+                    operator_info = {
+                        "dataset": dataset_tag,
+                        "operator_id": op_id,
+                        "name": op_data.get("name"),
+                        "state": op_data.get("state"),
+                        "progress": op_data.get("progress"),
+                        "total": op_data.get("total"),
+                        "total_rows": op_data.get("total_rows"),
+                        "queued_blocks": op_data.get("queued_blocks"),
+                    }
+
+                    # Add TaskPool metrics if available
+                    if "task_pool" in op_data:
+                        operator_info["task_pool"] = op_data["task_pool"]
+
+                    # Add ActorPool metrics if available
+                    if "actor_pool" in op_data:
+                        operator_info["actor_pool"] = op_data["actor_pool"]
+
+                    result.append(operator_info)
+
+            return Response(
+                text=json.dumps({
+                    "job_id": job_id,
+                    "operators": result,
+                }),
+                content_type="application/json",
+                status=200,
+            )
+        except Exception as e:
+            logger.exception(f"Failed to get operators for job {job_id}")
+            return Response(
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+                status=500,
+            )

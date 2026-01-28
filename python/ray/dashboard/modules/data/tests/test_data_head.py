@@ -11,7 +11,14 @@ from ray.tests.conftest import *  # noqa
 # For local testing on a Macbook, set `export TEST_ON_DARWIN=1`.
 TEST_ON_DARWIN = os.environ.get("TEST_ON_DARWIN", "0") == "1"
 
-DATA_HEAD_URLS = {"GET": "http://localhost:8265/api/data/datasets/{job_id}"}
+DATA_HEAD_URLS = {
+    "GET": "http://localhost:8265/api/data/datasets/{job_id}",
+    "GET_OPERATORS": "http://localhost:8265/api/data/{job_id}/operators",
+    "GET_EXECUTION_CONFIG": "http://localhost:8265/api/data/{job_id}/execution_config",
+    "PUT_EXECUTION_CONFIG": "http://localhost:8265/api/data/{job_id}/execution_config",
+    "DELETE_EXECUTION_CONFIG": "http://localhost:8265/api/data/{job_id}/execution_config",
+    "LIST_EXECUTION_CONFIGS": "http://localhost:8265/api/data/execution_configs",
+}
 
 DATA_SCHEMA = [
     "state",
@@ -135,6 +142,283 @@ def test_get_datasets(ray_start_regular_shared):
     assert dataset["job_id"] == job_id
     assert dataset["state"] == "FINISHED"
     assert dataset["end_time"] is not None
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_get_operators(ray_start_regular_shared):
+    """Test the /api/data/operators/{job_id} endpoint."""
+    ds = ray.data.range(100, override_num_blocks=20).map_batches(lambda x: x)
+    ds.set_name("operators_test")
+    ds.materialize()
+
+    client = JobSubmissionClient()
+    jobs = client.list_jobs()
+    assert len(jobs) == 1, jobs
+    job_id = jobs[0].job_id
+
+    data = requests.get(DATA_HEAD_URLS["GET_OPERATORS"].format(job_id=job_id)).json()
+
+    assert "operators" in data
+    assert data["job_id"] == job_id
+
+    # Filter to only our test dataset's operators
+    operators = [
+        op for op in data["operators"]
+        if op["dataset"].startswith("operators_test")
+    ]
+
+    assert len(operators) >= 1
+
+    # Verify operator structure
+    for op in operators:
+        assert "operator_id" in op
+        assert "name" in op
+        assert "state" in op
+        assert "progress" in op
+
+        # TaskPool operators should have task_pool info
+        if "task_pool" in op:
+            assert "active_tasks" in op["task_pool"]
+            assert "max_concurrency" in op["task_pool"]
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_get_execution_config(ray_start_regular_shared):
+    """Test the execution config CRUD endpoints."""
+    client = JobSubmissionClient()
+    jobs = client.list_jobs()
+    assert len(jobs) >= 1, jobs
+    job_id = jobs[0].job_id
+
+    # Test GET non-existent config returns 404
+    response = requests.get(
+        DATA_HEAD_URLS["GET_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 404
+    data = response.json()
+    assert "error" in data
+
+    # Test PUT to create a new config
+    config_payload = {
+        "config": {
+            "job_id": job_id,
+            "operators": {
+                "op1": {
+                    "type": "task_pool",
+                    "id": "op1",
+                    "name": "TestOperator",
+                    "max_concurrency": 10,
+                }
+            }
+        }
+    }
+    response = requests.put(
+        DATA_HEAD_URLS["PUT_EXECUTION_CONFIG"].format(job_id=job_id),
+        json=config_payload,
+    )
+    assert response.status_code == 201  # Created
+    data = response.json()
+    assert data["success"] is True
+    assert data["created"] is True
+    assert data["job_id"] == job_id
+
+    # Test GET the created config
+    response = requests.get(
+        DATA_HEAD_URLS["GET_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["job_id"] == job_id
+    assert "config" in data
+    assert "operators" in data["config"]
+    assert "op1" in data["config"]["operators"]
+    assert data["config"]["operators"]["op1"]["max_concurrency"] == 10
+
+    # Test PUT to update existing config
+    config_payload["config"]["operators"]["op1"]["max_concurrency"] = 20
+    response = requests.put(
+        DATA_HEAD_URLS["PUT_EXECUTION_CONFIG"].format(job_id=job_id),
+        json=config_payload,
+    )
+    assert response.status_code == 200  # Updated (not created)
+    data = response.json()
+    assert data["success"] is True
+    assert data["created"] is False
+
+    # Verify update was applied
+    response = requests.get(
+        DATA_HEAD_URLS["GET_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["config"]["operators"]["op1"]["max_concurrency"] == 20
+
+    # Test LIST execution configs
+    response = requests.get(DATA_HEAD_URLS["LIST_EXECUTION_CONFIGS"])
+    assert response.status_code == 200
+    data = response.json()
+    assert "configs" in data
+    assert job_id in data["configs"]
+
+    # Test DELETE the config
+    response = requests.delete(
+        DATA_HEAD_URLS["DELETE_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data["success"] is True
+    assert data["deleted"] is True
+
+    # Verify deletion - GET should return 404
+    response = requests.get(
+        DATA_HEAD_URLS["GET_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 404
+
+    # Test DELETE non-existent config returns 404
+    response = requests.delete(
+        DATA_HEAD_URLS["DELETE_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 404
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_put_execution_config_invalid_request(ray_start_regular_shared):
+    """Test PUT execution config with invalid request body."""
+    client = JobSubmissionClient()
+    jobs = client.list_jobs()
+    assert len(jobs) >= 1, jobs
+    job_id = jobs[0].job_id
+
+    # Test PUT with missing 'config' field
+    response = requests.put(
+        DATA_HEAD_URLS["PUT_EXECUTION_CONFIG"].format(job_id=job_id),
+        json={"invalid": "payload"},
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert "error" in data
+    assert "Missing 'config' field" in data["error"]
+
+    # Test PUT with invalid config format (missing type)
+    invalid_config = {
+        "config": {
+            "operators": {
+                "op1": {
+                    "id": "op1",
+                    "name": "TestOp",
+                    # missing "type" field
+                }
+            }
+        }
+    }
+    response = requests.put(
+        DATA_HEAD_URLS["PUT_EXECUTION_CONFIG"].format(job_id=job_id),
+        json=invalid_config,
+    )
+    assert response.status_code == 400
+    data = response.json()
+    assert "error" in data
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_execution_config_with_actor_pool(ray_start_regular_shared):
+    """Test execution config with ActorPool operator configuration."""
+    client = JobSubmissionClient()
+    jobs = client.list_jobs()
+    assert len(jobs) >= 1, jobs
+    job_id = jobs[0].job_id
+
+    # Create config with ActorPool operator
+    config_payload = {
+        "config": {
+            "job_id": job_id,
+            "operators": {
+                "actor_op": {
+                    "type": "actor_pool",
+                    "id": "actor_op",
+                    "name": "ActorPoolOperator",
+                    "min_size": 1,
+                    "max_size": 10,
+                    "size": 5,
+                }
+            }
+        }
+    }
+    response = requests.put(
+        DATA_HEAD_URLS["PUT_EXECUTION_CONFIG"].format(job_id=job_id),
+        json=config_payload,
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["success"] is True
+
+    # Verify the actor pool config was stored correctly
+    response = requests.get(
+        DATA_HEAD_URLS["GET_EXECUTION_CONFIG"].format(job_id=job_id)
+    )
+    assert response.status_code == 200
+    data = response.json()
+    actor_op = data["config"]["operators"]["actor_op"]
+    assert actor_op["type"] == "actor_pool"
+    assert actor_op["min_size"] == 1
+    assert actor_op["max_size"] == 10
+    assert actor_op["size"] == 5
+
+    # Clean up
+    requests.delete(DATA_HEAD_URLS["DELETE_EXECUTION_CONFIG"].format(job_id=job_id))
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_get_operators_with_actor_pool(ray_start_regular_shared):
+    """Test that ActorPool metrics are exposed via the operators endpoint."""
+
+    class Identity:
+        def __call__(self, batch):
+            return batch
+
+    ds = ray.data.range(100, override_num_blocks=10).map_batches(
+        Identity,
+        compute=ray.data.ActorPoolStrategy(size=2),
+    )
+    ds.set_name("actor_pool_operators_test")
+    ds.materialize()
+
+    client = JobSubmissionClient()
+    jobs = client.list_jobs()
+    job_id = jobs[0].job_id
+
+    data = requests.get(DATA_HEAD_URLS["GET_OPERATORS"].format(job_id=job_id)).json()
+
+    # Filter to our test dataset's operators
+    operators = [
+        op for op in data["operators"]
+        if op["dataset"].startswith("actor_pool_operators_test")
+    ]
+
+    # Find the ActorPool operator
+    actor_pool_ops = [op for op in operators if "actor_pool" in op]
+
+    # The map_batches with ActorPoolStrategy should have actor_pool info
+    # Note: After execution finishes, actor pool may be shut down,
+    # so we just verify the structure is correct when present
+    for op in actor_pool_ops:
+        assert "current_size" in op["actor_pool"]
+        assert "running" in op["actor_pool"]
+        assert "pending" in op["actor_pool"]
+        assert "min_size" in op["actor_pool"]
+        assert "max_size" in op["actor_pool"]
+
 
 
 if __name__ == "__main__":

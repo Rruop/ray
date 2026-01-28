@@ -201,3 +201,11 @@ py_test(
     tags = ["team:data"],
     deps = [":conftest"],
 )
+
+py_test(
+    name = "test_config_client",
+    size = "small",
+    srcs = ["modules/data/tests/test_config_client.py"],
+    tags = ["team:data"],
+    deps = [":conftest"],
+)
