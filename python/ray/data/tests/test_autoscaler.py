@@ -11,6 +11,8 @@ from ray.data import ExecutionResources
 from ray.data._internal.actor_autoscaler import (
     ActorPoolScalingRequest,
     DefaultActorAutoscaler,
+    NoOpActorAutoscaler,
+    create_actor_autoscaler,
 )
 from ray.data._internal.cluster_autoscaler import DefaultClusterAutoscaler
 from ray.data._internal.execution.operators.actor_pool_map_operator import _ActorPool
@@ -20,6 +22,7 @@ from ray.data._internal.execution.operators.base_physical_operator import (
 from ray.data._internal.execution.resource_manager import ResourceManager
 from ray.data._internal.execution.streaming_executor_state import OpState
 from ray.data.context import (
+    ActorAutoscalerType,
     AutoscalingConfig,
 )
 
@@ -868,6 +871,101 @@ def test_autoscaling_config_validation_negative_upscaling_threshold(
                 actor_pool_max_upscaling_delta=5,
             ),
         )
+
+
+def test_autoscaler_type_enum():
+    """Test ActorAutoscalerType enum values."""
+    assert ActorAutoscalerType.DISABLED.value == "disabled"
+    assert ActorAutoscalerType.DEFAULT.value == "default"
+
+    # Test enum membership
+    assert ActorAutoscalerType.DISABLED in ActorAutoscalerType
+    assert ActorAutoscalerType.DEFAULT in ActorAutoscalerType
+
+
+def test_autoscaling_config_default_type():
+    """Test that AutoscalingConfig defaults to DEFAULT autoscaler type."""
+    config = AutoscalingConfig()
+    assert config.autoscaler_type == ActorAutoscalerType.DEFAULT
+
+
+def test_autoscaling_config_with_type():
+    """Test AutoscalingConfig with explicit autoscaler type."""
+    # Test DISABLED type
+    config_disabled = AutoscalingConfig(autoscaler_type=ActorAutoscalerType.DISABLED)
+    assert config_disabled.autoscaler_type == ActorAutoscalerType.DISABLED
+
+    # Test DEFAULT type
+    config_default = AutoscalingConfig(autoscaler_type=ActorAutoscalerType.DEFAULT)
+    assert config_default.autoscaler_type == ActorAutoscalerType.DEFAULT
+
+    # Test with other config options
+    config_full = AutoscalingConfig(
+        autoscaler_type=ActorAutoscalerType.DEFAULT,
+        actor_pool_util_upscaling_threshold=1.5,
+        actor_pool_util_downscaling_threshold=0.3,
+    )
+    assert config_full.autoscaler_type == ActorAutoscalerType.DEFAULT
+    assert config_full.actor_pool_util_upscaling_threshold == 1.5
+    assert config_full.actor_pool_util_downscaling_threshold == 0.3
+
+
+def test_noop_actor_autoscaler():
+    """Test NoOpActorAutoscaler does nothing."""
+    topology = MagicMock()
+    resource_manager = MagicMock(spec=ResourceManager)
+
+    autoscaler = NoOpActorAutoscaler(topology, resource_manager)
+
+    # Verify it's an instance of ActorAutoscaler
+    from ray.data._internal.actor_autoscaler import ActorAutoscaler
+
+    assert isinstance(autoscaler, ActorAutoscaler)
+
+    # Verify try_trigger_scaling does nothing (no exceptions, no side effects)
+    autoscaler.try_trigger_scaling()
+
+    # Verify topology and resource_manager are stored
+    assert autoscaler._topology is topology
+    assert autoscaler._resource_manager is resource_manager
+
+
+def test_create_actor_autoscaler_disabled():
+    """Test create_actor_autoscaler returns NoOpActorAutoscaler when DISABLED."""
+    topology = MagicMock()
+    resource_manager = MagicMock(spec=ResourceManager)
+    config = AutoscalingConfig(autoscaler_type=ActorAutoscalerType.DISABLED)
+
+    autoscaler = create_actor_autoscaler(topology, resource_manager, config)
+
+    assert isinstance(autoscaler, NoOpActorAutoscaler)
+
+
+def test_create_actor_autoscaler_default():
+    """Test create_actor_autoscaler returns DefaultActorAutoscaler when DEFAULT."""
+    topology = MagicMock()
+    resource_manager = MagicMock(
+        spec=ResourceManager, get_budget=MagicMock(return_value=None)
+    )
+    # Mock topology.items() to return empty dict for validation
+    topology.items = MagicMock(return_value=[])
+    config = AutoscalingConfig(autoscaler_type=ActorAutoscalerType.DEFAULT)
+
+    autoscaler = create_actor_autoscaler(topology, resource_manager, config)
+
+    assert isinstance(autoscaler, DefaultActorAutoscaler)
+
+
+def test_create_actor_autoscaler_default_config():
+    """Test create_actor_autoscaler with default config returns NoOpActorAutoscaler."""
+    topology = MagicMock()
+    resource_manager = MagicMock(spec=ResourceManager)
+    config = AutoscalingConfig()  # Default config
+
+    autoscaler = create_actor_autoscaler(topology, resource_manager, config)
+
+    # Default should be DISABLED, so we get NoOpActorAutoscaler
+    assert isinstance(autoscaler, DefaultActorAutoscaler)
 
 
 if __name__ == "__main__":

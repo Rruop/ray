@@ -3,6 +3,7 @@ from typing import TYPE_CHECKING
 from .autoscaling_actor_pool import ActorPoolScalingRequest, AutoscalingActorPool
 from .base_actor_autoscaler import ActorAutoscaler
 from .default_actor_autoscaler import DefaultActorAutoscaler, _get_max_scale_up
+from .noop_actor_autoscaler import NoOpActorAutoscaler
 
 if TYPE_CHECKING:
     from ray.data._internal.execution.resource_manager import ResourceManager
@@ -15,11 +16,16 @@ def create_actor_autoscaler(
     resource_manager: "ResourceManager",
     config: "AutoscalingConfig",
 ) -> ActorAutoscaler:
-    return DefaultActorAutoscaler(
-        topology,
-        resource_manager,
-        config=config,
-    )
+    from ray.data.context import ActorAutoscalerType
+
+    if config.autoscaler_type == ActorAutoscalerType.DISABLED:
+        return NoOpActorAutoscaler(topology, resource_manager)
+    else:
+        return DefaultActorAutoscaler(
+            topology,
+            resource_manager,
+            config=config,
+        )
 
 
 __all__ = [

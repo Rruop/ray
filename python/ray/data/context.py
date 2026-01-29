@@ -41,6 +41,18 @@ class ShuffleStrategy(str, enum.Enum):
     GPU_SHUFFLE = "gpu_shuffle"
 
 
+@DeveloperAPI
+class ActorAutoscalerType(str, enum.Enum):
+    """Type of actor autoscaler to use.
+
+    DISABLED: No autoscaling (default). Uses a no-op autoscaler.
+    DEFAULT: Use the DefaultActorAutoscaler for automatic scaling.
+    """
+
+    DISABLED = "disabled"
+    DEFAULT = "default"
+
+
 # We chose 128MiB for default: With streaming execution and num_cpus many concurrent
 # tasks, the memory footprint will be about 2 * num_cpus * target_max_block_size ~= RAM
 # * DEFAULT_OBJECT_STORE_MEMORY_LIMIT_FRACTION * 0.3 (default object store memory
@@ -395,6 +407,9 @@ class AutoscalingConfig:
     """Configuration for autoscaling of Ray Data.
 
     Args:
+        autoscaler_type: Type of actor autoscaler to use.
+            DISABLED (default): No autoscaling, uses a no-op autoscaler.
+            DEFAULT: Use the DefaultActorAutoscaler for automatic scaling.
         actor_pool_util_upscaling_threshold: Actor Pool utilization threshold for upscaling.
             Once Actor Pool exceeds this utilization threshold it will start adding new actors.
             Actor Pool utilization is defined as ratio of number of submitted tasks to the
@@ -412,6 +427,8 @@ class AutoscalingConfig:
             This limits how many actors can be added at once to prevent resource contention
             and scheduling pressure. Defaults to 1 for conservative scaling.
     """
+
+    autoscaler_type: "ActorAutoscalerType" = ActorAutoscalerType.DEFAULT
 
     actor_pool_util_upscaling_threshold: float = (
         DEFAULT_ACTOR_POOL_UTIL_UPSCALING_THRESHOLD
