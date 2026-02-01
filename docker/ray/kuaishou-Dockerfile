@@ -1,0 +1,37 @@
+# syntax=docker/dockerfile:1.3-labs
+
+ARG BASE_IMAGE
+ARG FULL_BASE_IMAGE=registry-internal.corp.kuaishou.com/ksbase-test/build/python/ray-base-deps:${BASE_IMAGE}
+FROM $FULL_BASE_IMAGE
+
+ARG WHEEL_PATH
+ARG FIND_LINKS_PATH=".whl"
+ARG CONSTRAINTS_FILE="requirements_compiled.txt"
+
+RUN echo "========================================" && \
+    echo "Build Arguments:" && \
+    echo "  BASE_IMAGE: ${BASE_IMAGE}" && \
+    echo "  WHEEL_PATH: ${WHEEL_PATH}" && \
+    echo "  FIND_LINKS_PATH: ${FIND_LINKS_PATH}" && \
+    echo "  CONSTRAINTS_FILE: ${CONSTRAINTS_FILE}" && \
+    echo "========================================" && \
+    mkdir -p ${FIND_LINKS_PATH}
+
+RUN $HOME/anaconda3/bin/pip config set global.index_url https://pypi.corp.kuaishou.com/kuaishou/prod/+simple/ && \
+    $HOME/anaconda3/bin/pip config set search.index https://pypi.corp.kuaishou.com/kuaishou/prod/
+
+COPY ${CONSTRAINTS_FILE} /tmp/requirements_compiled.txt
+
+RUN csc get luoyang/ray/${WHEEL_PATH} ${FIND_LINKS_PATH}/ && \
+    echo "Downloaded files:" && \
+    ls -lh ${FIND_LINKS_PATH}
+
+RUN $HOME/anaconda3/bin/pip install -U "pip<=25.2" setuptools_scm "wheel<=0.45.0" pbr tox poetry cython build && \
+    $HOME/anaconda3/bin/pip --no-cache-dir install "${FIND_LINKS_PATH}/${WHEEL_PATH}[data-kconf]"
+
+RUN $HOME/anaconda3/bin/pip --no-cache-dir install -c /tmp/requirements_compiled.txt \
+    "${FIND_LINKS_PATH}/${WHEEL_PATH}[data,train,serve]" \
+    --find-links $FIND_LINKS_PATH && \
+    $HOME/anaconda3/bin/pip install ffmpeg-python kafka-python
+
+RUN $HOME/anaconda3/bin/pip freeze > ${HOME}/pip-freeze.txt
