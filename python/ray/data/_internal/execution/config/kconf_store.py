@@ -205,6 +205,9 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
         """
         Initialize Kconf-based config store.
 
+        Note: The watcher is not added here. It will be added after init() is called
+        to ensure the configuration exists before watching for changes.
+
         Args:
             key: The kconf key for configuration storage.
             token: Authentication token for kconf access.
@@ -213,11 +216,8 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
         self._key = key
         self._token = token
         self._config: Optional[ExecutionConfig] = None
-
-        try:
-            self._add_watcher()
-        except Exception as e:
-            logger.warning(f"Failed to initialize watcher for key {self._key}: {e}")
+        self._initialized = False
+        self._watcher_added = False
 
     def get(self) -> Optional[ExecutionConfig]:
         """Get the current execution configuration."""
@@ -233,37 +233,70 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
             logger.debug(f"Updated configuration in kconf for key: {self._key}")
 
     def init(self, config: ExecutionConfig) -> bool:
-        """Initialize the configuration if it doesn't exist."""
+        """Initialize the configuration if it doesn't exist.
+
+        This method also adds the watcher after ensuring the configuration exists.
+
+        Args:
+            config: The initial configuration to use if none exists.
+
+        Returns:
+            True if created, False if already exists.
+        """
+        should_add_watcher = False
+
         with self._lock:
-            if self._config is not None:
+            if self._initialized:
                 return False
 
             try:
-                if self._config_exists():
-                    value = get_string_config(self._key)
-                    self._config = ExecutionConfig.from_json(value)
-                    return False
+                existing_value = self._try_get_config()
+                if existing_value is not None:
+                    self._config = ExecutionConfig.from_json(existing_value)
                 else:
-                    create_config(self._key, self._token, KConfValueType.STRING, "execution configuration")
+                    create_config(
+                        self._key,
+                        self._token,
+                        KConfValueType.STRING,
+                        "execution configuration",
+                    )
                     self._config = config
                     value = config.to_json()
                     update_config(self._key, self._token, value)
-                    return True
+
+                self._initialized = True
+
+                # Mark that we need to add watcher, but do it outside the lock
+                # to avoid deadlock if add_watcher triggers a synchronous callback
+                if not self._watcher_added:
+                    should_add_watcher = True
+
             except KConfError as e:
                 logger.error(f"Failed to initialize kconf configuration: {e}")
                 return False
 
+        # Add watcher outside the lock to prevent deadlock
+        if should_add_watcher:
+            try:
+                self._add_watcher()
+                self._watcher_added = True
+            except Exception as e:
+                logger.warning(
+                    f"Failed to add watcher for key {self._key}: {e}"
+                )
+
+        return True
+
     def _add_watcher(self) -> None:
         """
         Initialize and register a watcher to monitor configuration changes.
+
+        This should only be called after init() has been called to ensure
+        the configuration exists in kconf.
         """
-        try:
-            watcher = _ExecutionConfigWatcher(update_callback=self._on_config_updated)
-            add_watcher(self._key, watcher)
-            logger.info(f"Started watching for ExecutionConfig updates at '{self._key}'.")
-        except Exception as e:
-            logger.error(f"Failed to add watcher for key {self._key}: {e}")
-            # Continue without watcher - not critical for basic functionality
+        watcher = _ExecutionConfigWatcher(update_callback=self._on_config_updated)
+        add_watcher(self._key, watcher)
+        logger.info(f"Started watching for ExecutionConfig updates at '{self._key}'.")
 
     def _on_config_updated(self, new_config: ExecutionConfig) -> None:
         """
@@ -277,11 +310,14 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
             except Exception as e:
                 logger.error(f"Error updating configuration in callback for key {self._key}: {e}")
 
-    def _config_exists(self) -> bool:
-        """Check if configuration exists in kconf."""
+    def _try_get_config(self) -> Optional[str]:
+        """Try to get configuration from kconf.
+
+        Returns:
+            The configuration value as a string, or None if it doesn't exist.
+        """
         try:
-            get_string_config(self._key)
-            return True
+            return get_string_config(self._key)
         except KConfError as e:
-            error = e
-            return False
+            logger.warning(f"Config not found for key {self._key}: {e}")
+            return None
