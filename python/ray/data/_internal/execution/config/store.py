@@ -102,7 +102,14 @@ def create_execution_config_store(
             )
             return None
 
-        full_key = f"{kconf_key}.{job_id}" if job_id else kconf_key
+        if not job_id:
+            raise ValueError(
+                "job_id is required for kconf store. "
+                "Please provide a valid job_id when creating the store."
+            )
+
+        full_key = f"{kconf_key}.job_{job_id}"
+
         return KconfExecutionConfigStore(key=full_key, token=kconf_token)
 
     logger.warning(f"Unknown store type: {store_type}, using memory store")
