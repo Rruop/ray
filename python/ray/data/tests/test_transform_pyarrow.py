@@ -3305,6 +3305,58 @@ def block_slice_data():
     }
 
 
+def test_arrow_concat_missing_list_null_column():
+    """Test concatenating blocks where list<null> type columns are missing.
+
+    This tests the fix for a bug where pa.nulls() returns a pyarrow.Array
+    instead of a pyarrow.ChunkedArray, causing an AttributeError when
+    _concatenate_chunked_arrays tries to access the .chunks attribute.
+
+    The bug is triggered when:
+    1. At least one block has a list<null> type column (e.g., empty list [])
+    2. Another block is missing that column entirely
+    3. The column goes through _concat_cols_with_null_list path
+
+    Note: This bug only affects columns that enter cols_with_null_list,
+    which requires the column to have list<null> type in at least one block.
+    Regular list<T> columns (where T is not null) go through
+    native_pyarrow_cols path and don't trigger this bug.
+    """
+    # Block 1: has a list column with null value type (simulating empty list scenario)
+    block1 = pa.table(
+        {
+            "id": [1],
+            "scores": pa.array([[]], type=pa.list_(pa.null())),
+        }
+    )
+
+    # Block 2: has a list column with actual values
+    block2 = pa.table(
+        {
+            "id": [2],
+            "scores": [[0.9, 0.8]],
+        }
+    )
+
+    # Block 3: missing the "scores" column entirely - this triggers the bug
+    block3 = pa.table(
+        {
+            "id": [3],
+        }
+    )
+
+    result = concat([block1, block2, block3], promote_types=True)
+
+    assert len(result) == 3
+    assert result.column_names == ["id", "scores"]
+    assert result["id"].to_pylist() == [1, 2, 3]
+    # First row has empty list, second has values, third is null (missing column)
+    scores = result["scores"].to_pylist()
+    assert scores[0] == []
+    assert scores[1] == [0.9, 0.8]
+    assert scores[2] is None
+
+
 if __name__ == "__main__":
     import sys
 

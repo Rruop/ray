@@ -749,7 +749,13 @@ def concat(
             if col_name in block.schema.names:
                 col_chunked_arrays.append(block.column(col_name))
             else:
-                col_chunked_arrays.append(pa.nulls(block.num_rows, type=col_type))
+                # Wrap pa.nulls() in a chunked_array to ensure consistent type.
+                # pa.nulls() returns a pyarrow.Array, but block.column() returns
+                # a pyarrow.ChunkedArray. The downstream _concatenate_chunked_arrays
+                # function expects all elements to have a .chunks attribute.
+                col_chunked_arrays.append(
+                    pa.chunked_array([pa.nulls(block.num_rows, type=col_type)])
+                )
 
         if col_name in cols_with_null_list:
             concatenated_cols[col_name] = _concat_cols_with_null_list(
