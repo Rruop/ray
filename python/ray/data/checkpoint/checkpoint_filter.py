@@ -149,6 +149,33 @@ def _combine_chunks(ckpt_block: pyarrow.Table) -> pyarrow.Table:
 
     return combined_ckpt_block
 
+from pyarrow.fs import FileType
+
+class SkipEmptyParquetFilter:
+    def __init__(self, filesystem):
+        self._fs = filesystem
+
+    def apply(self, path: str) -> bool:
+        """
+        Determine whether to keep a single file path.
+        Returns True → keep the file; False → skip (filter out).
+        """
+        # Keep non-parquet files (e.g., _SUCCESS)
+        if not path.endswith(".parquet"):
+            return True
+
+        try:
+            # Get file metadata for the given path
+            info = self._fs.get_file_info(path)
+            
+            # Check if it's a regular file and non-empty
+            if info.type == FileType.File and info.size > 0:
+                return True
+            else:
+                return False  # Filter out empty files or directories
+        except Exception:
+            # Optional: log the error or silently filter out problematic paths
+            return False
 
 class CheckpointLoader:
     """Loading checkpoint data."""
@@ -173,6 +200,30 @@ class CheckpointLoader:
         self.filesystem = filesystem
         self.id_column = id_column
         self.checkpoint_path_partition_filter = checkpoint_path_partition_filter
+    def remove_empty_parquet_files(self):
+        from pyarrow.fs import FileSelector,FileType
+        selector = FileSelector(self.checkpoint_path, recursive=True)
+        file_infos = self.filesystem.get_file_info(selector)
+        
+        for info in file_infos:
+            if (info.type == FileType.File 
+                and info.path.endswith(".parquet") 
+                and info.size == 0):
+                print(f"Removing empty Parquet file: {info.path}")
+                self.filesystem.delete_file(info.path)
+
+    def _skip_empty_parquet(self):
+        """Skip zero-byte .parquet files."""
+        from pyarrow.fs import FileSelector,FileType
+        infos = self.filesystem.get_file_info(self.checkpoint_path)
+        result = []
+        for path, info in zip(self.checkpoint_path, infos):
+            if path.endswith(".parquet"):
+                if info.type == FileType.File and info.size > 0:
+                    result.append(path)
+            else:
+                result.append(path)  # keep non-parquet
+        return result
 
     def load_checkpoint(self) -> ObjectRef[Block]:
         """Loading checkpoint data.
@@ -182,7 +233,12 @@ class CheckpointLoader:
         """
         start_t = time.time()
 
+      
+        #self.remove_empty_parquet_files()
+
         # Load the checkpoint data
+        if self.checkpoint_path_partition_filter is None:
+            self.checkpoint_path_partition_filter = SkipEmptyParquetFilter(self.filesystem)
         checkpoint_ds: ray.data.Dataset = ray.data.read_parquet(
             self.checkpoint_path,
             filesystem=self.filesystem,
