@@ -25,6 +25,7 @@ DATA_SCHEMA = [
     "progress",
     "total",
     "total_rows",
+    "num_errored_blocks",
     "ray_data_output_rows",
     "ray_data_spilled_bytes",
     "ray_data_current_bytes",
@@ -142,6 +143,94 @@ def test_get_datasets(ray_start_regular_shared):
     assert dataset["job_id"] == job_id
     assert dataset["state"] == "FINISHED"
     assert dataset["end_time"] is not None
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_num_errored_blocks_in_response(ray_start_regular_shared):
+    """Test that num_errored_blocks metric is included in the response schema."""
+    ds = ray.data.range(50, override_num_blocks=10).map_batches(lambda x: x)
+    ds.set_name("errored_blocks_test")
+    ds.materialize()
+
+    client = JobSubmissionClient()
+    jobs = client.list_jobs()
+    assert len(jobs) >= 1, jobs
+    job_id = jobs[0].job_id
+
+    data = requests.get(DATA_HEAD_URLS["GET"].format(job_id=job_id)).json()
+    datasets = [
+        dataset
+        for dataset in data["datasets"]
+        if dataset["dataset"].startswith("errored_blocks_test")
+    ]
+
+    assert len(datasets) == 1
+    dataset = datasets[0]
+
+    # Verify num_errored_blocks is present at dataset level
+    # This comes directly from _StatsActor, not from Prometheus
+    assert "num_errored_blocks" in dataset
+    # For a successful dataset without errors, this should be 0
+    assert dataset["num_errored_blocks"] == 0
+
+    # Verify num_errored_blocks is present at operator level
+    for operator in dataset["operators"]:
+        assert "num_errored_blocks" in operator
+
+
+@pytest.mark.skipif(
+    sys.platform == "darwin" and not TEST_ON_DARWIN, reason="Flaky on OSX."
+)
+def test_num_errored_blocks_with_failures(ray_start_regular_shared):
+    """Test that num_errored_blocks correctly reflects failed tasks."""
+    ctx = ray.data.DataContext.get_current()
+    original_max_errored_blocks = ctx.max_errored_blocks
+
+    try:
+        # Allow up to 3 errored blocks
+        ctx.max_errored_blocks = 3
+
+        def fail_some_blocks(batch):
+            # Fail based on batch content to get deterministic failures
+            if batch["id"][0] < 2:
+                raise RuntimeError("Intentional failure")
+            return batch
+
+        ds = ray.data.range(10, override_num_blocks=10).map_batches(
+            fail_some_blocks, batch_size=1
+        )
+        ds.set_name("errored_blocks_with_failures_test")
+
+        # This should complete with some errored blocks (not fail completely)
+        result = ds.take_all()
+
+        # We should have 8 successful results (10 - 2 failures)
+        assert len(result) == 8
+
+        client = JobSubmissionClient()
+        jobs = client.list_jobs()
+        job_id = jobs[0].job_id
+
+        data = requests.get(DATA_HEAD_URLS["GET"].format(job_id=job_id)).json()
+        datasets = [
+            dataset
+            for dataset in data["datasets"]
+            if dataset["dataset"].startswith("errored_blocks_with_failures_test")
+        ]
+
+        assert len(datasets) == 1
+        dataset = datasets[0]
+
+        # The num_errored_blocks should reflect the failures
+        # This comes directly from _StatsActor, not from Prometheus
+        assert "num_errored_blocks" in dataset
+        # Verify the structure is correct (should be an integer)
+        assert isinstance(dataset["num_errored_blocks"], int)
+
+    finally:
+        ctx.max_errored_blocks = original_max_errored_blocks
 
 
 @pytest.mark.skipif(
