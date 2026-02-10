@@ -36,6 +36,8 @@ export type DataMetrics = {
     value: number;
     max: number;
   };
+  // Obtained directly from _StatsActor, not from Prometheus metrics
+  num_errored_blocks: number;
   progress: number;
   total: number;
 };

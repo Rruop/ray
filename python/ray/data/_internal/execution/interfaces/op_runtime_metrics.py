@@ -381,6 +381,11 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         description="Number of failed tasks.",
         metrics_group=MetricsGroup.TASKS,
     )
+    num_errored_blocks: int = metric_field(
+        default=0,
+        description="Number of blocks that failed during processing.",
+        metrics_group=MetricsGroup.TASKS,
+    )
     block_generation_time: float = metric_field(
         default=0,
         description="Time spent generating blocks in tasks.",
@@ -1115,3 +1120,7 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
 
         inputs.destroy_if_owned()
         del self._running_tasks[task_index]
+
+    def on_block_errored(self):
+        """Callback when a block processing fails."""
+        self.num_errored_blocks += 1

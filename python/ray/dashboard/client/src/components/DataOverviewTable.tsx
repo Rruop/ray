@@ -32,6 +32,13 @@ const columns = [
     helpInfo: <Typography>Blocks outputted by output operator.</Typography>,
   },
   { label: "State", align: "center" },
+  {
+    label: "Errored Blocks",
+    helpInfo: (
+      <Typography>Number of blocks that failed during processing.</Typography>
+    ),
+    align: "center",
+  },
   { label: "Rows Outputted" },
   {
     label: "Queued Blocks",
@@ -218,6 +225,15 @@ const DataRow = ({
       </TableCell>
       <TableCell align="center">
         <StatusChip type="task" status={data.state} />
+      </TableCell>
+      <TableCell align="center">
+        {(data.num_errored_blocks ?? 0) > 0 ? (
+          <Typography color="error">
+            {data.num_errored_blocks}
+          </Typography>
+        ) : (
+          0
+        )}
       </TableCell>
       <TableCell align="right">{data.ray_data_output_rows.max}</TableCell>
       <TableCell align="right">

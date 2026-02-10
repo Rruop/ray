@@ -393,7 +393,7 @@ def process_completed_tasks(
     topology: Topology,
     backpressure_policies: List[BackpressurePolicy],
     max_errored_blocks: int,
-) -> int:
+) -> Dict["OpState", int]:
     """Process any newly completed tasks. To update operator
     states, call `update_operator_states()` afterwards.
 
@@ -403,7 +403,7 @@ def process_completed_tasks(
         max_errored_blocks: Max number of errored blocks to allow,
             unlimited if negative.
     Returns:
-        The number of errored blocks.
+        A dict mapping OpState to the number of errored blocks for that operator.
     """
 
     # All active tasks, keyed by their waitables.
@@ -440,6 +440,7 @@ def process_completed_tasks(
             remaining_output_budget[state] = max_bytes_to_read
 
     # Process completed Ray tasks and notify operators.
+    errored_blocks_per_op: Dict["OpState", int] = defaultdict(int)
     num_errored_blocks = 0
     if active_tasks:
         ready, _ = ray.wait(
@@ -474,6 +475,7 @@ def process_completed_tasks(
                                 remaining_output_budget[state] - bytes_read, 0
                             )
                     except Exception as e:
+                        errored_blocks_per_op[state] += 1
                         num_errored_blocks += 1
                         should_ignore = (
                             max_errored_blocks < 0
@@ -481,7 +483,8 @@ def process_completed_tasks(
                         )
                         error_message = (
                             "An exception was raised from a task of "
-                            f'operator "{state.op.name}".'
+                            f'operator "{state.op.name}". '
+                            f"[num_errored_blocks={num_errored_blocks}]"
                         )
                         if should_ignore:
                             remaining = (
@@ -511,7 +514,7 @@ def process_completed_tasks(
         while op.has_next():
             op_state.add_output(op.get_next())
 
-    return num_errored_blocks
+    return dict(errored_blocks_per_op)
 
 
 def update_operator_states(topology: Topology) -> None:
@@ -580,6 +583,9 @@ def get_eligible_operators(
     #   - Not throttled
     eligible_ops: List[PhysicalOperator] = []
 
+    # Debug: collect reasons why operators are not eligible
+    ineligible_reasons: Dict[str, List[str]] = {}
+
     for op, state in topology.items():
         # Operator is considered being in task-submission back-pressure if any
         # back-pressure policy is violated. Track the first triggered policy.
@@ -592,20 +598,46 @@ def get_eligible_operators(
 
         op_runnable = False
 
+        reasons = []
+
         # Check whether operator could start executing immediately:
         #   - It's not completed
         #   - It can accept at least one input
         #   - Its input queue has a valid bundle
-        if (
-            not op.has_completed()
-            and op.can_add_input()
-            and state.has_pending_bundles()
-        ):
+        is_completed = op.has_completed()
+        can_add = op.can_add_input()
+        has_bundles = state.has_pending_bundles()
+
+        if is_completed:
+            reasons.append("completed")
+        if not can_add:
+            reasons.append(
+                f"can_add_input=False(active_tasks={op.num_active_tasks()})")
+        if not has_bundles:
+            reasons.append(
+                f"no_pending_bundles(input_queues_len={[len(q) for q in state.input_queues]})")
+
+        if not is_completed and can_add and has_bundles:
             if not in_backpressure:
                 op_runnable = True
                 eligible_ops.append(op)
+                logger.debug(
+                    "[Scheduler] Op %s is ELIGIBLE: "
+                    "completed=%s, can_add_input=%s, has_pending_bundles=%s, "
+                    "active_tasks=%d, input_queue_sizes=%s",
+                    op.name,
+                    is_completed,
+                    can_add,
+                    has_bundles,
+                    op.num_active_tasks(),
+                    [len(q) for q in state.input_queues],
+                )
             else:
                 dispatchable_ops.append(op)
+                reasons.append(f"backpressure({triggered_policy})")
+
+        if reasons:
+            ineligible_reasons[op.name] = reasons
 
         # Update scheduling status
         state._scheduling_status = OpSchedulingStatus(
@@ -614,7 +646,15 @@ def get_eligible_operators(
         )
 
         # Signal whether op in backpressure for stats collections
-        op.notify_in_task_submission_backpressure(in_backpressure, triggered_policy)
+        op.notify_in_task_submission_backpressure(in_backpressure,
+                                                  triggered_policy)
+
+    # Log ineligible operators for debugging
+    if ineligible_reasons:
+        logger.debug(
+            "[Scheduler] Ineligible operators and reasons: %s",
+            {k: v for k, v in ineligible_reasons.items() if "completed" not in v},
+        )
 
     # To ensure liveness, allow at least 1 operator to schedule tasks regardless of
     # limits in case when topology is entirely idle (no active tasks running)
@@ -623,6 +663,11 @@ def get_eligible_operators(
         and ensure_liveness
         and all(op.num_active_tasks() == 0 for op in topology)
     ):
+        logger.debug(
+            "[Scheduler] No eligible ops, but ensure_liveness=True and all ops idle. "
+            "Returning dispatchable_ops=%s for liveness.",
+            [op.name for op in dispatchable_ops],
+        )
         return dispatchable_ops
 
     return eligible_ops

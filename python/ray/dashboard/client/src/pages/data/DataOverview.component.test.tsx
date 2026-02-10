@@ -33,6 +33,7 @@ describe("DataOverview", () => {
           value: 70,
           max: 80,
         },
+        num_errored_blocks: 0,
         operators: [
           {
             operator: "test_ds1_op1",
@@ -59,6 +60,7 @@ describe("DataOverview", () => {
               value: 71,
               max: 81,
             },
+            num_errored_blocks: 0,
           },
         ],
       },
@@ -88,6 +90,7 @@ describe("DataOverview", () => {
           value: 110,
           max: 120,
         },
+        num_errored_blocks: 0,
         operators: [],
       },
     ];
@@ -124,5 +127,51 @@ describe("DataOverview", () => {
     expect(screen.getByText("70.0000B/80.0000B")).toBeVisible();
     expect(screen.getByText("90/100")).toBeVisible();
     expect(screen.getByText("110/120")).toBeVisible();
+  });
+
+  it("displays errored blocks count with error styling when > 0", async () => {
+    const datasets = [
+      {
+        dataset: "errored_ds",
+        job_id: "test_job_id",
+        state: "RUNNING",
+        progress: 50,
+        total: 100,
+        start_time: 0,
+        end_time: undefined,
+        ray_data_output_rows: { max: 10 },
+        ray_data_spilled_bytes: { max: 20 },
+        ray_data_current_bytes: { value: 30, max: 40 },
+        ray_data_cpu_usage_cores: { value: 50, max: 60 },
+        ray_data_gpu_usage_cores: { value: 70, max: 80 },
+        num_errored_blocks: 5,
+        operators: [
+          {
+            operator: "errored_op1",
+            name: "ErroredOperator",
+            state: "RUNNING",
+            progress: 45,
+            total: 100,
+            ray_data_output_rows: { max: 8 },
+            ray_data_spilled_bytes: { max: 15 },
+            ray_data_current_bytes: { value: 25, max: 35 },
+            ray_data_cpu_usage_cores: { value: 40, max: 50 },
+            ray_data_gpu_usage_cores: { value: 60, max: 70 },
+            num_errored_blocks: 3,
+          },
+        ],
+      },
+    ];
+    const user = userEvent.setup();
+
+    render(<DataOverview datasets={datasets} />, { wrapper: TEST_APP_WRAPPER });
+
+    // Dataset level errored blocks should be displayed (value is 5)
+    expect(screen.getByText("5")).toBeVisible();
+
+    // Expand to see operator level errored blocks
+    await user.click(screen.getByTitle("Expand Dataset errored_ds"));
+    expect(screen.getByText("ErroredOperator")).toBeVisible();
+    expect(screen.getByText("3")).toBeVisible();
   });
 });

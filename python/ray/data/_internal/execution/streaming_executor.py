@@ -67,7 +67,7 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Interval for logging execution progress updates and operator metrics.
-DEBUG_LOG_INTERVAL_SECONDS = 5
+DEBUG_LOG_INTERVAL_SECONDS = 300
 
 # Maximum string/sequence length for DataContext logging. Set high to avoid truncation
 # while still protecting against pathological cases.
@@ -269,6 +269,13 @@ class StreamingExecutor(Executor, threading.Thread):
                 f"Shutting down executor for dataset {self._dataset_id} "
                 f"({status_detail})"
             )
+
+            # Log final error summary if any errors occurred
+            if self._num_errored_blocks > 0:
+                logger.info(
+                    f"Dataset {self._dataset_id} completed with "
+                    f"{self._num_errored_blocks} errored blocks"
+                )
 
             _num_shutdown += 1
             self._shutdown = True
@@ -501,6 +508,8 @@ class StreamingExecutor(Executor, threading.Thread):
             builder = stats.child_builder(op.name, override_start_time=self._start_time)
             stats = builder.build_multioperator(op.get_stats())
             stats.extra_metrics = op.metrics.as_dict(skip_internal_metrics=True)
+        # Use executor-level accumulated values for error metrics across all operators
+        stats.extra_metrics["num_errored_blocks"] = self._num_errored_blocks
         stats.streaming_exec_schedule_s = (
             self._initial_stats.streaming_exec_schedule_s
             if self._initial_stats
@@ -523,14 +532,23 @@ class StreamingExecutor(Executor, threading.Thread):
         # Note: calling process_completed_tasks() is expensive since it incurs
         # ray.wait() overhead, so make sure to allow multiple dispatch per call for
         # greater parallelism.
-        num_errored_blocks = process_completed_tasks(
+        errored_blocks_per_op = process_completed_tasks(
             topology,
             self._backpressure_policies,
             self._max_errored_blocks,
         )
+
+        # Update per-operator errored blocks metrics
+        for op_state, num_errors in errored_blocks_per_op.items():
+            if num_errors > 0:
+                for _ in range(num_errors):
+                    op_state.op.metrics.on_block_errored()
+
+        # Update executor-level errored blocks count
+        total_errored = sum(errored_blocks_per_op.values())
         if self._max_errored_blocks > 0:
-            self._max_errored_blocks -= num_errored_blocks
-        self._num_errored_blocks += num_errored_blocks
+            self._max_errored_blocks -= total_errored
+        self._num_errored_blocks += total_errored
 
         self._resource_manager.update_usages()
         # Dispatch as many operators as we can for completed tasks.
@@ -575,7 +593,7 @@ class StreamingExecutor(Executor, threading.Thread):
 
         self._update_stats_metrics(state=DatasetState.RUNNING.name)
         if time.time() - self._last_debug_log_time >= DEBUG_LOG_INTERVAL_SECONDS:
-            _log_op_metrics(topology)
+            _log_op_metrics(topology, self._num_errored_blocks)
             _debug_dump_topology(topology, self._resource_manager)
             self._last_debug_log_time = time.time()
 
@@ -711,12 +729,14 @@ class StreamingExecutor(Executor, threading.Thread):
         operators_dict = {}
         for i, (op, op_state) in enumerate(self._topology.items()):
             op_id = self._get_operator_id(op, i)
+            op_errored_blocks = op.metrics.num_errored_blocks
             op_info = {
                 "name": op.name,
                 "progress": op_state.num_completed_tasks,
                 "total": op.num_outputs_total(),
                 "total_rows": op.num_output_rows_total(),
                 "queued_blocks": op_state.total_enqueued_input_blocks(),
+                "num_errored_blocks": op_errored_blocks,
                 "state": DatasetState.FINISHED.name
                 if op.has_execution_finished()
                 else state,
@@ -749,6 +769,7 @@ class StreamingExecutor(Executor, threading.Thread):
             "progress": last_state.num_completed_tasks,
             "total": last_op.num_outputs_total(),
             "total_rows": last_op.num_output_rows_total(),
+            "num_errored_blocks": self._num_errored_blocks,
             "end_time": time.time()
             if state in (DatasetState.FINISHED.name, DatasetState.FAILED.name)
             else None,
@@ -786,11 +807,12 @@ def _debug_dump_topology(topology: Topology, resource_manager: ResourceManager) 
         )
 
 
-def _log_op_metrics(topology: Topology) -> None:
+def _log_op_metrics(topology: Topology, num_errored_blocks: int = 0) -> None:
     """Logs the metrics of each operator.
 
     Args:
         topology: The topology to debug.
+        num_errored_blocks: Total number of errored blocks in the job.
     """
     log_str = "Operator Metrics:\n"
     for op in topology:
@@ -818,6 +840,11 @@ def _log_op_metrics(topology: Topology) -> None:
                 )
 
         log_str += op_info + "\n"
+
+    # Add job-level error summary if any errors occurred
+    if num_errored_blocks > 0:
+        log_str += f"\n[Job Error Summary] total_errored_blocks={num_errored_blocks}\n"
+
     logger.debug(log_str)
 
 

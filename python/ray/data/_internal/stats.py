@@ -677,12 +677,14 @@ class _StatsActor:
             "total_rows": 0,
             "start_time": start_time,
             "end_time": None,
+            "num_errored_blocks": 0,
             "operators": {
                 operator: {
                     "state": DatasetState.PENDING.name,
                     "progress": 0,
                     "total": 0,
                     "queued_blocks": 0,
+                    "num_errored_blocks": 0,
                 }
                 for operator in operator_tags
             },
