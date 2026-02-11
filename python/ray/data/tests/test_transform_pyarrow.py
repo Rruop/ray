@@ -3357,6 +3357,332 @@ def test_arrow_concat_missing_list_null_column():
     assert scores[2] is None
 
 
+def test_concat_null_to_list_struct():
+    """Test concatenating blocks where null type needs to be cast to list<struct>.
+
+    This tests the fix for schema mismatch when one batch has all None values
+    (inferred as `null` type) and another batch has actual list<struct> data.
+    """
+    item_struct = pa.struct(
+        [
+            ("audioBlobstoreKey", pa.string()),
+            ("audioToneEmbed", pa.string()),
+            ("speakerId", pa.string()),
+            ("speech", pa.string()),
+        ]
+    )
+
+    # Block 1: null type (all values are None)
+    block1 = pa.table({"items": pa.nulls(2)})
+    assert pa.types.is_null(block1.column("items").type)
+
+    # Block 2: list<struct> type with actual data
+    block2 = pa.table(
+        {
+            "items": pa.array(
+                [
+                    [
+                        {
+                            "audioBlobstoreKey": "key1",
+                            "audioToneEmbed": "embed1",
+                            "speakerId": "sp1",
+                            "speech": "hello",
+                        }
+                    ],
+                    [
+                        {
+                            "audioBlobstoreKey": "key2",
+                            "audioToneEmbed": "embed2",
+                            "speakerId": "sp2",
+                            "speech": "world",
+                        }
+                    ],
+                ],
+                type=pa.list_(item_struct),
+            )
+        }
+    )
+
+    result = concat([block1, block2], promote_types=True)
+
+    assert len(result) == 4
+    assert pa.types.is_list(result.column("items").type)
+    assert pa.types.is_struct(result.column("items").type.value_type)
+
+    items = result["items"].to_pylist()
+    assert items[0] is None
+    assert items[1] is None
+    assert items[2] == [
+        {
+            "audioBlobstoreKey": "key1",
+            "audioToneEmbed": "embed1",
+            "speakerId": "sp1",
+            "speech": "hello",
+        }
+    ]
+    assert items[3] == [
+        {
+            "audioBlobstoreKey": "key2",
+            "audioToneEmbed": "embed2",
+            "speakerId": "sp2",
+            "speech": "world",
+        }
+    ]
+
+
+def test_concat_list_null_to_list_struct():
+    """Test concatenating blocks where list<null> needs to be cast to list<struct>.
+
+    This tests the fix for schema mismatch when one batch has all empty lists
+    (inferred as `list<null>` type) and another batch has actual list<struct> data.
+    """
+    item_struct = pa.struct(
+        [
+            ("audioBlobstoreKey", pa.string()),
+            ("audioToneEmbed", pa.string()),
+            ("speakerId", pa.string()),
+            ("speech", pa.string()),
+        ]
+    )
+
+    # Block 1: list<null> type (all values are empty lists)
+    block1 = pa.table({"items": pa.array([[], []], type=pa.list_(pa.null()))})
+    assert pa.types.is_list(block1.column("items").type)
+    assert pa.types.is_null(block1.column("items").type.value_type)
+
+    # Block 2: list<struct> type with actual data
+    block2 = pa.table(
+        {
+            "items": pa.array(
+                [
+                    [
+                        {
+                            "audioBlobstoreKey": "key1",
+                            "audioToneEmbed": "embed1",
+                            "speakerId": "sp1",
+                            "speech": "hello",
+                        }
+                    ],
+                ],
+                type=pa.list_(item_struct),
+            )
+        }
+    )
+
+    result = concat([block1, block2], promote_types=True)
+
+    assert len(result) == 3
+    assert pa.types.is_list(result.column("items").type)
+    assert pa.types.is_struct(result.column("items").type.value_type)
+
+    items = result["items"].to_pylist()
+    assert items[0] == []
+    assert items[1] == []
+    assert items[2] == [
+        {
+            "audioBlobstoreKey": "key1",
+            "audioToneEmbed": "embed1",
+            "speakerId": "sp1",
+            "speech": "hello",
+        }
+    ]
+
+
+def test_concat_nested_struct_with_list_null():
+    """Test concatenating blocks with nested struct containing list<null>.
+
+    This tests the fix for schema mismatch in nested structs where an inner
+    field has list<null> type in one batch but list<struct> in another.
+    """
+    item_struct = pa.struct(
+        [
+            ("audioBlobstoreKey", pa.string()),
+            ("audioToneEmbed", pa.string()),
+            ("speakerId", pa.string()),
+            ("speech", pa.string()),
+        ]
+    )
+
+    # Block 1: outer struct with inner list<null> field
+    block1 = pa.table(
+        {
+            "data": pa.array(
+                [{"items": []}],
+                type=pa.struct([("items", pa.list_(pa.null()))]),
+            )
+        }
+    )
+
+    # Block 2: outer struct with inner list<struct> field
+    block2 = pa.table(
+        {
+            "data": pa.array(
+                [
+                    {
+                        "items": [
+                            {
+                                "audioBlobstoreKey": "key1",
+                                "audioToneEmbed": "embed1",
+                                "speakerId": "sp1",
+                                "speech": "hello",
+                            }
+                        ]
+                    }
+                ],
+                type=pa.struct([("items", pa.list_(item_struct))]),
+            )
+        }
+    )
+
+    result = concat([block1, block2], promote_types=True)
+
+    assert len(result) == 2
+    data_type = result.column("data").type
+    assert pa.types.is_struct(data_type)
+    items_field_type = data_type.field("items").type
+    assert pa.types.is_list(items_field_type)
+    assert pa.types.is_struct(items_field_type.value_type)
+
+    data = result["data"].to_pylist()
+    assert data[0] == {"items": []}
+    assert data[1] == {
+        "items": [
+            {
+                "audioBlobstoreKey": "key1",
+                "audioToneEmbed": "embed1",
+                "speakerId": "sp1",
+                "speech": "hello",
+            }
+        ]
+    }
+
+
+def test_concat_deeply_nested_struct_with_null_types():
+    """Test concatenating blocks with deeply nested struct containing null types.
+
+    This tests the fix for schema mismatch in deeply nested structs:
+    struct<outer: struct<items: list<null>>> vs struct<outer: struct<items: list<struct>>>
+    """
+    item_struct = pa.struct(
+        [
+            ("audioBlobstoreKey", pa.string()),
+            ("speech", pa.string()),
+        ]
+    )
+
+    # Block 1: deeply nested struct with list<null>
+    block1 = pa.table(
+        {
+            "data": pa.array(
+                [{"outer": {"items": []}}],
+                type=pa.struct(
+                    [("outer", pa.struct([("items", pa.list_(pa.null()))]))]
+                ),
+            )
+        }
+    )
+
+    # Block 2: deeply nested struct with list<struct>
+    block2 = pa.table(
+        {
+            "data": pa.array(
+                [
+                    {
+                        "outer": {
+                            "items": [
+                                {"audioBlobstoreKey": "key1", "speech": "hello"}
+                            ]
+                        }
+                    }
+                ],
+                type=pa.struct(
+                    [("outer", pa.struct([("items", pa.list_(item_struct))]))]
+                ),
+            )
+        }
+    )
+
+    result = concat([block1, block2], promote_types=True)
+
+    assert len(result) == 2
+    data = result["data"].to_pylist()
+    assert data[0] == {"outer": {"items": []}}
+    assert data[1] == {
+        "outer": {"items": [{"audioBlobstoreKey": "key1", "speech": "hello"}]}
+    }
+
+
+def test_concat_struct_with_null_field_vs_list_struct_field():
+    """Test concatenating blocks where struct field is null vs list<struct>.
+
+    This tests the fix for schema mismatch when a struct field is `null` type
+    (all values are None) in one batch but `list<struct>` in another.
+    """
+    item_struct = pa.struct([("x", pa.int64()), ("y", pa.string())])
+
+    # Block 1: struct with null field (all None values)
+    block1 = pa.table(
+        {
+            "data": pa.array(
+                [{"items": None}],
+                type=pa.struct([("items", pa.null())]),
+            )
+        }
+    )
+
+    # Block 2: struct with list<struct> field
+    block2 = pa.table(
+        {
+            "data": pa.array(
+                [{"items": [{"x": 1, "y": "a"}]}],
+                type=pa.struct([("items", pa.list_(item_struct))]),
+            )
+        }
+    )
+
+    result = concat([block1, block2], promote_types=True)
+
+    assert len(result) == 2
+    data = result["data"].to_pylist()
+    assert data[0] == {"items": None}
+    assert data[1] == {"items": [{"x": 1, "y": "a"}]}
+
+
+def test_concat_mixed_null_scenarios():
+    """Test concatenating multiple blocks with various null type scenarios.
+
+    This tests multiple null type scenarios in a single concat operation:
+    - Block with null type
+    - Block with list<null> type
+    - Block with actual list<struct> data
+    """
+    item_struct = pa.struct([("id", pa.int64()), ("name", pa.string())])
+
+    # Block 1: null type
+    block1 = pa.table({"items": pa.nulls(1)})
+
+    # Block 2: list<null> type (empty list)
+    block2 = pa.table({"items": pa.array([[]], type=pa.list_(pa.null()))})
+
+    # Block 3: list<struct> type with data
+    block3 = pa.table(
+        {
+            "items": pa.array(
+                [[{"id": 1, "name": "alice"}]],
+                type=pa.list_(item_struct),
+            )
+        }
+    )
+
+    result = concat([block1, block2, block3], promote_types=True)
+
+    assert len(result) == 3
+    items = result["items"].to_pylist()
+    assert items[0] is None  # from null type
+    assert items[1] == []  # from list<null>
+    assert items[2] == [{"id": 1, "name": "alice"}]  # actual data
+
+
 if __name__ == "__main__":
     import sys
 

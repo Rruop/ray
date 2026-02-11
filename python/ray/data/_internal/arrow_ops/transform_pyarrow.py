@@ -276,6 +276,17 @@ def _reconcile_field(
         for t in non_null_types:
             if not (pyarrow.types.is_list(t) and pyarrow.types.is_null(t.value_type)):
                 return t
+
+    # 5. Pure null type fields
+    # When a field is `null` in some schemas but has a concrete type in others,
+    # use the concrete type.
+    null_types = [t for t in non_null_types if pyarrow.types.is_null(t)]
+    if null_types:
+        # Find first non-null type
+        for t in non_null_types:
+            if not pyarrow.types.is_null(t):
+                return t
+
     # At this phase, we have no special types to reconcile, so return None. Arrow will fail to unify.
     return None
 
@@ -413,6 +424,51 @@ def _extract_unified_struct_types(
     }
 
 
+def _cast_null_typed_array_to_target_type(
+    array: "pyarrow.Array",
+    target_type: "pyarrow.DataType",
+    length: int,
+) -> "pyarrow.Array":
+    """
+    Cast a null-typed array to the target type.
+
+    This handles the case where PyArrow infers a column as `null` or `list<null>`
+    because all values were None or empty lists, but the unified schema expects
+    a more specific type like `list<struct<...>>`.
+
+    Args:
+        array: The array to cast (may be null-typed).
+        target_type: The target type to cast to.
+        length: The number of rows in the array.
+
+    Returns:
+        The array cast to the target type, or the original array if no cast needed.
+    """
+    import pyarrow as pa
+
+    current_type = array.type
+
+    # Case 1: Current type is `null`, target is any other type
+    # Example: null -> list<struct<...>>
+    if pa.types.is_null(current_type):
+        # Create a null-filled array of the target type
+        return pa.nulls(length, type=target_type)
+
+    # Case 2: Current type is `list<null>`, target is `list<other>`
+    # Example: list<null> -> list<struct<...>>
+    if (
+        pa.types.is_list(current_type)
+        and pa.types.is_null(current_type.value_type)
+        and pa.types.is_list(target_type)
+    ):
+        # Cast the list to the target list type
+        # PyArrow can cast list<null> to list<any> since null is compatible
+        return array.cast(target_type)
+
+    # No cast needed
+    return array
+
+
 def _backfill_missing_fields(
     column: "pyarrow.ChunkedArray",
     unified_struct_type: "pyarrow.StructType",
@@ -464,7 +520,17 @@ def _backfill_missing_fields(
         if field_name in current_fields:
             # If the field exists in the current column, align it
             current_array = current_fields[field_name]
-            if pa.types.is_struct(field_type):
+
+            # Handle null-typed arrays (null or list<null>) that need conversion
+            # to the target type. This happens when all values in a batch were
+            # None or empty lists, causing PyArrow to infer the wrong type.
+            current_array = _cast_null_typed_array_to_target_type(
+                current_array, field_type, len(current_array)
+            )
+
+            if pa.types.is_struct(field_type) and pa.types.is_struct(
+                current_array.type
+            ):
                 # Recursively align nested struct fields
                 current_array = _backfill_missing_fields(
                     column=current_array,
@@ -600,16 +666,30 @@ def _concat_cols_with_null_list(
     # For each opaque list column, iterate through all schemas until
     # we find a valid value_type that can be used to override the
     # column types in the following for-loop.
+    # We look for a concrete list type (not list<null> and not pure null).
     scalar_type = None
     for arr in col_chunked_arrays:
-        if not pa.types.is_list(arr.type) or not pa.types.is_null(arr.type.value_type):
-            scalar_type = arr.type
-            break
+        arr_type = arr.type
+        # Skip pure null type and list<null> type
+        if pa.types.is_null(arr_type):
+            continue
+        if pa.types.is_list(arr_type) and pa.types.is_null(arr_type.value_type):
+            continue
+        scalar_type = arr_type
+        break
 
     if scalar_type is not None:
         for c_idx in range(len(col_chunked_arrays)):
             c = col_chunked_arrays[c_idx]
-            if pa.types.is_list(c.type) and pa.types.is_null(c.type.value_type):
+            c_type = c.type
+
+            # Handle pure null type: convert to nulls of target type
+            if pa.types.is_null(c_type):
+                col_chunked_arrays[c_idx] = pa.chunked_array(
+                    [pa.nulls(c.length(), type=scalar_type)]
+                )
+            # Handle list<null> type
+            elif pa.types.is_list(c_type) and pa.types.is_null(c_type.value_type):
                 if pa.types.is_list(scalar_type):
                     # If we are dealing with a list input,
                     # cast the array to the scalar_type found above.
