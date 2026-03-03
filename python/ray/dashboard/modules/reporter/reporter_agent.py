@@ -1882,21 +1882,26 @@ class ReporterAgent(
 
             records = self._to_records(stats, cluster_stats)
 
+            # Build global tags that apply to all metrics
+            global_tags = {
+                "Version": ray.__version__,
+                "SessionName": self._session_name,
+            }
+            # Add ray_io_cluster to global_tags if RAY_CLUSTER_NAME is set
+            # This ensures all metrics (including cluster metrics) have this label
+            cluster_name = os.environ.get("RAY_CLUSTER_NAME")
+            if cluster_name:
+                global_tags["ray_io_cluster"] = cluster_name
+
             if RAY_ENABLE_OPEN_TELEMETRY:
                 self._open_telemetry_metric_recorder.record_and_export(
                     records,
-                    global_tags={
-                        "Version": ray.__version__,
-                        "SessionName": self._session_name,
-                    },
+                    global_tags=global_tags,
                 )
             else:
                 self._metrics_agent.record_and_export(
                     records,
-                    global_tags={
-                        "Version": ray.__version__,
-                        "SessionName": self._session_name,
-                    },
+                    global_tags=global_tags,
                 )
 
             self._metrics_agent.clean_all_dead_worker_metrics()

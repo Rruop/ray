@@ -1,7 +1,8 @@
 import logging
+import os
 import threading
 from collections import defaultdict
-from typing import Callable, List
+from typing import Callable, List, Optional
 
 from opentelemetry import metrics
 from opentelemetry.exporter.prometheus import PrometheusMetricReader
@@ -14,7 +15,28 @@ from ray._private.telemetry.metric_types import MetricType
 
 logger = logging.getLogger(__name__)
 
+# =============================================================================
+# Constants
+# =============================================================================
+
 NAMESPACE = "ray"
+
+# Export mode configuration
+RAY_METRICS_EXPORT_MODE = "RAY_METRICS_EXPORT_MODE"
+RAY_METRICS_PUSH_INTERVAL_MS = "RAY_METRICS_PUSH_INTERVAL_MS"
+
+# Prometheus Remote Write configuration
+RAY_METRICS_REMOTE_WRITE_ENDPOINT = "RAY_METRICS_REMOTE_WRITE_ENDPOINT"
+RAY_METRICS_REMOTE_WRITE_USERNAME = "RAY_METRICS_REMOTE_WRITE_USERNAME"
+RAY_METRICS_REMOTE_WRITE_PASSWORD = "RAY_METRICS_REMOTE_WRITE_PASSWORD"
+RAY_METRICS_REMOTE_WRITE_HEADERS = "RAY_METRICS_REMOTE_WRITE_HEADERS"
+RAY_METRICS_REMOTE_WRITE_TIMEOUT = "RAY_METRICS_REMOTE_WRITE_TIMEOUT"
+RAY_METRICS_REMOTE_WRITE_TENANT_ID = "RAY_METRICS_REMOTE_WRITE_TENANT_ID"
+
+
+# =============================================================================
+# OpenTelemetry Metric Recorder
+# =============================================================================
 
 
 class OpenTelemetryMetricRecorder:
@@ -22,10 +44,29 @@ class OpenTelemetryMetricRecorder:
     A class to record OpenTelemetry metrics. This is the main entry point for exporting
     all ray telemetries to Prometheus server.
     It uses OpenTelemetry's Prometheus exporter to export metrics.
+
+    Export Modes:
+        - "pull" (default): Prometheus scrape at :8080/metrics
+        - "push": Prometheus Remote Write protocol (alias for remote_write)
+        - "remote_write": Prometheus Remote Write protocol
+
+    Environment Variables:
+        Common:
+            RAY_METRICS_EXPORT_MODE: "pull", "push", or "remote_write"
+            RAY_METRICS_PUSH_INTERVAL_MS: Push interval in ms (default: 10000)
+
+        Remote Write mode (push/remote_write):
+            RAY_METRICS_REMOTE_WRITE_ENDPOINT: Remote write URL
+            RAY_METRICS_REMOTE_WRITE_USERNAME: Basic auth username
+            RAY_METRICS_REMOTE_WRITE_PASSWORD: Basic auth password
+            RAY_METRICS_REMOTE_WRITE_HEADERS: Additional headers (JSON)
+            RAY_METRICS_REMOTE_WRITE_TIMEOUT: Request timeout in seconds
+            RAY_METRICS_REMOTE_WRITE_TENANT_ID: Tenant ID for multi-tenant systems
     """
 
     _metrics_initialized = False
     _metrics_initialized_lock = threading.Lock()
+    _export_mode: Optional[str] = None
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -92,17 +133,194 @@ class OpenTelemetryMetricRecorder:
 
         return callback
 
+    # -------------------------------------------------------------------------
+    # Initialization
+    # -------------------------------------------------------------------------
+
     def _init_metrics(self):
-        # Initialize the global metrics provider and meter. We only do this once on
-        # the first initialization of the class, because re-setting the meter provider
-        # can result in loss of metrics.
+        """Initialize the global metrics provider (once per process)."""
         with self._metrics_initialized_lock:
             if self._metrics_initialized:
                 return
-            prometheus_reader = PrometheusMetricReader()
-            provider = MeterProvider(metric_readers=[prometheus_reader])
+
+            export_mode = os.environ.get(RAY_METRICS_EXPORT_MODE, "pull").lower()
+            OpenTelemetryMetricRecorder._export_mode = export_mode
+
+            if export_mode in ("push", "remote_write"):
+                reader = self._create_remote_write_reader()
+            else:
+                reader = PrometheusMetricReader()
+                logger.info(
+                    "Metrics export mode: PULL (Prometheus scrape at :8080/metrics)"
+                )
+
+            # Initialize the global metrics provider and meter. We only do this once on
+            # the first initialization of the class, because re-setting the meter provider
+            # can result in loss of metrics.
+            provider = MeterProvider(metric_readers=[reader])
             metrics.set_meter_provider(provider)
             self._metrics_initialized = True
+
+    def _create_remote_write_reader(self):
+        """Create Prometheus Remote Write mode reader.
+
+        Uses a wrapper class to fix unit mapping issue in the official exporter.
+        The official exporter appends unit directly (e.g., "ray_tasks_1"),
+        but we use map_unit to match PrometheusMetricReader behavior.
+        """
+        from opentelemetry.exporter.prometheus._mapping import map_unit
+        from opentelemetry.exporter.prometheus_remote_write import (
+            PrometheusRemoteWriteMetricsExporter,
+        )
+        from opentelemetry.sdk.metrics.export import (
+            Gauge,
+            Histogram,
+            PeriodicExportingMetricReader,
+            Sum,
+        )
+
+        class RayRemoteWriteExporter(PrometheusRemoteWriteMetricsExporter):
+            """Exporter with proper unit mapping for consistent metric names.
+
+            Also adds 'instance' label for Grafana dashboard compatibility.
+            In Prometheus pull mode, the 'instance' label is automatically added
+            by Prometheus server. In push/remote_write mode, we need to add it
+            manually to maintain compatibility with existing dashboards.
+
+            Note: 'ray_io_cluster' label is added at the metrics recording source
+            (reporter_agent.py) rather than here, so it applies to all export modes.
+            """
+
+            def _add_instance_label(self, attrs_dict):
+                """Add 'instance' label from 'ip' for Prometheus compatibility."""
+                # In pull mode, Prometheus adds 'instance' automatically from scrape target
+                # In push/remote_write mode, we need to add it manually
+                if "instance" not in attrs_dict and "ip" in attrs_dict:
+                    attrs_dict["instance"] = attrs_dict["ip"]
+                return attrs_dict
+
+            def _parse_data_point(self, data_point, name=None):
+                """Override to add 'instance' label for dashboard compatibility."""
+                attrs_dict = dict(data_point.attributes.items())
+                attrs_dict = self._add_instance_label(attrs_dict)
+
+                attrs = tuple(attrs_dict.items()) + (
+                    ("__name__", self._sanitize_string(name, "name")),
+                )
+                sample = (data_point.value, (data_point.time_unix_nano // 1_000_000))
+                return attrs, sample
+
+            def _parse_histogram_data_point(self, data_point, name):
+                """Override to add 'instance' label for histogram data points."""
+                attrs_dict = dict(data_point.attributes.items())
+                attrs_dict = self._add_instance_label(attrs_dict)
+
+                timestamp = data_point.time_unix_nano // 1_000_000
+                results = []
+
+                # Generate bucket samples
+                cumulative_count = 0
+                for i, bound in enumerate(data_point.explicit_bounds):
+                    cumulative_count += data_point.bucket_counts[i]
+                    bucket_attrs = tuple(attrs_dict.items()) + (
+                        ("le", str(bound)),
+                        ("__name__", self._sanitize_string(f"{name}_bucket", "name")),
+                    )
+                    results.append((bucket_attrs, (cumulative_count, timestamp)))
+
+                # +Inf bucket
+                cumulative_count += data_point.bucket_counts[-1]
+                inf_attrs = tuple(attrs_dict.items()) + (
+                    ("le", "+Inf"),
+                    ("__name__", self._sanitize_string(f"{name}_bucket", "name")),
+                )
+                results.append((inf_attrs, (cumulative_count, timestamp)))
+
+                # Sum
+                sum_attrs = tuple(attrs_dict.items()) + (
+                    ("__name__", self._sanitize_string(f"{name}_sum", "name")),
+                )
+                results.append((sum_attrs, (data_point.sum, timestamp)))
+
+                # Count
+                count_attrs = tuple(attrs_dict.items()) + (
+                    ("__name__", self._sanitize_string(f"{name}_count", "name")),
+                )
+                results.append((count_attrs, (data_point.count, timestamp)))
+
+                return results
+
+            def _parse_metric(self, metric, resource_labels):
+                mapped_unit = map_unit(metric.unit)
+                name = f"{metric.name}_{mapped_unit}" if mapped_unit else metric.name
+
+                sample_sets = defaultdict(list)
+                if isinstance(metric.data, (Gauge, Sum)):
+                    for dp in metric.data.data_points:
+                        attrs, sample = self._parse_data_point(dp, name)
+                        sample_sets[attrs].append(sample)
+                elif isinstance(metric.data, Histogram):
+                    for dp in metric.data.data_points:
+                        for attrs, sample in self._parse_histogram_data_point(dp, name):
+                            sample_sets[attrs].append(sample)
+                else:
+                    logger.warning("Unsupported Metric Type: %s", type(metric.data))
+                    return []
+                return self._convert_to_timeseries(sample_sets, resource_labels)
+
+        # Read configuration
+        endpoint = os.environ.get(
+            RAY_METRICS_REMOTE_WRITE_ENDPOINT, "http://localhost:9090/api/v1/write"
+        )
+        push_interval_ms = int(os.environ.get(RAY_METRICS_PUSH_INTERVAL_MS, "10000"))
+        timeout = int(os.environ.get(RAY_METRICS_REMOTE_WRITE_TIMEOUT, "30"))
+
+        # Parse headers
+        headers = {}
+        headers_json = os.environ.get(RAY_METRICS_REMOTE_WRITE_HEADERS)
+        if headers_json:
+            try:
+                headers = json.loads(headers_json)
+            except json.JSONDecodeError as e:
+                logger.warning(
+                    "Failed to parse RAY_METRICS_REMOTE_WRITE_HEADERS: %s", e
+                )
+
+        # Add tenant ID header for multi-tenant systems (Cortex/Mimir)
+        tenant_id = os.environ.get(RAY_METRICS_REMOTE_WRITE_TENANT_ID)
+        if tenant_id:
+            headers["X-Scope-OrgID"] = tenant_id
+
+        # Prepare basic auth
+        username = os.environ.get(RAY_METRICS_REMOTE_WRITE_USERNAME)
+        password = os.environ.get(RAY_METRICS_REMOTE_WRITE_PASSWORD)
+        basic_auth = (
+            {"username": username, "password": password}
+            if username and password
+            else None
+        )
+
+        exporter = RayRemoteWriteExporter(
+            endpoint=endpoint,
+            basic_auth=basic_auth,
+            headers=headers or None,
+            timeout=timeout,
+        )
+
+        logger.info(
+            "Metrics export mode: REMOTE_WRITE to %s (interval: %sms, timeout: %ss)",
+            endpoint,
+            push_interval_ms,
+            timeout,
+        )
+        return PeriodicExportingMetricReader(
+            exporter, export_interval_millis=push_interval_ms
+        )
+
+    @classmethod
+    def get_export_mode(cls) -> Optional[str]:
+        """Get the current metrics export mode."""
+        return cls._export_mode
 
     def register_gauge_metric(self, name: str, description: str) -> None:
         with self._lock:

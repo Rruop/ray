@@ -1,3 +1,5 @@
+import json
+import os
 import sys
 from unittest.mock import MagicMock, patch
 
@@ -300,6 +302,158 @@ def test_record_histogram_aggregated_batch(
 
     # No warnings should be logged for registered histogram
     mock_logger_warning.assert_not_called()
+
+
+# =============================================================================
+# Prometheus Remote Write Tests
+# =============================================================================
+
+
+@pytest.fixture
+def skip_if_remote_write_not_available():
+    """Skip tests if remote write exporter is not installed."""
+    try:
+        from opentelemetry.exporter.prometheus_remote_write import (  # noqa: F401
+            PrometheusRemoteWriteMetricsExporter,
+        )
+    except ImportError:
+        pytest.skip("opentelemetry-exporter-prometheus-remote-write not installed")
+
+
+class TestPrometheusRemoteWriteExporter:
+    """Tests for Prometheus Remote Write exporter configuration."""
+
+    def test_exporter_instantiation(self, skip_if_remote_write_not_available):
+        """Test PrometheusRemoteWriteMetricsExporter instantiation."""
+        from opentelemetry.exporter.prometheus_remote_write import (
+            PrometheusRemoteWriteMetricsExporter,
+        )
+
+        exporter = PrometheusRemoteWriteMetricsExporter(
+            endpoint="http://localhost:9090/api/v1/write",
+            timeout=30,
+        )
+        assert exporter.endpoint == "http://localhost:9090/api/v1/write"
+        assert exporter.timeout == 30
+
+    def test_exporter_with_basic_auth(self, skip_if_remote_write_not_available):
+        """Test exporter with basic auth configuration."""
+        from opentelemetry.exporter.prometheus_remote_write import (
+            PrometheusRemoteWriteMetricsExporter,
+        )
+
+        exporter = PrometheusRemoteWriteMetricsExporter(
+            endpoint="http://localhost:9090/api/v1/write",
+            basic_auth={"username": "user", "password": "pass"},
+        )
+        assert exporter.basic_auth == {"username": "user", "password": "pass"}
+
+    def test_exporter_with_headers(self, skip_if_remote_write_not_available):
+        """Test exporter with custom headers configuration."""
+        from opentelemetry.exporter.prometheus_remote_write import (
+            PrometheusRemoteWriteMetricsExporter,
+        )
+
+        exporter = PrometheusRemoteWriteMetricsExporter(
+            endpoint="http://localhost:9090/api/v1/write",
+            headers={"X-Scope-OrgID": "tenant-1"},
+        )
+        assert exporter.headers == {"X-Scope-OrgID": "tenant-1"}
+
+
+class TestRemoteWriteEnvironmentVariables:
+    """Tests for Prometheus Remote Write environment variable constants."""
+
+    @pytest.mark.parametrize(
+        "const_name",
+        [
+            "RAY_METRICS_EXPORT_MODE",
+            "RAY_METRICS_PUSH_INTERVAL_MS",
+            "RAY_METRICS_REMOTE_WRITE_ENDPOINT",
+            "RAY_METRICS_REMOTE_WRITE_USERNAME",
+            "RAY_METRICS_REMOTE_WRITE_PASSWORD",
+            "RAY_METRICS_REMOTE_WRITE_HEADERS",
+            "RAY_METRICS_REMOTE_WRITE_TIMEOUT",
+            "RAY_METRICS_REMOTE_WRITE_TENANT_ID",
+        ],
+    )
+    def test_env_variable_defined(self, const_name):
+        """Verify each environment variable constant equals its name."""
+        from ray._private.telemetry import open_telemetry_metric_recorder as module
+
+        assert getattr(module, const_name) == const_name
+
+    def test_headers_json_parsing(self):
+        """Test headers JSON string parsing."""
+        headers_json = '{"X-Custom-Header": "value", "X-Scope-OrgID": "tenant-1"}'
+        headers = json.loads(headers_json)
+
+        assert headers["X-Custom-Header"] == "value"
+        assert headers["X-Scope-OrgID"] == "tenant-1"
+
+
+class TestRemoteWriteReaderConfiguration:
+    """Tests for remote_write mode reader configuration."""
+
+    @patch("opentelemetry.metrics.set_meter_provider")
+    @patch("opentelemetry.metrics.get_meter")
+    def test_remote_write_mode_creates_reader(
+        self, mock_get_meter, mock_set_meter_provider, skip_if_remote_write_not_available
+    ):
+        """Test that remote_write mode creates appropriate reader."""
+        mock_get_meter.return_value = MagicMock()
+
+        OpenTelemetryMetricRecorder._metrics_initialized = False
+
+        with patch.dict(
+            os.environ,
+            {
+                "RAY_METRICS_EXPORT_MODE": "remote_write",
+                "RAY_METRICS_REMOTE_WRITE_ENDPOINT": "http://localhost:9090/api/v1/write",
+                "RAY_METRICS_PUSH_INTERVAL_MS": "5000",
+            },
+            clear=False,
+        ):
+            recorder = OpenTelemetryMetricRecorder()
+            assert recorder.get_export_mode() == "remote_write"
+
+            OpenTelemetryMetricRecorder._metrics_initialized = False
+
+
+class TestUnitMapping:
+    """Tests for unit mapping used in Prometheus Remote Write exporter."""
+
+    @pytest.fixture
+    def map_unit(self):
+        """Get the map_unit function from prometheus exporter."""
+        from opentelemetry.exporter.prometheus._mapping import map_unit
+
+        return map_unit
+
+    @pytest.mark.parametrize(
+        "input_unit,expected",
+        [
+            # Dimensionless
+            ("1", ""),
+            # Time units
+            ("ms", "milliseconds"),
+            ("s", "seconds"),
+            ("us", "microseconds"),
+            ("ns", "nanoseconds"),
+            # Byte units
+            ("By", "bytes"),
+            ("KiBy", "kibibytes"),
+            ("MiBy", "mebibytes"),
+            # Empty and unknown
+            ("", ""),
+            ("custom_unit", "custom_unit"),
+            # Percent
+            ("%", "percent"),
+        ],
+    )
+    def test_map_unit(self, map_unit, input_unit, expected):
+        """Test unit mapping for various unit types."""
+        assert map_unit(input_unit) == expected
 
 
 if __name__ == "__main__":

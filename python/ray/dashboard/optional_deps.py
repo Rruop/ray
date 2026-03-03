@@ -13,6 +13,7 @@ import grpc  # noqa: F401
 import opencensus  # noqa: F401
 import opentelemetry  # noqa: F401
 import opentelemetry.exporter.prometheus  # noqa: F401
+import opentelemetry.exporter.prometheus_remote_write  # noqa: F401
 import opentelemetry.proto  # noqa: F401
 import prometheus_client  # noqa: F401
 import pydantic  # noqa: F401
