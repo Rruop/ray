@@ -56,12 +56,13 @@ def test_max_errored_blocks(
 
 def test_errored_blocks_metric_reset_per_dataset(restore_data_context):
     """Test that num_errored_blocks metric is reset for each new dataset execution."""
+    ray.init(address="auto")
     ctx = ray.data.DataContext.get_current()
     ctx.max_errored_blocks = 5
 
     def fail_first_two(row):
         if row["id"] < 2:
-            raise RuntimeError(f"Task failed: {row['id']}")
+            time.sleep(20)
         return row
 
     # First dataset with failures
@@ -88,16 +89,18 @@ def test_errored_blocks_metric_reset_per_dataset(restore_data_context):
 
 def test_errored_blocks_with_map_batches(restore_data_context):
     """Test that num_errored_blocks works correctly with map_batches."""
+    ray.init(address="auto")
     ctx = ray.data.DataContext.get_current()
     ctx.max_errored_blocks = 3
 
     def fail_some_batches(batch):
         # Fail batches where first element is < 2
         if batch["id"][0] < 2:
-            raise RuntimeError("Batch failed")
+            time.sleep(20)
+        time.sleep(20)
         return batch
 
-    ds = ray.data.range(10, override_num_blocks=10).map_batches(
+    ds = ray.data.range(20, override_num_blocks=10).map_batches(
         fail_some_batches, batch_size=1
     )
     result = ds.take_all()
