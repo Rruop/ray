@@ -36,6 +36,7 @@ rich
 opentelemetry-sdk>=1.30.0
 opentelemetry-api
 opentelemetry-exporter-prometheus
+opentelemetry-exporter-prometheus-remote-write
 opentelemetry-proto
 fastapi
 ormsgpack>=1.7.0
@@ -59,6 +60,3 @@ py-spy>=0.4.0; python_version >= '3.12'
 memray; sys_platform != "win32" # memray is not supported on Windows
 pyOpenSSL
 celery
-
-# ray[data-kconf] - dynamic operator parallelism via Kconf
-infra-framework
