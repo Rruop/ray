@@ -53,7 +53,6 @@ def _generate_checkpoint_writing_transform(
             f"Datasink and not a legacy Datasource, but got: "
             f"{type(datasink)}"
         )
-
     checkpoint_writer = CheckpointWriter.create(data_context.checkpoint_config)
 
     # MapTransformFn for writing checkpoint files after write completes.
