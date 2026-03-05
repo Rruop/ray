@@ -83,6 +83,11 @@ class CheckpointConfig:
         filter_num_threads: int = 3,
         write_num_threads: int = 3,
         checkpoint_path_partition_filter: Optional["PathPartitionFilter"] = None,
+        checkpoint_read_override_num_blocks: Optional[int] = None,
+        redis_checkpoint_key:Optional[str] = None,
+        redis_checkpoint_cluster: Optional[str] = 'RayClusterCheckpoint',
+        redis_checkpoint_biz: Optional[str] = 'ad',
+        use_roaring_bitmap: bool = False,
     ):
         self.id_column: Optional[str] = id_column
 
@@ -113,6 +118,11 @@ class CheckpointConfig:
         self.filter_num_threads: int = filter_num_threads
         self.write_num_threads: int = write_num_threads
         self.checkpoint_path_partition_filter = checkpoint_path_partition_filter
+        self.checkpoint_read_override_num_blocks = checkpoint_read_override_num_blocks
+        self.redis_checkpoint_key = redis_checkpoint_key
+        self.redis_checkpoint_cluster = redis_checkpoint_cluster
+        self.redis_checkpoint_biz = redis_checkpoint_biz
+        self.use_roaring_bitmap: bool = use_roaring_bitmap
 
     def _get_default_checkpoint_path(self) -> str:
         artifact_storage = os.environ.get(self.DEFAULT_CHECKPOINT_PATH_BUCKET_ENV_VAR)

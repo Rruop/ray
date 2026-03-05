@@ -1,6 +1,8 @@
 import logging
 import os
 import uuid
+
+import storage
 from abc import abstractmethod
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
@@ -10,6 +12,7 @@ from pyarrow.fs import FileType
 
 if TYPE_CHECKING:
     import pyarrow
+from redis import RedisError
 
 from ray.data._internal.util import call_with_retry
 from ray.data.block import BlockAccessor
@@ -55,6 +58,9 @@ class CheckpointWriter:
         self.id_col = self.ckpt_config.id_column
         self.filesystem = self.ckpt_config.filesystem
         self.write_num_threads = self.ckpt_config.write_num_threads
+        self.redis_checkpoint_key = self.ckpt_config.redis_checkpoint_key
+        self.redis_checkpoint_cluster = self.ckpt_config.redis_checkpoint_cluster
+        self.redis_checkpoint_biz = self.ckpt_config.redis_checkpoint_biz
 
     @abstractmethod
     def write_block_checkpoint(self, block: BlockAccessor):
@@ -174,15 +180,28 @@ class BatchBasedCheckpointWriter(CheckpointWriter):
         file_name = f"{uuid.uuid4()}.parquet"
         ckpt_file_path = os.path.join(self.checkpoint_path_unwrapped, file_name)
 
+        checkpoint_ids_block = block.select(columns=[self.id_col])
         checkpoint_ids_table = self._prepare_checkpoint_table_from_block(block)
 
-        def _write():
-            pq.write_table(
-                checkpoint_ids_table,
-                ckpt_file_path,
-                filesystem=self.filesystem,
-            )
+        redis_checkpoint_key = self.redis_checkpoint_key
 
+        def _write():
+            if not redis_checkpoint_key:
+                pq.write_table(
+                    checkpoint_ids_table,
+                    ckpt_file_path,
+                    filesystem=self.filesystem,
+                )
+                return
+            else:
+                ids = checkpoint_ids_block["id"].to_numpy().tolist()
+                try:
+                    op = storage.RedisOption(self.redis_checkpoint_cluster, biz_def=self.redis_checkpoint_biz)
+                    redis_client = storage.RedisClient(op)
+                    redis_client.sadd(redis_checkpoint_key, *ids)
+                except storage.Error as e:
+                    exit(1)
+                redis_client.close()
         try:
             call_with_retry(
                 _write,

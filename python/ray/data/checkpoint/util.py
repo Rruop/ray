@@ -1,6 +1,7 @@
 import logging
 import posixpath
-from typing import Iterable, List
+from typing import Iterable
+from typing import List
 
 from ray.data._internal.execution.interfaces.task_context import TaskContext
 from ray.data.block import Block, BlockAccessor, DataBatch
@@ -69,12 +70,24 @@ def filter_checkpointed_rows_for_blocks(
 
     ckpt_filter = BatchBasedCheckpointFilter(checkpoint_config)
     checkpointed_ids = task_context.kwargs[CHECKPOINTED_IDS_KWARG_NAME]
-
+    redis_checkpoint_key = ckpt_filter.redis_checkpoint_key
+    use_roaring_bitmap = ckpt_filter.use_roaring_bitmap
     def filter_fn(block: Block) -> Block:
-        return ckpt_filter.filter_rows_for_block(
-            block=block,
-            checkpointed_ids=checkpointed_ids,
-        )
+        if not redis_checkpoint_key :
+            if not use_roaring_bitmap:
+                return ckpt_filter.filter_rows_for_block(
+                    block=block,
+                    checkpointed_ids=checkpointed_ids,
+                )
+            else:
+                return ckpt_filter.filter_rows_for_block_with_raoring_bitmap(
+                    block=block,
+                    checkpointed_ids=checkpointed_ids,
+                )
+        else:
+            return ckpt_filter.filter_block_by_redis_ckpt(
+                block=block
+            )
 
     for block in blocks:
         filtered_block = filter_fn(block)

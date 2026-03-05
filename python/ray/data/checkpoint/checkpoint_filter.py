@@ -8,6 +8,7 @@ from typing import List, Optional
 import numpy
 import pyarrow
 from pyarrow.fs import FileSelector, FileType
+import redis
 
 import ray
 from ray._common.retry import call_with_retry
@@ -17,11 +18,59 @@ from ray.data.block import Block, BlockAccessor, BlockMetadata, DataBatch, Schem
 from ray.data.checkpoint import CheckpointConfig
 from ray.data.checkpoint.checkpoint_writer import PENDING_CHECKPOINT_SUFFIX
 from ray.data.checkpoint.util import build_pending_checkpoint_trie
+from ray.data.checkpoint.bitmap64 import RoaringBitmap64
 from ray.data.datasource import PathPartitionFilter
 from ray.data.datasource.path_util import _unwrap_protocol
 from ray.types import ObjectRef
+from redis import RedisError
+import storage
+
+import numpy as np
+from pyroaring import BitMap
+import pyarrow as pa
+import threading
 
 logger = logging.getLogger(__name__)
+
+# ====== MODULE-LEVEL PER-WORKER CACHE (KEY!) ======
+# Each Ray worker process has its own copy.
+_CACHED_ROARING_BITMAP: Optional[BitMap] = None
+_CACHED_CHECKPOINT_REF_ID: Optional[str] = None  # e.g., hash or path
+_CACHE_LOCK = threading.Lock()
+
+
+def _build_bitmap_from_checkpoint_table(ckpt_table: pa.Table, id_column: str) -> BitMap:
+    """Build a single Roaring Bitmap from the entire checkpoint table."""
+    id_col = ckpt_table[id_column]
+
+    if isinstance(id_col, pa.ChunkedArray):
+        # Efficiently concatenate all chunks into one numpy array
+        arrays = [chunk.to_numpy(zero_copy_only=True) for chunk in id_col.chunks]
+        if len(arrays) == 1:
+            ckpt_ids = arrays[0]
+        else:
+            ckpt_ids = np.concatenate(arrays)
+    else:
+        ckpt_ids = id_col.to_numpy(zero_copy_only=True)
+
+    return BitMap(ckpt_ids)
+
+
+def _get_or_build_roaring_bitmap(
+    ckpt_table: pa.Table,
+    id_column: str,
+    checkpoint_key: str = "default",
+) -> BitMap:
+    """Get cached bitmap or build it once per worker."""
+    global _CACHED_ROARING_BITMAP, _CACHED_CHECKPOINT_REF_ID
+
+    with _CACHE_LOCK:
+        if _CACHED_ROARING_BITMAP is None or _CACHED_CHECKPOINT_REF_ID != checkpoint_key:
+            _CACHED_ROARING_BITMAP = _build_bitmap_from_checkpoint_table(ckpt_table, id_column)
+            _CACHED_CHECKPOINT_REF_ID = checkpoint_key
+            print(f"[Worker] Built Roaring Bitmap with {len(_CACHED_ROARING_BITMAP)} IDs")
+
+    return _CACHED_ROARING_BITMAP
 
 # Retry configuration for checkpoint recovery operations.
 # These can be overridden via environment variables for testing or tuning.
@@ -47,7 +96,10 @@ class CheckpointFilter(abc.ABC):
         self.id_column = self.ckpt_config.id_column
         self.filesystem = self.ckpt_config.filesystem
         self.filter_num_threads = self.ckpt_config.filter_num_threads
-
+        self.redis_checkpoint_key = self.ckpt_config.redis_checkpoint_key
+        self.redis_checkpoint_cluster = self.ckpt_config.redis_checkpoint_cluster
+        self.redis_checkpoint_biz = self.ckpt_config.redis_checkpoint_biz
+        self.use_roaring_bitmap = self.ckpt_config.use_roaring_bitmap
 
 @ray.remote(num_cpus=0)
 def _clean_pending_checkpoints_task(
@@ -185,7 +237,13 @@ class CheckpointLoader:
         checkpoint_path: str,
         filesystem: pyarrow.fs.FileSystem,
         id_column: str,
+        redis_checkpoint_key: str,
+        redis_checkpoint_cluster: str,
+        redis_checkpoint_biz: str,
+        use_roaring_bitmap: bool,
         checkpoint_path_partition_filter: Optional[PathPartitionFilter] = None,
+        checkpoint_read_override_num_blocks:Optional[int] = None,
+
     ):
         """Initialize the CheckpointLoader.
 
@@ -200,6 +258,11 @@ class CheckpointLoader:
         self.filesystem = filesystem
         self.id_column = id_column
         self.checkpoint_path_partition_filter = checkpoint_path_partition_filter
+        self.checkpoint_read_override_num_blocks = checkpoint_read_override_num_blocks
+        self.redis_checkpoint_key = redis_checkpoint_key
+        self.redis_checkpoint_cluster = redis_checkpoint_cluster
+        self.redis_checkpoint_biz = redis_checkpoint_biz
+        self.use_roaring_bitmap = use_roaring_bitmap
     def remove_empty_parquet_files(self):
         from pyarrow.fs import FileSelector,FileType
         selector = FileSelector(self.checkpoint_path, recursive=True)
@@ -231,10 +294,10 @@ class CheckpointLoader:
         Returns:
             ObjectRef[Block]: ObjectRef to the checkpointed IDs block.
         """
+        ## if checkpoint data save in redis, skip
+        if self.redis_checkpoint_key:
+            return
         start_t = time.time()
-
-      
-        #self.remove_empty_parquet_files()
 
         # Load the checkpoint data
         if self.checkpoint_path_partition_filter is None:
@@ -243,6 +306,7 @@ class CheckpointLoader:
             self.checkpoint_path,
             filesystem=self.filesystem,
             partition_filter=self.checkpoint_path_partition_filter,
+            override_num_blocks= self.checkpoint_read_override_num_blocks,
         )
 
         # Manually disable checkpointing for loading the checkpoint metadata
@@ -317,7 +381,10 @@ class IdColumnCheckpointLoader(CheckpointLoader):
             The pre-processed checkpoint dataset
         """
         # Sort by the ID column.
-        return checkpoint_ds.sort(self.id_column)
+        if self.use_roaring_bitmap==True:
+            return checkpoint_ds
+        else:
+            return checkpoint_ds.sort(self.id_column)
 
 
 class BatchBasedCheckpointFilter(CheckpointFilter):
@@ -354,6 +421,11 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
             filesystem=self.filesystem,
             id_column=self.id_column,
             checkpoint_path_partition_filter=self.ckpt_config.checkpoint_path_partition_filter,
+            checkpoint_read_override_num_blocks=self.ckpt_config.checkpoint_read_override_num_blocks,
+            redis_checkpoint_key=self.ckpt_config.redis_checkpoint_key,
+            redis_checkpoint_cluster=self.ckpt_config.redis_checkpoint_cluster,
+            redis_checkpoint_biz=self.ckpt_config.redis_checkpoint_biz,
+            use_roaring_bitmap =self.ckpt_config.use_roaring_bitmap,
         )
         return loader.load_checkpoint()
 
@@ -394,6 +466,15 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
 
     def delete_checkpoint(self) -> None:
         self.filesystem.delete_dir(self.checkpoint_path_unwrapped)
+        if self.redis_checkpoint_key :
+            try:
+                op = storage.RedisOption(self.redis_checkpoint_cluster, biz_def=self.redis_checkpoint_biz)
+                redis_client = storage.RedisClient(op)
+                redis_client.delete(self.redis_checkpoint_key)
+            except storage.Error as e:
+                exit(1)
+
+
 
     def filter_rows_for_block(
         self,
@@ -460,6 +541,79 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
         mask_array = pyarrow.array(final_mask)
         filtered_block = block.filter(mask_array)
         return filtered_block
+
+
+    def filter_rows_for_block_with_raoring_bitmap(
+        self,
+        block: Block,
+        checkpointed_ids: Block,
+    ) -> Block:
+        """Filter block using a per-worker cached Roaring Bitmap (no chunking)."""
+        if len(checkpointed_ids) == 0 or len(block) == 0:
+            return block
+
+        assert isinstance(block, pa.Table)
+        assert isinstance(checkpointed_ids, pa.Table)
+
+        # Use a stable key for caching (e.g., checkpoint path)
+        # If you don't have a key, use "default" assuming static checkpoint
+        cache_key = getattr(self, 'checkpoint_path_unwrapped', 'default')
+
+        # Build or get cached bitmap (once per worker)
+        bitmap = _get_or_build_roaring_bitmap(
+            ckpt_table=checkpointed_ids,
+            id_column=self.id_column,
+            checkpoint_key=cache_key,
+        )
+
+        # Process block
+        block_ids = block[self.id_column].to_numpy()
+        # Vectorize as much as possible (pyroaring doesn't support batch contains)
+        mask = np.fromiter(
+            (x in bitmap for x in block_ids),
+            dtype=bool,
+            count=len(block_ids)
+        )
+        keep_mask = ~mask
+        return block.filter(pa.array(keep_mask))
+
+    def filter_block_by_redis_ckpt(
+        self,
+        block: Block,
+    ) -> Block:
+        """
+        Filter out rows already in Redis Set (no chunking needed).
+        """
+
+        try:
+            op = storage.RedisOption(self.redis_checkpoint_cluster, biz_def=self.redis_checkpoint_biz)
+            redis_client = storage.RedisClient(op)
+            is_exists = redis_client.exists(self.redis_checkpoint_key)
+        except storage.Error as e:
+            exit(1)
+
+        if len(block) == 0 or is_exists==0:
+            return block
+
+        block_ids = block[self.id_column].to_numpy()
+
+        #exists_flags = redis_client.sismember('mykey_5', block_ids.tolist())
+        #keep_mask = ~np.array(exists_flags, dtype=bool)
+        batch_size = 20000
+        exists_flags = []
+        block_ids = block[self.id_column].to_numpy().tolist()
+        for i in range(0, len(block_ids), batch_size):
+            pipe = redis_client.pipeline()
+            for _id in block_ids[i:i + batch_size]:
+                pipe.sismember(self.redis_checkpoint_key, _id)
+
+            batch_results = pipe.execute()
+            exists_flags.extend(batch_results)
+
+        # Build keep mask: True = keep (not in checkpoint)
+        keep_mask = ~numpy.array(exists_flags, dtype=bool)
+        redis_client.close()
+        return block.filter(pyarrow.array(keep_mask))
 
     def filter_rows_for_batch(
         self,

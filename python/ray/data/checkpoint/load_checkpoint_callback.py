@@ -69,5 +69,5 @@ class LoadCheckpointCallback(ExecutionCallback):
         assert self._config is executor._data_context.checkpoint_config
 
     def load_checkpoint(self) -> ObjectRef[Block]:
-        assert self._checkpoint_ref is not None
+        #assert self._checkpoint_ref is not None
         return self._checkpoint_ref

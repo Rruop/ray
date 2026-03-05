@@ -110,7 +110,6 @@ def plan_write_op_with_checkpoint_writer(
             f"Datasink and not a legacy Datasource, but got: "
             f"{type(datasink)}"
         )
-
     checkpoint_writer = CheckpointWriter.create(data_context.checkpoint_config)
     collect_stats_fn = generate_collect_write_stats_fn()
 
