@@ -774,6 +774,12 @@ class PhysicalOperator(Operator):
         (e.g., the OutputSplitter operator). This hints to the execution engine that
         these operators should not be throttled based on resource usage.
         """
+        """
+        是否禁用此操作符的资源限制。
+        对于仅操作包元数据的操作符（例如 OutputSplitter 操作符），此设置应返回 True。
+        这会提示执行引擎：这些操作符不应基于资源使用情况进行限制。
+        throttling:限制
+        """
         return False
 
     def shutdown(self, timer: Timer, force: bool = False) -> None:

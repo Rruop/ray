@@ -150,7 +150,7 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
 
         # Skip dynamic backpressure if:
         # - Not a MapOperator
-        # - Not eligible for Op for Backpressure
+        # - Not eligible for Op for Backpressure，是否有资格且未结束，限流开启物理算子（元数据算子无限制），eligible：有资格的
         # - Dynamic backpressure based on output queue size is disabled
         # - Downstream is a materializing op which requires full materialization
         if (
