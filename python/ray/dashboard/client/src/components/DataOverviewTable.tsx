@@ -227,7 +227,7 @@ const DataRow = ({
           0
         )}
       </TableCell>
-      <TableCell align="right">{data.ray_data_output_rows.max}</TableCell>
+      <TableCell align="right">{data.output_rows}</TableCell>
       <TableCell align="right">
         {memoryConverter(Number(data.ray_data_current_bytes.value))}/
         {memoryConverter(Number(data.ray_data_current_bytes.max))}
