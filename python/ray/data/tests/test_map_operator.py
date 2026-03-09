@@ -706,6 +706,64 @@ def test_operator_metrics():
         assert metrics.obj_store_mem_freed == metrics.bytes_task_inputs_processed, i
 
 
+def _create_test_op(num_inputs, num_blocks_per_task, min_rows_per_bundle):
+    """Helper to create a test MapOperator."""
+    inputs = make_ref_bundles([[i] for i in range(num_inputs)])
+    input_op = InputDataBuffer(DataContext.get_current(), inputs)
+
+    def yield_blocks(block_iter: Iterable[Block], ctx) -> Iterable[Block]:
+        for _ in range(num_blocks_per_task):
+            yield pd.DataFrame({"id": [1]})
+
+    op = MapOperator.create(
+        create_map_transformer_from_block_fn(yield_blocks),
+        input_op=input_op,
+        data_context=DataContext.get_current(),
+        name="TestNumOutputsTotal",
+        min_rows_per_bundle=min_rows_per_bundle,
+    )
+    return op, input_op
+
+
+def test_num_outputs_total_returns_actual_when_finished():
+    """Test that num_outputs_total returns actual count when operator is finished."""
+    NUM_INPUTS, NUM_BLOCKS_PER_TASK, MIN_ROWS_PER_BUNDLE = 20, 3, 10
+
+    op, input_op = _create_test_op(NUM_INPUTS, NUM_BLOCKS_PER_TASK, MIN_ROWS_PER_BUNDLE)
+    op.start(ExecutionOptions())
+
+    # Add all inputs and run tasks
+    while input_op.has_next():
+        op.add_input(input_op.get_next(), 0)
+    op.all_inputs_done()
+    run_op_tasks_sync(op)
+
+    # Take all outputs
+    while op.has_next():
+        op.get_next()
+
+    assert op.has_execution_finished()
+    expected_total = (NUM_INPUTS // MIN_ROWS_PER_BUNDLE) * NUM_BLOCKS_PER_TASK
+    assert op.num_outputs_total() == expected_total
+    assert op.num_outputs_total() == op.metrics.num_task_outputs_generated
+
+
+def test_num_outputs_total_at_least_actual_during_execution():
+    """Test that num_outputs_total >= actual outputs during execution."""
+    NUM_INPUTS, NUM_BLOCKS_PER_TASK, MIN_ROWS_PER_BUNDLE = 30, 2, 10
+
+    op, input_op = _create_test_op(NUM_INPUTS, NUM_BLOCKS_PER_TASK, MIN_ROWS_PER_BUNDLE)
+    op.start(ExecutionOptions())
+
+    for i in range(NUM_INPUTS):
+        op.add_input(input_op.get_next(), 0)
+        if (i + 1) % MIN_ROWS_PER_BUNDLE == 0:
+            run_op_tasks_sync(op)
+            num_outputs_total = op.num_outputs_total()
+            if num_outputs_total is not None:
+                assert num_outputs_total >= op.metrics.num_task_outputs_generated
+
+
 if __name__ == "__main__":
     import sys
 

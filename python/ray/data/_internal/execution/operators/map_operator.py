@@ -768,6 +768,17 @@ def _map_task(
                 block_meta = BlockAccessor.for_block(block).get_metadata()
                 block_schema = BlockAccessor.for_block(block).schema()
 
+                # For Write operators, use actual written rows/bytes from context
+                # instead of the stats DataFrame's 1 row.
+                # NOTE: Write operators always produce exactly one output block per task,
+                # so we can safely pop these values (they won't be needed again).
+                if "_write_stats_num_rows" in ctx.kwargs:
+                    block_meta = replace(
+                        block_meta,
+                        num_rows=ctx.kwargs.pop("_write_stats_num_rows"),
+                        size_bytes=ctx.kwargs.pop("_write_stats_size_bytes"),
+                    )
+
                 # Finish processing before yielding the block!
                 blk_exec_stats_builder.finish()
 

@@ -25,6 +25,7 @@ DATA_SCHEMA = [
     "progress",
     "total",
     "total_rows",
+    "output_rows",
     "num_errored_blocks",
     "ray_data_output_rows",
     "ray_data_spilled_bytes",

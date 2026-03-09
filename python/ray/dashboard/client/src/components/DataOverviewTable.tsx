@@ -235,7 +235,7 @@ const DataRow = ({
           0
         )}
       </TableCell>
-      <TableCell align="right">{data.ray_data_output_rows.max}</TableCell>
+      <TableCell align="right">{data.output_rows}</TableCell>
       <TableCell align="right">
         {isOperatorRow ? operatorMetrics.queued_blocks : ""}
       </TableCell>

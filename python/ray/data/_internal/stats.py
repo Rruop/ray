@@ -675,6 +675,7 @@ class _StatsActor:
             "progress": 0,
             "total": 0,
             "total_rows": 0,
+            "output_rows": 0,
             "start_time": start_time,
             "end_time": None,
             "num_errored_blocks": 0,
@@ -685,6 +686,7 @@ class _StatsActor:
                     "total": 0,
                     "queued_blocks": 0,
                     "num_errored_blocks": 0,
+                    "output_rows": 0,
                 }
                 for operator in operator_tags
             },

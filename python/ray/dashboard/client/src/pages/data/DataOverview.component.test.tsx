@@ -34,6 +34,7 @@ describe("DataOverview", () => {
           max: 80,
         },
         num_errored_blocks: 0,
+        output_rows: 10,
         operators: [
           {
             operator: "test_ds1_op1",
@@ -61,6 +62,7 @@ describe("DataOverview", () => {
               max: 81,
             },
             num_errored_blocks: 0,
+            output_rows: 11,
           },
         ],
       },
@@ -91,6 +93,7 @@ describe("DataOverview", () => {
           max: 120,
         },
         num_errored_blocks: 0,
+        output_rows: 50,
         operators: [],
       },
     ];
@@ -145,6 +148,7 @@ describe("DataOverview", () => {
         ray_data_cpu_usage_cores: { value: 50, max: 60 },
         ray_data_gpu_usage_cores: { value: 70, max: 80 },
         num_errored_blocks: 5,
+        output_rows: 10,
         operators: [
           {
             operator: "errored_op1",
@@ -158,6 +162,7 @@ describe("DataOverview", () => {
             ray_data_cpu_usage_cores: { value: 40, max: 50 },
             ray_data_gpu_usage_cores: { value: 60, max: 70 },
             num_errored_blocks: 3,
+            output_rows: 8,
           },
         ],
       },

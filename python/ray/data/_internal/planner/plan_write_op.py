@@ -54,6 +54,12 @@ def generate_collect_write_stats_fn() -> BlockMapTransformFn:
         total_num_rows = sum(ba.num_rows() for ba in block_accessors)
         total_size_bytes = sum(ba.size_bytes() for ba in block_accessors)
 
+        # Store actual write stats in context for _map_task to use when
+        # constructing BlockMetadata. This ensures the output block's metadata
+        # reflects the actual rows/bytes written, not the stats DataFrame's 1 row.
+        ctx.kwargs["_write_stats_num_rows"] = total_num_rows
+        ctx.kwargs["_write_stats_size_bytes"] = total_size_bytes
+
         # NOTE: Write tasks can return anything, so we need to wrap it in a valid block
         # type.
         import pandas as pd

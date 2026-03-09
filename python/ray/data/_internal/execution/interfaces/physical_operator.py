@@ -676,7 +676,21 @@ class PhysicalOperator(Operator):
         Subclasses should either override this method, or update
         ``self._estimated_num_output_bundles`` appropriately.
         """
-        return self._estimated_num_output_bundles
+        actual = self._metrics.num_task_outputs_generated if self._metrics else 0
+        estimated = self._estimated_num_output_bundles
+
+        # When execution is finished, return the best known value
+        if self.has_execution_finished():
+            # For operators that don't run tasks (e.g., InputDataBuffer),
+            # actual will be 0, so prefer estimated if available
+            if actual > 0:
+                return actual
+            return estimated if estimated is not None else 0
+
+        # During execution, ensure estimate is at least as large as actual
+        if estimated is not None:
+            return max(estimated, actual)
+        return actual if actual > 0 else None
 
     def num_output_rows_total(self) -> Optional[int]:
         """Returns the total number of output rows of this operator,
