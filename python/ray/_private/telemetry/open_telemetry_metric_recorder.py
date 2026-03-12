@@ -192,11 +192,22 @@ class OpenTelemetryMetricRecorder:
             """
 
             def _add_instance_label(self, attrs_dict):
-                """Add 'instance' label from 'ip' for Prometheus compatibility."""
+                """Add 'instance' label from 'ip' and 'NodeId' for Prometheus compatibility.
+
+                The instance label format is '<ip>:<NodeId>' when NodeId is available,
+                which uniquely identifies a node even when multiple nodes share the same IP.
+                Falls back to just 'ip' if NodeId is not present.
+                """
                 # In pull mode, Prometheus adds 'instance' automatically from scrape target
                 # In push/remote_write mode, we need to add it manually
                 if "instance" not in attrs_dict and "ip" in attrs_dict:
-                    attrs_dict["instance"] = attrs_dict["ip"]
+                    ip = attrs_dict["ip"]
+                    node_id = attrs_dict.get("NodeId")
+                    if node_id:
+                        # Use ip:NodeId format to uniquely identify nodes with same IP
+                        attrs_dict["instance"] = f"{ip}:{node_id}"
+                    else:
+                        attrs_dict["instance"] = ip
                 return attrs_dict
 
             def _parse_data_point(self, data_point, name=None):

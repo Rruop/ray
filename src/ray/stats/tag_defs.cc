@@ -30,6 +30,8 @@ const TagKeyType WorkerIdKey = TagKeyType::Register("WorkerId");
 
 const TagKeyType SessionNameKey = TagKeyType::Register("SessionName");
 
+const TagKeyType NodeIdKey = TagKeyType::Register("NodeId");
+
 const TagKeyType NameKey = TagKeyType::Register("Name");
 
 const TagKeyType SourceKey = TagKeyType::Register("Source");
