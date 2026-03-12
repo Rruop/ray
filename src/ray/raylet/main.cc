@@ -1059,6 +1059,7 @@ int main(int argc, char *argv[]) {
         {ray::stats::WorkerIdKey, ""},
         {ray::stats::VersionKey, kRayVersion},
         {ray::stats::NodeAddressKey, node_ip_address},
+        {ray::stats::NodeIdKey, raylet_node_id.Hex()},
         {ray::stats::SessionNameKey, session_name}};
     ray::stats::Init(global_tags, ray::WorkerID::Nil());
     // Use the actual bound port returned by the node manager.

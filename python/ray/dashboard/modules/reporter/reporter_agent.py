@@ -1173,7 +1173,7 @@ class ReporterAgent(
         Returns:
             a list of Record instances of all values 0.
         """
-        tags = {"ip": self._ip, "Component": component_name}
+        tags = {"ip": self._ip, "NodeId": self._dashboard_agent.node_id, "Component": component_name}
 
         records = []
         records.append(
@@ -1262,7 +1262,7 @@ class ReporterAgent(
                     total_uss += float(memory_info.private) / 1.0e6
             total_num_fds += int(stat.get("num_fds", 0))
 
-        tags = {"ip": self._ip, "Component": component_name}
+        tags = {"ip": self._ip, "NodeId": self._dashboard_agent.node_id, "Component": component_name}
         if pid:
             tags["pid"] = pid
 
@@ -1335,7 +1335,7 @@ class ReporterAgent(
         Returns:
             a list of Record instances of GPU metrics with all values 0.
         """
-        tags = {"ip": self._ip, "Component": component_name}
+        tags = {"ip": self._ip, "NodeId": self._dashboard_agent.node_id, "Component": component_name}
 
         records = []
         records.append(
@@ -1412,12 +1412,14 @@ class ReporterAgent(
     def _to_records(self, stats, cluster_stats) -> List[Record]:
         records_reported = []
         ip = stats["ip"]
+        node_id = self._dashboard_agent.node_id
         ray_node_type = "head" if self._is_head_node else "worker"
         is_head_node = "true" if self._is_head_node else "false"
 
         # Common tags for node-level metrics
         # We use RayNodeType to mark head/worker node, IsHeadNode is retained for backward compatibility
-        node_tags = {"ip": ip, "RayNodeType": ray_node_type, "IsHeadNode": is_head_node}
+        # NodeId is added to uniquely identify nodes when multiple nodes share the same IP
+        node_tags = {"ip": ip, "NodeId": node_id, "RayNodeType": ray_node_type, "IsHeadNode": is_head_node}
 
         # -- Instance count of cluster --
         # Only report cluster stats on head node

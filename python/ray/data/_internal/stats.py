@@ -538,7 +538,7 @@ class _StatsActor:
             metrics[field.name] = Gauge(
                 metric_name,
                 description="",
-                tag_keys=("dataset", "node_ip"),
+                tag_keys=("dataset", "node_ip", "node_id"),
             )
         return metrics
 
@@ -613,7 +613,9 @@ class _StatsActor:
 
                 node_ip = self._ray_nodes_cache.get(node_id, NODE_UNKNOWN)
 
-                tags = self._create_tags(dataset_tag=dataset_tag, node_ip_tag=node_ip)
+                tags = self._create_tags(
+                    dataset_tag=dataset_tag, node_ip_tag=node_ip, node_id_tag=node_id
+                )
                 for metric_name, metric_value in node_metrics.items():
                     prom_metric = self.per_node_metrics[metric_name]
                     _record(prom_metric, metric_value, tags)
@@ -847,12 +849,15 @@ class _StatsActor:
         dataset_tag: str,
         operator_tag: Optional[str] = None,
         node_ip_tag: Optional[str] = None,
+        node_id_tag: Optional[str] = None,
     ):
         tags = {"dataset": dataset_tag}
         if operator_tag is not None:
             tags["operator"] = operator_tag
         if node_ip_tag is not None:
             tags["node_ip"] = node_ip_tag
+        if node_id_tag is not None:
+            tags["node_id"] = node_id_tag
         return tags
 
 
