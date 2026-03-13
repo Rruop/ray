@@ -3,10 +3,12 @@ import os
 import uuid
 
 import storage
+import redis
 from abc import abstractmethod
 
 from pyarrow import parquet as pq
 from redis import RedisError
+
 
 from ray.data._internal.util import call_with_retry
 from ray.data.block import BlockAccessor
@@ -32,8 +34,11 @@ class CheckpointWriter:
         self.filesystem = self.ckpt_config.filesystem
         self.write_num_threads = self.ckpt_config.write_num_threads
         self.redis_checkpoint_key = self.ckpt_config.redis_checkpoint_key
-        self.redis_checkpoint_cluster = self.ckpt_config.redis_checkpoint_cluster
-        self.redis_checkpoint_biz = self.ckpt_config.redis_checkpoint_biz
+        self.redis_checkpoint_host = self.ckpt_config.redis_checkpoint_host
+        self.redis_checkpoint_port = self.ckpt_config.redis_checkpoint_port
+        self.redis_checkpoint_password = self.ckpt_config.redis_checkpoint_password
+        self.redis_data_storage_as_roaring_bitmap = self.ckpt_config.redis_data_storage_as_roaring_bitmap
+        self.write_checkpoint_retry_number = self.ckpt_config.write_checkpoint_retry_number
 
     @abstractmethod
     def write_block_checkpoint(self, block: BlockAccessor):
@@ -82,29 +87,33 @@ class BatchBasedCheckpointWriter(CheckpointWriter):
         checkpoint_ids_table = BlockAccessor.for_block(checkpoint_ids_block).to_arrow()
 
         redis_checkpoint_key = self.redis_checkpoint_key
-
+        
         def _write():
-            if not redis_checkpoint_key:
-                pq.write_table(
-                    checkpoint_ids_table,
-                    ckpt_file_path,
-                    filesystem=self.filesystem,
-                )
-                return
-            else:
-                ids = checkpoint_ids_block["id"].to_numpy().tolist()
-                try:
-                    op = storage.RedisOption(self.redis_checkpoint_cluster, biz_def=self.redis_checkpoint_biz)
-                    redis_client = storage.RedisClient(op)
-                    redis_client.sadd(redis_checkpoint_key, *ids)
-                except storage.Error as e:
-                    exit(1)
-                redis_client.close()
+            try:
+                if not redis_checkpoint_key:
+                    pq.write_table(
+                        checkpoint_ids_table,
+                        ckpt_file_path,
+                        filesystem=self.filesystem,
+                    )
+                    return
+                else:
+                    logger.info(f"write checkpoint file: {file_name}")
+                    ids = checkpoint_ids_block[self.id_col].to_numpy().tolist()
+                    redis_client = redis.Redis(host=self.redis_checkpoint_host, port=9000, password=self.redis_checkpoint_password, decode_responses=True)
+                    if self.redis_data_storage_as_roaring_bitmap:
+                        redis_client.execute_command('R.APPENDINTARRAY', redis_checkpoint_key, *ids)
+                    else:
+                        redis_client.sadd(redis_checkpoint_key, *ids)
+                    redis_client.close() 
+            except  Exception:
+                    raise Exception("CHECKPOINT_WERITE_ERROR")   
         try:
             return call_with_retry(
                 _write,
                 description=f"Write checkpoint file: {file_name}",
                 match=DataContext.get_current().retried_io_errors,
+                max_attempts = self.write_checkpoint_retry_number,
             )
         except Exception:
             logger.exception(f"Checkpoint write failed: {file_name}")
