@@ -85,9 +85,13 @@ class CheckpointConfig:
         checkpoint_path_partition_filter: Optional["PathPartitionFilter"] = None,
         checkpoint_read_override_num_blocks: Optional[int] = None,
         redis_checkpoint_key:Optional[str] = None,
-        redis_checkpoint_cluster: Optional[str] = 'RayClusterCheckpoint',
-        redis_checkpoint_biz: Optional[str] = 'ad',
+        redis_checkpoint_host: Optional[str] = 'public-xm-c-stagingredis51.idchb1az1.hb1.kwaidc.com',
+        redis_checkpoint_port: Optional[int] = 16942,
+        redis_checkpoint_password: Optional[str] = '',
+        redis_checkpoint_pipeline_batch_size: Optional[int] = 1000,
+        redis_data_storage_as_roaring_bitmap: bool = True,
         use_roaring_bitmap: bool = False,
+        write_checkpoint_retry_number: Optional[int] = 10,
     ):
         self.id_column: Optional[str] = id_column
 
@@ -120,9 +124,13 @@ class CheckpointConfig:
         self.checkpoint_path_partition_filter = checkpoint_path_partition_filter
         self.checkpoint_read_override_num_blocks = checkpoint_read_override_num_blocks
         self.redis_checkpoint_key = redis_checkpoint_key
-        self.redis_checkpoint_cluster = redis_checkpoint_cluster
-        self.redis_checkpoint_biz = redis_checkpoint_biz
+        self.redis_checkpoint_host = redis_checkpoint_host
+        self.redis_checkpoint_port = redis_checkpoint_port
+        self.redis_checkpoint_password = redis_checkpoint_password
+        self.redis_checkpoint_pipeline_batch_size = redis_checkpoint_pipeline_batch_size
+        self.redis_data_storage_as_roaring_bitmap = redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap: bool = use_roaring_bitmap
+        self.write_checkpoint_retry_number = write_checkpoint_retry_number
 
     def _get_default_checkpoint_path(self) -> str:
         artifact_storage = os.environ.get(self.DEFAULT_CHECKPOINT_PATH_BUCKET_ENV_VAR)

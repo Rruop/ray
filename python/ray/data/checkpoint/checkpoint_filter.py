@@ -22,7 +22,7 @@ from ray.data.checkpoint.bitmap64 import RoaringBitmap64
 from ray.data.datasource import PathPartitionFilter
 from ray.data.datasource.path_util import _unwrap_protocol
 from ray.types import ObjectRef
-from redis import RedisError
+from redis import RedisError, Redis
 import storage
 
 import numpy as np
@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 _CACHED_ROARING_BITMAP: Optional[BitMap] = None
 _CACHED_CHECKPOINT_REF_ID: Optional[str] = None  # e.g., hash or path
 _CACHE_LOCK = threading.Lock()
+_REDIS_CHECKPOINT_EXISTS:Optional[str] = None
+_REDIS_CHECKPOINT_EXISTS_LOCK = threading.Lock()
+
 
 
 def _build_bitmap_from_checkpoint_table(ckpt_table: pa.Table, id_column: str) -> BitMap:
@@ -81,6 +84,19 @@ CHECKPOINT_RECOVERY_MAX_BACKOFF_S = int(
     os.environ.get("RAY_DATA_CHECKPOINT_RECOVERY_MAX_BACKOFF_S", "8")
 )
 
+def _is_redis_checkpoint_key_exists(
+    redis_key: str,
+    redis_client: Redis,
+) -> str:
+    """Get cached bitmap or build it once per worker."""
+    global _REDIS_CHECKPOINT_EXISTS
+
+    with _REDIS_CHECKPOINT_EXISTS_LOCK:
+        if _REDIS_CHECKPOINT_EXISTS is None:
+            _REDIS_CHECKPOINT_EXISTS = str(redis_client.exists(redis_key))
+
+    return _REDIS_CHECKPOINT_EXISTS
+
 
 class CheckpointFilter(abc.ABC):
     """Abstract class which defines the interface for filtering checkpointed rows
@@ -97,8 +113,11 @@ class CheckpointFilter(abc.ABC):
         self.filesystem = self.ckpt_config.filesystem
         self.filter_num_threads = self.ckpt_config.filter_num_threads
         self.redis_checkpoint_key = self.ckpt_config.redis_checkpoint_key
-        self.redis_checkpoint_cluster = self.ckpt_config.redis_checkpoint_cluster
-        self.redis_checkpoint_biz = self.ckpt_config.redis_checkpoint_biz
+        self.redis_checkpoint_host = self.ckpt_config.redis_checkpoint_host
+        self.redis_checkpoint_port = self.ckpt_config.redis_checkpoint_port
+        self.redis_checkpoint_password = self.ckpt_config.redis_checkpoint_password
+        self.redis_checkpoint_pipeline_batch_size = self.ckpt_config.redis_checkpoint_pipeline_batch_size
+        self.redis_data_storage_as_roaring_bitmap = self.ckpt_config.redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap = self.ckpt_config.use_roaring_bitmap
 
 @ray.remote(num_cpus=0)
@@ -238,12 +257,14 @@ class CheckpointLoader:
         filesystem: pyarrow.fs.FileSystem,
         id_column: str,
         redis_checkpoint_key: str,
-        redis_checkpoint_cluster: str,
-        redis_checkpoint_biz: str,
+        redis_checkpoint_host: str,
+        redis_checkpoint_port: int,
+        redis_checkpoint_password: str,
+        redis_checkpoint_pipeline_batch_size: int,
         use_roaring_bitmap: bool,
         checkpoint_path_partition_filter: Optional[PathPartitionFilter] = None,
         checkpoint_read_override_num_blocks:Optional[int] = None,
-
+        redis_data_storage_as_roaring_bitmap: bool = False,
     ):
         """Initialize the CheckpointLoader.
 
@@ -260,9 +281,13 @@ class CheckpointLoader:
         self.checkpoint_path_partition_filter = checkpoint_path_partition_filter
         self.checkpoint_read_override_num_blocks = checkpoint_read_override_num_blocks
         self.redis_checkpoint_key = redis_checkpoint_key
-        self.redis_checkpoint_cluster = redis_checkpoint_cluster
-        self.redis_checkpoint_biz = redis_checkpoint_biz
+        self.redis_checkpoint_host = redis_checkpoint_host
+        self.redis_checkpoint_port = redis_checkpoint_port
+        self.redis_checkpoint_password = redis_checkpoint_password
+        self.redis_checkpoint_pipeline_batch_size = redis_checkpoint_pipeline_batch_size
+        self.redis_data_storage_as_roaring_bitmap = redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap = use_roaring_bitmap
+
     def remove_empty_parquet_files(self):
         from pyarrow.fs import FileSelector,FileType
         selector = FileSelector(self.checkpoint_path, recursive=True)
@@ -423,8 +448,11 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
             checkpoint_path_partition_filter=self.ckpt_config.checkpoint_path_partition_filter,
             checkpoint_read_override_num_blocks=self.ckpt_config.checkpoint_read_override_num_blocks,
             redis_checkpoint_key=self.ckpt_config.redis_checkpoint_key,
-            redis_checkpoint_cluster=self.ckpt_config.redis_checkpoint_cluster,
-            redis_checkpoint_biz=self.ckpt_config.redis_checkpoint_biz,
+            redis_checkpoint_host=self.ckpt_config.redis_checkpoint_host,
+            redis_checkpoint_port=self.ckpt_config.redis_checkpoint_port,
+            redis_checkpoint_password=self.ckpt_config.redis_checkpoint_password,
+            redis_checkpoint_pipeline_batch_size=self.ckpt_config.redis_checkpoint_pipeline_batch_size,
+            redis_data_storage_as_roaring_bitmap=self.ckpt_config.redis_data_storage_as_roaring_bitmap,
             use_roaring_bitmap =self.ckpt_config.use_roaring_bitmap,
         )
         return loader.load_checkpoint()
@@ -468,11 +496,11 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
         self.filesystem.delete_dir(self.checkpoint_path_unwrapped)
         if self.redis_checkpoint_key :
             try:
-                op = storage.RedisOption(self.redis_checkpoint_cluster, biz_def=self.redis_checkpoint_biz)
-                redis_client = storage.RedisClient(op)
+                redis_client = redis.Redis(host=self.redis_checkpoint_host, port=self.redis_checkpoint_port, password=self.redis_checkpoint_password, decode_responses=True)
                 redis_client.delete(self.redis_checkpoint_key)
             except storage.Error as e:
                 exit(1)
+            redis_client.close()
 
 
 
@@ -584,32 +612,32 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
         """
         Filter out rows already in Redis Set (no chunking needed).
         """
-
-        try:
-            op = storage.RedisOption(self.redis_checkpoint_cluster, biz_def=self.redis_checkpoint_biz)
-            redis_client = storage.RedisClient(op)
-            is_exists = redis_client.exists(self.redis_checkpoint_key)
-        except storage.Error as e:
-            exit(1)
-
-        if len(block) == 0 or is_exists==0:
+        redis_client = redis.Redis(host=self.redis_checkpoint_host, port=self.redis_checkpoint_port,
+                                       password=self.redis_checkpoint_password, decode_responses=True)
+        is_exists = _is_redis_checkpoint_key_exists(self.redis_checkpoint_key,redis_client)
+        if len(block) == 0 or is_exists == '0' :
             return block
-
-        block_ids = block[self.id_column].to_numpy()
-
-        #exists_flags = redis_client.sismember('mykey_5', block_ids.tolist())
-        #keep_mask = ~np.array(exists_flags, dtype=bool)
-        batch_size = 20000
+        batch_size = self.redis_checkpoint_pipeline_batch_size
         exists_flags = []
         block_ids = block[self.id_column].to_numpy().tolist()
+
+        def batch_check_roaring_bitmap(client, bitmap_key, values_to_check):
+            with client.pipeline(transaction=False) as pipe:
+                for value in values_to_check:
+                    pipe.execute_command('R.GETBIT', bitmap_key, value)
+                results = pipe.execute()
+
+            return results
         for i in range(0, len(block_ids), batch_size):
-            pipe = redis_client.pipeline()
-            for _id in block_ids[i:i + batch_size]:
-                pipe.sismember(self.redis_checkpoint_key, _id)
-
-            batch_results = pipe.execute()
-            exists_flags.extend(batch_results)
-
+            if self.redis_data_storage_as_roaring_bitmap:
+                batch_results = batch_check_roaring_bitmap(redis_client,self.redis_checkpoint_key,block_ids[i:i + batch_size])
+                exists_flags.extend(batch_results)
+            else:
+                pipe = redis_client.pipeline(transaction=False)
+                for _id in block_ids[i:i + batch_size]:
+                    pipe.execute_command('SISMEMBER',self.redis_checkpoint_key, _id)
+                batch_results = pipe.execute()
+                exists_flags.extend(batch_results)
         # Build keep mask: True = keep (not in checkpoint)
         keep_mask = ~numpy.array(exists_flags, dtype=bool)
         redis_client.close()
