@@ -22,8 +22,7 @@ from ray.data.checkpoint.bitmap64 import RoaringBitmap64
 from ray.data.datasource import PathPartitionFilter
 from ray.data.datasource.path_util import _unwrap_protocol
 from ray.types import ObjectRef
-from redis import RedisError, Redis
-import storage
+from redis import Redis
 
 import numpy as np
 from pyroaring import BitMap

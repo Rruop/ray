@@ -2,7 +2,6 @@ import logging
 import os
 import uuid
 
-import storage
 import redis
 from abc import abstractmethod
 from dataclasses import dataclass
@@ -13,7 +12,7 @@ from pyarrow.fs import FileType
 
 if TYPE_CHECKING:
     import pyarrow
-from redis import RedisError
+
 
 
 from ray.data._internal.util import call_with_retry
@@ -191,25 +190,21 @@ class BatchBasedCheckpointWriter(CheckpointWriter):
         redis_checkpoint_key = self.redis_checkpoint_key
         
         def _write():
-            try:
-                if not redis_checkpoint_key:
-                    pq.write_table(
-                        checkpoint_ids_table,
-                        ckpt_file_path,
-                        filesystem=self.filesystem,
-                    )
-                    return
+            if not redis_checkpoint_key:
+                pq.write_table(
+                    checkpoint_ids_table,
+                    ckpt_file_path,
+                    filesystem=self.filesystem,
+                )
+            else:
+                logger.info(f"write checkpoint file: {file_name}")
+                ids = checkpoint_ids_block[self.id_col].to_numpy().tolist()
+                redis_client = redis.Redis(host=self.redis_checkpoint_host, port=self.redis_checkpoint_port, password=self.redis_checkpoint_password, decode_responses=True)
+                if self.redis_data_storage_as_roaring_bitmap:
+                    redis_client.execute_command('R.APPENDINTARRAY', redis_checkpoint_key, *ids)
                 else:
-                    logger.info(f"write checkpoint file: {file_name}")
-                    ids = checkpoint_ids_block[self.id_col].to_numpy().tolist()
-                    redis_client = redis.Redis(host=self.redis_checkpoint_host, port=9000, password=self.redis_checkpoint_password, decode_responses=True)
-                    if self.redis_data_storage_as_roaring_bitmap:
-                        redis_client.execute_command('R.APPENDINTARRAY', redis_checkpoint_key, *ids)
-                    else:
-                        redis_client.sadd(redis_checkpoint_key, *ids)
-                    redis_client.close() 
-            except  Exception:
-                    raise Exception("CHECKPOINT_WERITE_ERROR")   
+                    redis_client.sadd(redis_checkpoint_key, *ids)
+                redis_client.close()
         try:
             call_with_retry(
                 _write,
