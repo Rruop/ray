@@ -613,6 +613,14 @@ class ActorPoolMapOperator(MapOperator):
         """Returns Actor counts for Alive, Restarting and Pending Actors."""
         return self._actor_pool.get_actor_info()
 
+    def get_task_distribution(self) -> Tuple[int, int]:
+        """Returns the estimated distribution of tasks between running and queued.
+
+        Returns:
+            A tuple of (estimated_running, estimated_queued) task counts.
+        """
+        return self._actor_pool.get_task_distribution()
+
     def get_max_concurrency_limit(self) -> Optional[int]:
         return self._actor_pool.max_size() * self._actor_pool.max_actor_concurrency()
 
@@ -1478,6 +1486,28 @@ class _ActorPool(AutoscalingActorPool):
             pending=self.num_pending_actors(),
             restarting=self.num_restarting_actors(),
         )
+
+    def get_task_distribution(self) -> Tuple[int, int]:
+        """Returns the estimated distribution of tasks between running and queued.
+
+        For each actor, at most `max_actor_concurrency` tasks can be running
+        simultaneously. Tasks beyond that are queued within the actor.
+
+        Returns:
+            A tuple of (estimated_running, estimated_queued) task counts.
+        """
+        estimated_running = 0
+        estimated_queued = 0
+
+        for actor, state in self._running_actors.items():
+            tasks = state.num_tasks_in_flight
+            # Each actor can run at most max_actor_concurrency tasks simultaneously
+            actor_running = min(tasks, self._max_actor_concurrency)
+            actor_queued = tasks - actor_running
+            estimated_running += actor_running
+            estimated_queued += actor_queued
+
+        return estimated_running, estimated_queued
 
     def per_actor_resource_usage(self) -> ExecutionResources:
         """Per actor resource usage."""

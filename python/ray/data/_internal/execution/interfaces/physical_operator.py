@@ -42,7 +42,12 @@ logger = logging.getLogger(__name__)
 METADATA_GET_TIMEOUT_S = 1.0
 
 # Timeout for waiting for metadata object to become available (in seconds)
-METADATA_WAIT_TIMEOUT_S = 0.1
+# NOTE: This is set to 0 for non-blocking behavior in prepare_metadata().
+# When meta_ref is not immediately available, the task will be retried
+# in the next scheduling loop iteration. This avoids serial blocking
+# when processing many tasks, significantly improving scheduling loop
+# performance when block sizes are small.
+METADATA_WAIT_TIMEOUT_S = 0.0
 
 # TODO(hchen): Ray Core should have a common interface for these two types.
 Waitable = Union[ray.ObjectRef, ObjectRefGenerator]
@@ -245,6 +250,102 @@ class DataOpTask(OpTask):
     @property
     def has_finished(self) -> bool:
         return self._has_finished
+
+    def prepare_metadata(self) -> bool:
+        """Prepare metadata ref without blocking.
+
+        This method prepares the block_ref and meta_ref for batch processing.
+        It does not block waiting for metadata to be ready.
+
+        Returns:
+            True if metadata ref is ready for batch waiting, False otherwise.
+            Returns False if:
+            - Task has finished (StopIteration)
+            - Block ref is not yet available
+            - Meta ref is not yet available
+        """
+        if self._has_finished:
+            return False
+
+        # Step 1: Get block_ref if not already available
+        if self._pending_block_ref.is_nil():
+            assert self._pending_meta_ref.is_nil(), (
+                "This method expects streaming generators to yield blocks then "
+                "metadata. So, if we have a reference to metadata but not the "
+                "block, it means there's an error in the implementation."
+            )
+
+            try:
+                self._pending_block_ref = self._streaming_gen._next_sync(timeout_s=0)
+            except StopIteration:
+                self._task_done_callback(None)
+                self._has_finished = True
+                return False
+
+            if self._pending_block_ref.is_nil():
+                # The generator currently doesn't have new output.
+                return False
+
+            self._block_ready_callback(self._pending_block_ref)
+
+        # Step 2: Get meta_ref if not already available
+        if self._pending_meta_ref.is_nil():
+            try:
+                self._pending_meta_ref = self._streaming_gen._next_sync(
+                    timeout_s=METADATA_WAIT_TIMEOUT_S
+                )
+            except StopIteration:
+                # The generator should always yield 2 values (block and metadata)
+                # each time. If we get a StopIteration here, it means an error
+                # happened in the task.
+                # And in this case, the block_ref is the exception object.
+                try:
+                    ray.get(self._pending_block_ref)
+                    assert False, "Above ray.get should raise an exception."
+                except Exception as ex:
+                    self._task_done_callback(ex)
+                    self._has_finished = True
+                    raise ex from None
+
+            if self._pending_meta_ref.is_nil():
+                # Metadata ref not yet available
+                return False
+
+            self._metadata_ready_callback(self._pending_meta_ref)
+
+        # Both block_ref and meta_ref are ready for batch waiting
+        return True
+
+    def get_pending_meta_ref(self) -> ray.ObjectRef:
+        """Get the pending metadata reference for batch waiting."""
+        return self._pending_meta_ref
+
+    def complete_with_metadata(
+        self, meta_with_schema: "BlockMetadataWithSchema"
+    ) -> int:
+        """Complete data processing with already-fetched metadata.
+
+        This method should be called after metadata has been batch-fetched
+        and is guaranteed to be available locally.
+
+        Args:
+            meta_with_schema: The metadata that was fetched via batch ray.get().
+
+        Returns:
+            The size in bytes of the processed block.
+        """
+        meta = meta_with_schema.metadata
+        self._output_ready_callback(
+            RefBundle(
+                [(self._pending_block_ref, meta)],
+                owns_blocks=True,
+                schema=meta_with_schema.schema,
+            ),
+        )
+        bytes_read = meta.size_bytes
+        self._pending_block_ref = ray.ObjectRef.nil()
+        self._pending_meta_ref = ray.ObjectRef.nil()
+        return bytes_read
 
 
 class MetadataOpTask(OpTask):

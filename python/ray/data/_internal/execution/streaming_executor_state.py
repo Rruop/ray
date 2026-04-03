@@ -4,10 +4,11 @@ This is split out from streaming_executor.py to facilitate better unit testing.
 """
 
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import ray
@@ -46,6 +47,88 @@ logger = logging.getLogger(__name__)
 # Holds the full execution state of the streaming topology. It's a dict mapping each
 # operator to tracked streaming exec state.
 Topology = Dict[PhysicalOperator, "OpState"]
+
+# Environment variable to enable detailed scheduling loop diagnostics
+_ENABLE_SCHED_LOOP_DIAGNOSTICS = os.environ.get(
+    "RAY_DATA_ENABLE_SCHED_LOOP_DIAGNOSTICS", "0"
+) == "1"
+
+
+@dataclass
+class SchedulingLoopDiagnostics:
+    """Diagnostics for a single scheduling loop iteration.
+
+    This class collects detailed timing and count information to help
+    identify performance bottlenecks in the scheduling loop.
+    """
+
+    # Timing metrics (in seconds)
+    ray_wait_active_tasks_s: float = 0.0  # Time spent in ray.wait for active tasks
+    prepare_metadata_total_s: float = 0.0  # Total time in prepare_metadata calls
+    prepare_metadata_max_s: float = 0.0  # Max time for a single prepare_metadata
+    ray_wait_meta_refs_s: float = 0.0  # Time spent in ray.wait for meta refs
+    process_meta_total_s: float = 0.0  # Time processing metadata (ray.get + complete)
+    pull_outputs_s: float = 0.0  # Time pulling outputs from operators
+
+    # Count metrics
+    num_active_tasks: int = 0  # Number of active tasks checked
+    num_ready_tasks: int = 0  # Number of tasks ready from ray.wait
+    num_prepare_metadata_calls: int = 0  # Number of prepare_metadata calls
+    num_prepare_metadata_waited: int = 0  # Number that actually waited (took >1ms)
+    num_pending_meta_tasks: int = 0  # Number of tasks with pending metadata
+    num_meta_refs_ready: int = 0  # Number of meta refs ready after batch wait
+    num_blocks_processed: int = 0  # Number of blocks processed
+
+    # Derived metrics
+    def total_time_s(self) -> float:
+        """Total time accounted for in this iteration."""
+        return (
+            self.ray_wait_active_tasks_s
+            + self.prepare_metadata_total_s
+            + self.ray_wait_meta_refs_s
+            + self.process_meta_total_s
+            + self.pull_outputs_s
+        )
+
+    def to_log_string(self) -> str:
+        """Format diagnostics for logging."""
+        return (
+            f"SchedulingLoopDiagnostics: "
+            f"ray_wait_active={self.ray_wait_active_tasks_s * 1000:.1f}ms, "
+            f"prepare_meta={self.prepare_metadata_total_s * 1000:.1f}ms "
+            f"(calls={self.num_prepare_metadata_calls}, "
+            f"waited={self.num_prepare_metadata_waited}, "
+            f"max={self.prepare_metadata_max_s * 1000:.1f}ms), "
+            f"ray_wait_meta={self.ray_wait_meta_refs_s * 1000:.1f}ms, "
+            f"process_meta={self.process_meta_total_s * 1000:.1f}ms, "
+            f"pull_outputs={self.pull_outputs_s * 1000:.1f}ms, "
+            f"active_tasks={self.num_active_tasks}, "
+            f"ready_tasks={self.num_ready_tasks}, "
+            f"pending_meta={self.num_pending_meta_tasks}, "
+            f"meta_ready={self.num_meta_refs_ready}, "
+            f"blocks_processed={self.num_blocks_processed}, "
+            f"total={self.total_time_s() * 1000:.1f}ms"
+        )
+
+
+# Global diagnostics for the last N iterations (ring buffer)
+_DIAGNOSTICS_BUFFER_SIZE = 100
+_diagnostics_buffer: List[SchedulingLoopDiagnostics] = []
+_diagnostics_lock = threading.Lock()
+
+
+def get_recent_diagnostics() -> List[SchedulingLoopDiagnostics]:
+    """Get recent scheduling loop diagnostics for analysis."""
+    with _diagnostics_lock:
+        return list(_diagnostics_buffer)
+
+
+def _record_diagnostics(diag: SchedulingLoopDiagnostics) -> None:
+    """Record diagnostics to the ring buffer."""
+    with _diagnostics_lock:
+        _diagnostics_buffer.append(diag)
+        if len(_diagnostics_buffer) > _DIAGNOSTICS_BUFFER_SIZE:
+            _diagnostics_buffer.pop(0)
 
 
 class OpBufferQueue:
@@ -400,7 +483,7 @@ def process_completed_tasks(
     topology: Topology,
     backpressure_policies: List[BackpressurePolicy],
     max_errored_blocks: int,
-) -> Dict["OpState", int]:
+) -> Tuple[Dict["OpState", int], Optional[SchedulingLoopDiagnostics]]:
     """Process any newly completed tasks. To update operator
     states, call `update_operator_states()` afterwards.
 
@@ -410,14 +493,21 @@ def process_completed_tasks(
         max_errored_blocks: Max number of errored blocks to allow,
             unlimited if negative.
     Returns:
-        A dict mapping OpState to the number of errored blocks for that operator.
+        A tuple of:
+        - A dict mapping OpState to the number of errored blocks for that operator.
+        - Optional diagnostics if enabled via RAY_DATA_ENABLE_SCHED_LOOP_DIAGNOSTICS=1
     """
+    # Initialize diagnostics if enabled
+    diag = SchedulingLoopDiagnostics() if _ENABLE_SCHED_LOOP_DIAGNOSTICS else None
 
     # All active tasks, keyed by their waitables.
     active_tasks: Dict[Waitable, Tuple[OpState, OpTask]] = {}
     for op, state in topology.items():
         for task in op.get_active_tasks():
             active_tasks[task.get_waitable()] = (state, task)
+
+    if diag:
+        diag.num_active_tasks = len(active_tasks)
 
     max_bytes_to_read_per_op: Dict[OpState, int] = {}
     for op, state in topology.items():
@@ -445,12 +535,17 @@ def process_completed_tasks(
     errored_blocks_per_op: Dict["OpState", int] = defaultdict(int)
     num_errored_blocks = 0
     if active_tasks:
+        # ===== Phase 1: ray.wait for active tasks =====
+        t_ray_wait_start = time.perf_counter()
         ready, _ = ray.wait(
             list(active_tasks.keys()),
             num_returns=len(active_tasks),
             fetch_local=False,
             timeout=0.1,
         )
+        if diag:
+            diag.ray_wait_active_tasks_s = time.perf_counter() - t_ray_wait_start
+            diag.num_ready_tasks = len(ready)
 
         # Organize tasks by the operator they belong to, and sort them by task index.
         # So that we'll process them in a deterministic order.
@@ -462,17 +557,52 @@ def process_completed_tasks(
             state, task = active_tasks[ref]
             ready_tasks_by_op[state].append(task)
 
+        # ========== Batch Metadata Fetching (Solution 2) ==========
+        # The key optimization: instead of calling ray.get() with 1s timeout
+        # sequentially for each task (N tasks × 1s = N seconds worst case),
+        # we batch all metadata refs and use a single ray.wait() with short timeout.
+        #
+        # IMPORTANT: Each task may produce MULTIPLE blocks. The original on_data_ready()
+        # uses a while loop to read all available blocks from a task's streaming generator.
+        # Our batch approach processes ONE block per task per scheduling loop iteration.
+        # This is acceptable because:
+        # 1. Tasks with more blocks will be processed again in subsequent iterations
+        # 2. The scheduling loop runs frequently
+        # 3. The key bottleneck (serial 1s timeouts) is eliminated
+
+        # ===== Phase 2: Collect metadata refs (prepare_metadata calls) =====
+        # Step 1: Collect metadata refs and separate task types
+        pending_meta_tasks = []  # [(state, task, meta_ref), ...]
+        non_data_tasks = []  # [(state, task), ...] for MetadataOpTask
+
         for state, ready_tasks in ready_tasks_by_op.items():
-            # TODO elaborate why sorting (helps preserve_order case)
+            # Sort tasks by index (helps preserve_order case)
             ready_tasks = sorted(ready_tasks, key=lambda t: t.task_index())
             for task in ready_tasks:
                 if isinstance(task, DataOpTask):
                     try:
-                        bytes_read = task.on_data_ready(
-                            max_bytes_to_read_per_op.get(state, None)
-                        )
-                        if state in max_bytes_to_read_per_op:
-                            max_bytes_to_read_per_op[state] -= bytes_read
+                        # Prepare metadata ref without blocking
+                        # This gets block_ref and meta_ref ready for batch waiting
+                        t_prepare_start = time.perf_counter() if diag else 0
+                        prepared = task.prepare_metadata()
+                        if diag:
+                            prepare_time = time.perf_counter() - t_prepare_start
+                            diag.num_prepare_metadata_calls += 1
+                            diag.prepare_metadata_total_s += prepare_time
+                            diag.prepare_metadata_max_s = max(
+                                diag.prepare_metadata_max_s, prepare_time
+                            )
+                            # Track if this call actually waited (>1ms)
+                            if prepare_time > 0.001:
+                                diag.num_prepare_metadata_waited += 1
+
+                        if prepared:
+                            meta_ref = task.get_pending_meta_ref()
+                            if not meta_ref.is_nil():
+                                pending_meta_tasks.append((state, task, meta_ref))
+                        # If prepare_metadata() returns False, task either:
+                        # - Has finished (StopIteration, handled internally)
+                        # - Block/meta ref not yet available (will retry next loop)
                     except Exception as e:
                         errored_blocks_per_op[state] += 1
                         num_errored_blocks += 1
@@ -506,14 +636,113 @@ def process_completed_tasks(
                             raise e from None
                 else:
                     assert isinstance(task, MetadataOpTask)
-                    task.on_task_finished()
+                    non_data_tasks.append((state, task))
 
+        # Step 2: Process MetadataOpTasks immediately (they don't need batching)
+        for state, task in non_data_tasks:
+            task.on_task_finished()
+
+        # ===== Phase 3: Batch wait for metadata refs =====
+        # Step 3: Batch wait for all pending metadata refs
+        if pending_meta_tasks:
+            if diag:
+                diag.num_pending_meta_tasks = len(pending_meta_tasks)
+
+            from ray.data._internal.execution.interfaces.physical_operator import (
+                METADATA_WAIT_TIMEOUT_S,
+            )
+
+            meta_refs = [item[2] for item in pending_meta_tasks]
+            t_meta_wait_start = time.perf_counter() if diag else 0
+            ready_meta_refs, _ = ray.wait(
+                meta_refs,
+                num_returns=len(meta_refs),
+                timeout=METADATA_WAIT_TIMEOUT_S,  # Only wait 100ms total, not per task
+                fetch_local=True,
+            )
+            if diag:
+                diag.ray_wait_meta_refs_s = time.perf_counter() - t_meta_wait_start
+                diag.num_meta_refs_ready = len(ready_meta_refs)
+
+            ready_meta_set = set(ready_meta_refs)
+
+            # ===== Phase 4: Process metadata =====
+            # Step 4: Process tasks with ready metadata
+            # Iterate in original order to preserve task_index ordering per state
+            t_process_meta_start = time.perf_counter() if diag else 0
+            for state, task, meta_ref in pending_meta_tasks:
+                if meta_ref not in ready_meta_set:
+                    # Metadata not ready yet, will retry in next scheduling loop.
+                    # Task's pending refs remain set, so prepare_metadata() will
+                    # return True immediately in next iteration.
+                    continue
+
+                # Check max_bytes_to_read limit before processing
+                if state in max_bytes_to_read_per_op:
+                    if max_bytes_to_read_per_op[state] <= 0:
+                        # Skip due to backpressure. Task's pending refs remain set,
+                        # will be processed in next scheduling loop.
+                        continue
+
+                try:
+                    # Metadata is ready locally, ray.get won't block
+                    meta_with_schema = ray.get(meta_ref, timeout=0)
+                    bytes_read = task.complete_with_metadata(meta_with_schema)
+                    if diag:
+                        diag.num_blocks_processed += 1
+                    if state in max_bytes_to_read_per_op:
+                        max_bytes_to_read_per_op[state] -= bytes_read
+                except Exception as e:
+                    errored_blocks_per_op[state] += 1
+                    num_errored_blocks += 1
+                    should_ignore = (
+                        max_errored_blocks < 0
+                        or max_errored_blocks >= num_errored_blocks
+                    )
+                    error_message = (
+                        "An exception was raised from a task of "
+                        f'operator "{state.op.name}". '
+                        f"[num_errored_blocks={num_errored_blocks}]"
+                    )
+                    if should_ignore:
+                        remaining = (
+                            max_errored_blocks - num_errored_blocks
+                            if max_errored_blocks >= 0
+                            else "unlimited"
+                        )
+                        error_message += (
+                            " Ignoring this exception with remaining"
+                            f" max_errored_blocks={remaining}."
+                        )
+                        logger.error(error_message, exc_info=e)
+                    else:
+                        error_message += (
+                            " Dataset execution will now abort."
+                            " To ignore this exception and continue, set"
+                            " DataContext.max_errored_blocks."
+                        )
+                        logger.exception(error_message)
+                        raise e from None
+
+            if diag:
+                diag.process_meta_total_s = time.perf_counter() - t_process_meta_start
+
+    # ===== Phase 5: Pull outputs =====
     # Pull any operator outputs into the streaming op state.
+    t_pull_start = time.perf_counter() if diag else 0
     for op, op_state in topology.items():
         while op.has_next():
             op_state.add_output(op.get_next())
+    if diag:
+        diag.pull_outputs_s = time.perf_counter() - t_pull_start
 
-    return dict(errored_blocks_per_op)
+    # Log and record diagnostics
+    if diag:
+        if diag.total_time_s() > 0.1:  # Log if loop takes > 100ms
+            logger.info(diag.to_log_string())
+        _record_diagnostics(diag)
+
+    return dict(errored_blocks_per_op), diag
 
 
 def update_operator_states(topology: Topology) -> None:
@@ -780,9 +1009,20 @@ def format_op_state_summary(
     op_state: OpState, resource_manager: ResourceManager, verbose: bool = False
 ) -> str:
     """Get a formatted summary of the OpState for progress reporting."""
-    # Active tasks
+    # Active tasks with running/queued breakdown if available
     active = op_state.op.num_active_tasks()
-    desc = f"Tasks: {active}"
+
+    # Try to get task distribution (running vs queued) if the operator supports it
+    if hasattr(op_state.op, "get_task_distribution"):
+        try:
+            estimated_running, estimated_queued = op_state.op.get_task_distribution()
+            desc = f"Tasks: {active} (running={estimated_running}, queued={estimated_queued})"
+        except Exception:
+            # Fallback to simple format if get_task_distribution fails
+            desc = f"Tasks: {active}"
+    else:
+        desc = f"Tasks: {active}"
+
     if (
         op_state.op._in_task_submission_backpressure
         or op_state.op._in_task_output_backpressure

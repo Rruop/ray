@@ -581,7 +581,7 @@ class StreamingExecutor(Executor, threading.Thread):
         # Note: calling process_completed_tasks() is expensive since it incurs
         # ray.wait() overhead, so make sure to allow multiple dispatch per call for
         # greater parallelism.
-        errored_blocks_per_op = process_completed_tasks(
+        errored_blocks_per_op, _ = process_completed_tasks(
             topology,
             self._backpressure_policies,
             self._max_errored_blocks,

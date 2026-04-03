@@ -173,6 +173,25 @@ class TaskPoolMapOperator(MapOperator):
     def get_max_concurrency_limit(self) -> Optional[int]:
         return self._max_concurrency
 
+    def get_task_distribution(self) -> Tuple[int, int]:
+        """Returns the estimated distribution of tasks between running and queued.
+
+        For TaskPoolMapOperator, tasks are submitted directly to Ray Core
+        as independent tasks. We cannot directly estimate how many are
+        truly running vs queued in Ray's scheduler without querying Ray Core.
+
+        Returns:
+            A tuple of (estimated_running, estimated_queued) task counts.
+            For TaskPool, we assume all active tasks are "running" since
+            they are managed by Ray Core's scheduler, not queued locally.
+        """
+        # For TaskPool, tasks are submitted directly to Ray Core.
+        # We don't have visibility into Ray Core's internal scheduling state
+        # without making expensive API calls. We report all tasks as "running"
+        # since they've been submitted to Ray Core for execution.
+        active_tasks = self.num_active_tasks()
+        return (active_tasks, 0)
+
     def min_max_resource_requirements(
         self,
     ) -> Tuple[ExecutionResources, ExecutionResources]:
