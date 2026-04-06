@@ -1,0 +1,79 @@
+# .graphifyignore - Graphify knowledge graph exclusions for Ray project
+
+# === Build artifacts / output ===
+bazel-*
+python/build/
+python/dist/
+python/ray/core/
+python/ray/dashboard/client/build/
+build/
+
+# === Third-party / vendor / dependencies ===
+python/ray/dashboard/client/node_modules/
+thirdparty/
+python/ray/thirdparty_files/
+python/ray/jars/
+python/ray/cpp/
+python/deplocks/
+
+# === Generated code ===
+*_pb2.py
+*_pb2_grpc.py
+*.pb.h
+*.pb.cc
+*_generated.h
+
+# === CI / infrastructure ===
+.buildkite/
+ci/
+docker/
+.github/
+
+# === IDE / editor / tool configs ===
+.idea/
+.vscode/
+.claude/
+.codeflicker/
+.gemini/
+.playwright-mcp/
+.vale/
+
+# === Cache directories ===
+**/__pycache__/
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+
+# === Binary / media files ===
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.ico
+*.so
+*.dylib
+*.o
+*.a
+*.whl
+*.jar
+*.zip
+*.tar.gz
+*.tgz
+
+# === Documentation build output ===
+doc/_build/
+
+# === Bazel build system ===
+bazel/
+WORKSPACE
+
+# === Lock files ===
+python/ray/dashboard/client/package-lock.json
+
+# === Release tests (infrastructure, not core logic) ===
+release/
+
+# === Misc ===
+*.pyc
+.eggs/
+*.egg-info/
