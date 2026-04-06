@@ -16,9 +16,6 @@
 .jar
 /dashboard/client/build
 /.whl
-/bin
-/lib
-/pyvenv*
 
 # KubeRay config lives in a separate repository
 python/ray/autoscaler/kuberay/config
@@ -165,9 +162,6 @@ hf-internal-testing/
 # Vscode
 .vscode/
 
-# Local clangd config (persists across branches, not committed)
-.clangd
-
 *.iml
 
 # Java
@@ -251,11 +245,21 @@ tag-mapping.json
 # Custom BYOD build rayci yaml file
 .buildkite/release/custom_byod_build.rayci.yml
 
+.claude/
+.gitnexus/kuzu
+graphify-out/cache/
+graphify-out/.graphify_ast.json
+graphify-out/.graphify_extract.json
+graphify-out/.rebuild.lock
+graphify-out/GRAPH_TREE.html
+graphify-out/kray-callflow.html
 # Claude files
 /.claude/
+.gitnexus
 
-# CodeFlicker
-/.codeflicker/
+.playwright-mcp/
 
-# Worktrees
-.worktrees/
+.codeflicker/
+# Graphify - keep locally, don't commit large files
+graphify-out/
+.graphifyignore
