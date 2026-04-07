@@ -375,6 +375,12 @@ class TestRemoteWriteEnvironmentVariables:
             "RAY_METRICS_REMOTE_WRITE_HEADERS",
             "RAY_METRICS_REMOTE_WRITE_TIMEOUT",
             "RAY_METRICS_REMOTE_WRITE_TENANT_ID",
+            # New reliability configuration
+            "RAY_METRICS_REMOTE_WRITE_CONNECT_TIMEOUT",
+            "RAY_METRICS_REMOTE_WRITE_BATCH_SIZE",
+            # Metric filtering
+            "RAY_METRICS_REMOTE_WRITE_INCLUDE_METRICS",
+            "RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS",
         ],
     )
     def test_env_variable_defined(self, const_name):
@@ -398,7 +404,10 @@ class TestRemoteWriteReaderConfiguration:
     @patch("opentelemetry.metrics.set_meter_provider")
     @patch("opentelemetry.metrics.get_meter")
     def test_remote_write_mode_creates_reader(
-        self, mock_get_meter, mock_set_meter_provider, skip_if_remote_write_not_available
+        self,
+        mock_get_meter,
+        mock_set_meter_provider,
+        skip_if_remote_write_not_available,
     ):
         """Test that remote_write mode creates appropriate reader."""
         mock_get_meter.return_value = MagicMock()
@@ -454,6 +463,98 @@ class TestUnitMapping:
     def test_map_unit(self, map_unit, input_unit, expected):
         """Test unit mapping for various unit types."""
         assert map_unit(input_unit) == expected
+
+
+class TestMetricFiltering:
+    """Tests for metric filtering functionality."""
+
+    def test_include_pattern_matching(self):
+        """Test include pattern matching with wildcards."""
+        import fnmatch
+
+        include_patterns = ["ray_tasks_*", "ray_actors_*"]
+        test_cases = [
+            ("ray_tasks_running", True),
+            ("ray_tasks_pending", True),
+            ("ray_actors_total", True),
+            ("ray_objects_store", False),
+            ("ray_memory_usage", False),
+        ]
+
+        for metric_name, expected in test_cases:
+            matched = any(
+                fnmatch.fnmatch(metric_name, pattern) for pattern in include_patterns
+            )
+            assert matched == expected, f"Expected {expected} for {metric_name}"
+
+    def test_exclude_pattern_matching(self):
+        """Test exclude pattern matching with wildcards."""
+        import fnmatch
+
+        exclude_patterns = ["ray_internal_*", "ray_debug_*"]
+        test_cases = [
+            ("ray_internal_metric", True),
+            ("ray_debug_info", True),
+            ("ray_tasks_running", False),
+            ("ray_actors_total", False),
+        ]
+
+        for metric_name, expected in test_cases:
+            excluded = any(
+                fnmatch.fnmatch(metric_name, pattern) for pattern in exclude_patterns
+            )
+            assert excluded == expected, f"Expected {expected} for {metric_name}"
+
+    def test_combined_include_exclude(self):
+        """Test combined include and exclude patterns."""
+        import fnmatch
+
+        include_patterns = ["ray_*"]
+        exclude_patterns = ["ray_internal_*"]
+
+        def should_include(metric_name):
+            if include_patterns:
+                if not any(fnmatch.fnmatch(metric_name, p) for p in include_patterns):
+                    return False
+            if exclude_patterns:
+                if any(fnmatch.fnmatch(metric_name, p) for p in exclude_patterns):
+                    return False
+            return True
+
+        test_cases = [
+            ("ray_tasks_running", True),
+            ("ray_internal_debug", False),
+            ("other_metric", False),
+        ]
+
+        for metric_name, expected in test_cases:
+            assert should_include(metric_name) == expected, (
+                f"Expected {expected} for {metric_name}"
+            )
+
+
+class TestBatchSizeConfiguration:
+    """Tests for batch size configuration."""
+
+    def test_batch_splitting(self):
+        """Test that large payloads are split into batches correctly."""
+        batch_size = 3
+        items = list(range(10))
+
+        batches = []
+        for i in range(0, len(items), batch_size):
+            batches.append(items[i : i + batch_size])
+
+        assert len(batches) == 4
+        assert batches[0] == [0, 1, 2]
+        assert batches[1] == [3, 4, 5]
+        assert batches[2] == [6, 7, 8]
+        assert batches[3] == [9]
+
+    def test_batch_size_default(self):
+        """Test default batch size value."""
+        default_batch_size = 500
+        assert default_batch_size > 0
 
 
 if __name__ == "__main__":

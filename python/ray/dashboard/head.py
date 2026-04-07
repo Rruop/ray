@@ -131,6 +131,8 @@ class DashboardHead:
         self.gcs_log_subscriber = None
         self.ip = node_ip_address
         self.pid = os.getpid()
+        self.node_id = ""  # TODO: pass node_id from startup args
+        self.ray_io_cluster = os.environ.get("RAY_CLUSTER_NAME", "")
         self.dashboard_proc = psutil.Process()
         self.proxy_server_url = proxy_server_url
 
@@ -345,10 +347,12 @@ class DashboardHead:
     ):
         labels = {
             "ip": self.ip,
+            "NodeId": self.node_id,
             "pid": self.pid,
             "Version": ray.__version__,
             "Component": "dashboard",
             "SessionName": self.session_name,
+            "ray_io_cluster": self.ray_io_cluster,
         }
         assert "dashboard" in AVAILABLE_COMPONENT_NAMES_FOR_METRICS
         self._record_cpu_mem_metrics_for_proc(self.dashboard_proc)
@@ -377,10 +381,12 @@ class DashboardHead:
     ):
         labels = {
             "ip": self.ip,
+            "NodeId": self.node_id,
             "pid": proc.pid,
             "Version": ray.__version__,
             "Component": "dashboard" if not module_name else "dashboard_" + module_name,
             "SessionName": self.session_name,
+            "ray_io_cluster": self.ray_io_cluster,
         }
         proc_attrs = proc.as_dict(attrs=["cpu_percent", "memory_full_info"])
         self.metrics.metrics_dashboard_cpu.labels(**labels).set(

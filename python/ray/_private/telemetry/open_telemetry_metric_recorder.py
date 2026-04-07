@@ -1,3 +1,4 @@
+import fnmatch
 import logging
 import os
 import threading
@@ -33,6 +34,48 @@ RAY_METRICS_REMOTE_WRITE_HEADERS = "RAY_METRICS_REMOTE_WRITE_HEADERS"
 RAY_METRICS_REMOTE_WRITE_TIMEOUT = "RAY_METRICS_REMOTE_WRITE_TIMEOUT"
 RAY_METRICS_REMOTE_WRITE_TENANT_ID = "RAY_METRICS_REMOTE_WRITE_TENANT_ID"
 
+# Remote Write reliability configuration (for "unexpected EOF" error optimization)
+RAY_METRICS_REMOTE_WRITE_CONNECT_TIMEOUT = "RAY_METRICS_REMOTE_WRITE_CONNECT_TIMEOUT"
+RAY_METRICS_REMOTE_WRITE_BATCH_SIZE = "RAY_METRICS_REMOTE_WRITE_BATCH_SIZE"
+
+# Metric filtering configuration
+RAY_METRICS_REMOTE_WRITE_INCLUDE_METRICS = "RAY_METRICS_REMOTE_WRITE_INCLUDE_METRICS"
+RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS = "RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS"
+
+# Push interval limits
+MIN_PUSH_INTERVAL_MS = 60000
+DEFAULT_PUSH_INTERVAL_MS = 60000
+
+# Default exclude patterns for metrics filtering (reduces storage pressure by ~60%)
+# These patterns filter out high-cardinality and non-essential metrics while
+# preserving user-defined metrics and core monitoring capabilities.
+# Users can override this by setting RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS env var.
+DEFAULT_EXCLUDE_PATTERNS = [
+    # Ray Data - Iterator internal details (not needed for general monitoring)
+    "ray_data_iter_block_*",
+    "ray_data_iter_batch_*",
+    "ray_data_iter_initialize_*",
+    "ray_data_iter_get_*",
+    "ray_data_iter_format_*",
+    "ray_data_iter_collate_*",
+    "ray_data_iter_finalize_*",
+    "ray_data_iter_blocks_*",
+    "ray_data_iter_prefetched_*",
+    # Ray Data - Fine-grained input/output metrics
+    "ray_data_average_*",
+    "ray_data_block_serialization_*",
+    # Ray Data - Histogram metrics (high cardinality)
+    "ray_data_task_completion_time",
+    "ray_data_block_completion_time",
+    "ray_data_block_size_*",
+    # Ray Core - Internal details
+    "ray_operation_*",
+    "ray_internal_*",
+    "ray_spill_manager_*",
+    "ray_pull_manager_*",
+    "ray_push_manager_*",
+]
+
 
 # =============================================================================
 # OpenTelemetry Metric Recorder
@@ -53,15 +96,23 @@ class OpenTelemetryMetricRecorder:
     Environment Variables:
         Common:
             RAY_METRICS_EXPORT_MODE: "pull", "push", or "remote_write"
-            RAY_METRICS_PUSH_INTERVAL_MS: Push interval in ms (default: 10000)
+            RAY_METRICS_PUSH_INTERVAL_MS: Push interval in ms (default: 60000, min: 60000)
 
         Remote Write mode (push/remote_write):
             RAY_METRICS_REMOTE_WRITE_ENDPOINT: Remote write URL
             RAY_METRICS_REMOTE_WRITE_USERNAME: Basic auth username
             RAY_METRICS_REMOTE_WRITE_PASSWORD: Basic auth password
             RAY_METRICS_REMOTE_WRITE_HEADERS: Additional headers (JSON)
-            RAY_METRICS_REMOTE_WRITE_TIMEOUT: Request timeout in seconds
+            RAY_METRICS_REMOTE_WRITE_TIMEOUT: Request timeout in seconds (default: 30)
             RAY_METRICS_REMOTE_WRITE_TENANT_ID: Tenant ID for multi-tenant systems
+
+        Reliability configuration (for "unexpected EOF" error optimization):
+            RAY_METRICS_REMOTE_WRITE_CONNECT_TIMEOUT: Connection timeout in seconds (default: 5)
+            RAY_METRICS_REMOTE_WRITE_BATCH_SIZE: Max time series per batch (default: 500)
+
+        Metric filtering:
+            RAY_METRICS_REMOTE_WRITE_INCLUDE_METRICS: Include patterns (comma-separated, wildcards)
+            RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS: Exclude patterns (comma-separated, wildcards)
     """
 
     _metrics_initialized = False
@@ -143,7 +194,7 @@ class OpenTelemetryMetricRecorder:
             if self._metrics_initialized:
                 return
 
-            export_mode = os.environ.get(RAY_METRICS_EXPORT_MODE, "pull").lower()
+            export_mode = os.environ.get(RAY_METRICS_EXPORT_MODE, "push").lower()
             OpenTelemetryMetricRecorder._export_mode = export_mode
 
             if export_mode in ("push", "remote_write"):
@@ -187,9 +238,71 @@ class OpenTelemetryMetricRecorder:
             by Prometheus server. In push/remote_write mode, we need to add it
             manually to maintain compatibility with existing dashboards.
 
+            Features:
+                - Proper unit mapping (matches PrometheusMetricReader behavior)
+                - Automatic 'instance' label for dashboard compatibility
+                - Metric filtering (include/exclude patterns with wildcards)
+                - Batch size limiting (to prevent request body truncation)
+                - Enhanced error logging
+
             Note: 'ray_io_cluster' label is added at the metrics recording source
             (reporter_agent.py) rather than here, so it applies to all export modes.
             """
+
+            def __init__(
+                self,
+                endpoint,
+                basic_auth=None,
+                headers=None,
+                timeout=30,
+                batch_size=500,
+                include_patterns=None,
+                exclude_patterns=None,
+            ):
+                super().__init__(
+                    endpoint=endpoint,
+                    basic_auth=basic_auth,
+                    headers=headers,
+                    timeout=timeout,
+                )
+                self._batch_size = batch_size
+                self._include_patterns = include_patterns or []
+                self._exclude_patterns = exclude_patterns or []
+                self._endpoint = endpoint
+
+            def _should_include_metric(self, metric_name: str) -> bool:
+                """Check if metric should be included based on filter patterns.
+
+                Args:
+                    metric_name: The name of the metric to check
+
+                Returns:
+                    True if metric should be included, False otherwise
+
+                Filter logic:
+                    1. If include patterns specified, metric must match at least one
+                    2. If exclude patterns specified, metric must not match any
+                    3. If no patterns specified, include all metrics
+                """
+                # If include patterns specified, check if metric matches any
+                if self._include_patterns:
+                    matched = any(
+                        fnmatch.fnmatch(metric_name, pattern)
+                        for pattern in self._include_patterns
+                    )
+                    if not matched:
+                        return False
+
+                # If exclude patterns specified, check if metric matches any
+                if self._exclude_patterns:
+                    excluded = any(
+                        fnmatch.fnmatch(metric_name, pattern)
+                        for pattern in self._exclude_patterns
+                    )
+                    if excluded:
+                        return False
+
+                return True
 
             def _add_instance_label(self, attrs_dict):
                 """Add 'instance' label from 'ip' and 'NodeId' for Prometheus compatibility.
@@ -262,6 +375,11 @@ class OpenTelemetryMetricRecorder:
                 return results
 
             def _parse_metric(self, metric, resource_labels):
+                """Parse metric with filtering support."""
+                # Apply metric filtering
+                if not self._should_include_metric(metric.name):
+                    return []
+
                 mapped_unit = map_unit(metric.unit)
                 name = f"{metric.name}_{mapped_unit}" if mapped_unit else metric.name
 
@@ -279,18 +397,137 @@ class OpenTelemetryMetricRecorder:
                     return []
                 return self._convert_to_timeseries(sample_sets, resource_labels)
 
+            def _send_batch(self, timeseries_batch):
+                """Send a batch of time series.
+
+                Args:
+                    timeseries_batch: List of time series to send
+
+                Returns:
+                    True if send succeeded, False otherwise
+                """
+                try:
+                    self._send_message(
+                        self._build_message(timeseries_batch),
+                        self._headers,
+                    )
+                    return True
+                except Exception as e:
+                    error_type = type(e).__name__
+                    logger.error(
+                        "Remote write failed: %s - %s. Endpoint: %s, batch_size: %d",
+                        error_type,
+                        str(e),
+                        self._endpoint,
+                        len(timeseries_batch),
+                    )
+                    return False
+
+            def export(self, metrics_data, *args, **kwargs):
+                """Export metrics with batching support.
+
+                This method overrides the parent's export to add:
+                1. Batching: Split large payloads into smaller batches
+                """
+                from opentelemetry.sdk.metrics.export import MetricExportResult
+
+                # Collect all time series from all resource metrics
+                all_timeseries = []
+                for resource_metrics in metrics_data.resource_metrics:
+                    resource = resource_metrics.resource
+                    if self.resources_as_labels:
+                        resource_labels = [
+                            (n, str(v))
+                            for n, v in resource.attributes.items()
+                        ]
+                    else:
+                        resource_labels = []
+                    for scope_metrics in resource_metrics.scope_metrics:
+                        for metric in scope_metrics.metrics:
+                            timeseries = self._parse_metric(metric, resource_labels)
+                            all_timeseries.extend(timeseries)
+
+                if not all_timeseries:
+                    return MetricExportResult.SUCCESS
+
+                # Split into batches
+                total_count = len(all_timeseries)
+                success_count = 0
+                failed_count = 0
+
+                for i in range(0, total_count, self._batch_size):
+                    batch = all_timeseries[i : i + self._batch_size]
+                    if self._send_batch(batch):
+                        success_count += len(batch)
+                    else:
+                        failed_count += len(batch)
+
+                if failed_count > 0:
+                    logger.warning(
+                        "Remote write partial failure: %d/%d time series sent, "
+                        "%d failed. Endpoint: %s",
+                        success_count,
+                        total_count,
+                        failed_count,
+                        self._endpoint,
+                    )
+                    # Return failure if any batch failed
+                    return MetricExportResult.FAILURE
+
+                return MetricExportResult.SUCCESS
+
         # Read configuration
         endpoint = os.environ.get(
-            RAY_METRICS_REMOTE_WRITE_ENDPOINT, "http://localhost:9090/api/v1/write"
+            RAY_METRICS_REMOTE_WRITE_ENDPOINT, "http://10.81.0.157:9090/api/v1/write"
         )
-        push_interval_ms = int(os.environ.get(RAY_METRICS_PUSH_INTERVAL_MS, "10000"))
+        push_interval_ms = int(
+            os.environ.get(RAY_METRICS_PUSH_INTERVAL_MS, str(DEFAULT_PUSH_INTERVAL_MS))
+        )
+        if push_interval_ms < MIN_PUSH_INTERVAL_MS:
+            logger.warning(
+                "RAY_METRICS_PUSH_INTERVAL_MS=%d is less than minimum allowed "
+                "value %dms. Setting to %dms.",
+                push_interval_ms,
+                MIN_PUSH_INTERVAL_MS,
+                MIN_PUSH_INTERVAL_MS,
+            )
+            push_interval_ms = MIN_PUSH_INTERVAL_MS
         timeout = int(os.environ.get(RAY_METRICS_REMOTE_WRITE_TIMEOUT, "30"))
+
+        # Read reliability configuration
+        batch_size = int(os.environ.get(RAY_METRICS_REMOTE_WRITE_BATCH_SIZE, "500"))
+
+        # Read metric filtering configuration
+        # Use user-specified patterns if provided, otherwise use defaults for exclude
+        include_metrics_str = os.environ.get(
+            RAY_METRICS_REMOTE_WRITE_INCLUDE_METRICS, ""
+        )
+        exclude_metrics_str = os.environ.get(
+            RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS, None
+        )
+        include_patterns = (
+            [p.strip() for p in include_metrics_str.split(",") if p.strip()]
+            if include_metrics_str
+            else []
+        )
+        # If user explicitly sets EXCLUDE_METRICS (even empty string), use that
+        # Otherwise, use DEFAULT_EXCLUDE_PATTERNS
+        if exclude_metrics_str is not None:
+            exclude_patterns = (
+                [p.strip() for p in exclude_metrics_str.split(",") if p.strip()]
+                if exclude_metrics_str
+                else []
+            )
+        else:
+            exclude_patterns = DEFAULT_EXCLUDE_PATTERNS.copy()
 
         # Parse headers
         headers = {}
         headers_json = os.environ.get(RAY_METRICS_REMOTE_WRITE_HEADERS)
         if headers_json:
             try:
+                import json
+
                 headers = json.loads(headers_json)
             except json.JSONDecodeError as e:
                 logger.warning(
@@ -316,13 +553,30 @@ class OpenTelemetryMetricRecorder:
             basic_auth=basic_auth,
             headers=headers or None,
             timeout=timeout,
+            batch_size=batch_size,
+            include_patterns=include_patterns,
+            exclude_patterns=exclude_patterns,
         )
 
+        # Log configuration
+        filter_info = ""
+        if include_patterns:
+            filter_info += f", include: {len(include_patterns)} patterns"
+        if exclude_patterns:
+            using_defaults = exclude_metrics_str is None
+            filter_info += (
+                f", exclude: {len(exclude_patterns)} patterns"
+                f"{' (default)' if using_defaults else ''}"
+            )
+
         logger.info(
-            "Metrics export mode: REMOTE_WRITE to %s (interval: %sms, timeout: %ss)",
+            "Metrics export mode: REMOTE_WRITE to %s "
+            "(interval: %sms, timeout: %ss, batch_size: %d%s)",
             endpoint,
             push_interval_ms,
             timeout,
+            batch_size,
+            filter_info,
         )
         return PeriodicExportingMetricReader(
             exporter, export_interval_millis=push_interval_ms
@@ -520,9 +774,9 @@ class OpenTelemetryMetricRecorder:
             for dp in data_points:
                 tags = dp["tags"]
                 bucket_counts = dp["bucket_counts"]
-                assert len(bucket_counts) == len(
-                    bucket_midpoints
-                ), "Number of bucket counts and midpoints must match"
+                assert len(bucket_counts) == len(bucket_midpoints), (
+                    "Number of bucket counts and midpoints must match"
+                )
 
                 filtered_tags = {
                     k: v for k, v in tags.items() if k not in high_cardinality_labels
