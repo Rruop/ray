@@ -540,7 +540,10 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
         def filter_with_ckpt_chunk(ckpt_chunk: pyarrow.ChunkedArray) -> numpy.ndarray:
             # Convert checkpoint chunk to numpy for fast search.
             # Use internal helper function for consistency and robustness (handles null-typed arrays, etc.)
-            ckpt_ids = transform_pyarrow.to_numpy(ckpt_chunk, zero_copy_only=False)
+            try:
+                ckpt_ids = transform_pyarrow.to_numpy(ckpt_chunk, zero_copy_only=True)
+            except (pa.ArrowInvalid, ValueError):
+                ckpt_ids = transform_pyarrow.to_numpy(ckpt_chunk, zero_copy_only=False)
             # Start with a mask of all True (keep all rows).
             mask = numpy.ones(len(block_ids), dtype=bool)
             # Use binary search to find where block_ids would be in ckpt_ids.
