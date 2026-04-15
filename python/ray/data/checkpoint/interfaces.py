@@ -91,6 +91,7 @@ class CheckpointConfig:
         redis_checkpoint_pipeline_batch_size: Optional[int] = 1000,
         redis_data_storage_as_roaring_bitmap: bool = True,
         use_roaring_bitmap: bool = False,
+        need_deduplication: bool = False,
         write_checkpoint_retry_number: Optional[int] = 10,
     ):
         self.id_column: Optional[str] = id_column
@@ -131,6 +132,8 @@ class CheckpointConfig:
         self.redis_data_storage_as_roaring_bitmap = redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap: bool = use_roaring_bitmap
         self.write_checkpoint_retry_number = write_checkpoint_retry_number
+        self.need_deduplication = need_deduplication
+
 
     def _get_default_checkpoint_path(self) -> str:
         artifact_storage = os.environ.get(self.DEFAULT_CHECKPOINT_PATH_BUCKET_ENV_VAR)

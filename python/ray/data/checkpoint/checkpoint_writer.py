@@ -65,6 +65,7 @@ class CheckpointWriter:
         self.redis_checkpoint_password = self.ckpt_config.redis_checkpoint_password
         self.redis_data_storage_as_roaring_bitmap = self.ckpt_config.redis_data_storage_as_roaring_bitmap
         self.write_checkpoint_retry_number = self.ckpt_config.write_checkpoint_retry_number
+        self.need_deduplication = self.ckpt_config.need_deduplication
 
     @abstractmethod
     def write_block_checkpoint(self, block: BlockAccessor):
@@ -191,11 +192,23 @@ class BatchBasedCheckpointWriter(CheckpointWriter):
         
         def _write():
             if not redis_checkpoint_key:
-                pq.write_table(
-                    checkpoint_ids_table,
-                    ckpt_file_path,
-                    filesystem=self.filesystem,
-                )
+                if self.need_deduplication:
+                    import pyarrow.compute as pc
+                    import pyarrow as pa
+                    col = checkpoint_ids_table.column(0)
+                    unique_col = pc.unique(col)
+                    dedup_table = pa.table([unique_col], names=[self.id_col])
+                    pq.write_table(
+                        dedup_table,
+                        ckpt_file_path,
+                        filesystem=self.filesystem,
+                    )
+                else:
+                    pq.write_table(
+                        checkpoint_ids_table,
+                        ckpt_file_path,
+                        filesystem=self.filesystem,
+                    )
             else:
                 logger.info(f"write checkpoint file: {file_name}")
                 ids = checkpoint_ids_block[self.id_col].to_numpy().tolist()
