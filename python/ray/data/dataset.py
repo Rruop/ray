@@ -4181,6 +4181,8 @@ class Dataset:
         concurrency: Optional[int] = None,
         num_rows_per_file: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
         **arrow_parquet_args,
     ) -> None:
         """Writes the :class:`~ray.data.Dataset` to parquet files under the provided ``path``.
@@ -4312,6 +4314,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -4330,6 +4334,8 @@ class Dataset:
         concurrency: Optional[int] = None,
         num_rows_per_file: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
         **pandas_json_args,
     ) -> None:
         """Writes the :class:`~ray.data.Dataset` to JSON and JSONL files.
@@ -4438,6 +4444,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -4572,6 +4580,8 @@ class Dataset:
         ray_remote_args: Dict[str, Any] = None,
         concurrency: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Writes the :class:`~ray.data.Dataset` to images.
 
@@ -4633,6 +4643,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -4651,6 +4663,8 @@ class Dataset:
         concurrency: Optional[int] = None,
         num_rows_per_file: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
         **arrow_csv_args,
     ) -> None:
         """Writes the :class:`~ray.data.Dataset` to CSV files.
@@ -4757,6 +4771,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -4775,6 +4791,8 @@ class Dataset:
         concurrency: Optional[int] = None,
         num_rows_per_file: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Write the :class:`~ray.data.Dataset` to TFRecord files.
 
@@ -4868,6 +4886,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -4886,6 +4906,8 @@ class Dataset:
         concurrency: Optional[int] = None,
         num_rows_per_file: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Writes the dataset to `WebDataset <https://github.com/webdataset/webdataset>`_ files.
 
@@ -4972,6 +4994,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -4990,6 +5014,8 @@ class Dataset:
         concurrency: Optional[int] = None,
         num_rows_per_file: Optional[int] = None,
         mode: SaveMode = SaveMode.APPEND,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Writes a column of the :class:`~ray.data.Dataset` to .npy files.
 
@@ -5073,6 +5099,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -5211,6 +5239,8 @@ class Dataset:
         collection: str,
         ray_remote_args: Dict[str, Any] = None,
         concurrency: Optional[int] = None,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Writes the :class:`~ray.data.Dataset` to a MongoDB database.
 
@@ -5275,6 +5305,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI
@@ -5696,6 +5728,8 @@ class Dataset:
         kafka_auth_config: Optional[Any] = None,
         ray_remote_args: Dict[str, Any] = None,
         concurrency: Optional[int] = None,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Write the dataset to a Kafka topic.
 
@@ -5732,6 +5766,18 @@ class Dataset:
                 to control number of tasks to run concurrently. This doesn't change the
                 total number of tasks run. By default, concurrency is dynamically
                 decided based on the available resources.
+            filter_fn: Optional function to filter rows before writing to Kafka.
+                Takes a row dict and returns True to keep the row, False to skip it.
+                When used with checkpointing, filtered data is still recorded in
+                checkpoint (preventing reprocessing on restart) but not written to Kafka.
+                Use filter_expr for better performance when possible.
+                Example: filter_fn=lambda row: row["score"] > 0.5
+            filter_expr: Optional Arrow expression for filtering rows before writing.
+                Uses vectorized PyArrow operations for better performance than filter_fn.
+                When used with checkpointing, filtered data is still recorded in
+                checkpoint (preventing reprocessing on restart) but not written to Kafka.
+                Example: filter_expr=col("score") > 0.5
+                Note: Only one of filter_fn or filter_expr can be specified.
         """
         sink = KafkaDatasink(
             topic=topic,
@@ -5747,6 +5793,8 @@ class Dataset:
             sink,
             ray_remote_args=ray_remote_args,
             concurrency=concurrency,
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
 
     @ConsumptionAPI(pattern="Time complexity:")
@@ -5756,6 +5804,8 @@ class Dataset:
         *,
         ray_remote_args: Dict[str, Any] = None,
         concurrency: Optional[int] = None,
+        filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        filter_expr: Optional["Expr"] = None,
     ) -> None:
         """Writes the dataset to a custom :class:`~ray.data.Datasink`.
 
@@ -5768,6 +5818,19 @@ class Dataset:
                 to control number of tasks to run concurrently. This doesn't change the
                 total number of tasks run. By default, concurrency is dynamically
                 decided based on the available resources.
+            filter_fn: Optional function to filter rows before writing. Takes a row
+                dict and returns True to keep the row, False to skip it. When used
+                with checkpointing, filtered data is still recorded in checkpoint
+                (preventing reprocessing on restart) but not written to the datasink.
+                Use filter_expr for better performance when possible.
+                Example: filter_fn=lambda row: row["score"] > 0.5
+            filter_expr: Optional Arrow expression for filtering rows before writing.
+                Uses vectorized PyArrow operations for better performance than filter_fn.
+                When used with checkpointing, filtered data is still recorded in
+                checkpoint (preventing reprocessing on restart) but not written to
+                the datasink.
+                Example: filter_expr=col("score") > 0.5
+                Note: Only one of filter_fn or filter_expr can be specified.
         """  # noqa: E501
         if ray_remote_args is None:
             ray_remote_args = {}
@@ -5794,6 +5857,8 @@ class Dataset:
             datasink,
             ray_remote_args=ray_remote_args,
             compute=TaskPoolStrategy(concurrency),
+            filter_fn=filter_fn,
+            filter_expr=filter_expr,
         )
         logical_plan = LogicalPlan(write_op, self.context)
 

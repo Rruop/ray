@@ -1,6 +1,6 @@
 import itertools
 import uuid
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional, Union
 
 from ray.data._internal.execution.interfaces import PhysicalOperator
 from ray.data._internal.execution.interfaces.task_context import TaskContext
@@ -16,29 +16,69 @@ from ray.data.datasource.datasource import Datasource
 
 if TYPE_CHECKING:
     from ray.data._internal.logical.operators import Write
+    from ray.data.expressions import Expr
 
 WRITE_UUID_KWARG_NAME = "write_uuid"
 # Key for storing pending checkpoint paths for commit phase
 PENDING_CHECKPOINTS_KWARG_NAME = "_pending_checkpoints"
 
 
+def _filter_blocks_with_expr(
+    blocks: Iterator[Block],
+    filter_expr: "Expr",
+) -> Iterator[Block]:
+    """Filter blocks using Arrow expression (vectorized)."""
+    for block in blocks:
+        yield BlockAccessor.for_block(block).filter(filter_expr)
+
+
+def _filter_blocks_with_fn(
+    blocks: Iterator[Block],
+    filter_fn: Callable[[Dict[str, Any]], bool],
+) -> Iterator[Block]:
+    """Filter blocks using a Python function applied row-by-row."""
+    import pyarrow as pa
+
+    for block in blocks:
+        df = BlockAccessor.for_block(block).to_pandas()
+        mask = df.apply(lambda row: filter_fn(row.to_dict()), axis=1)
+        yield pa.Table.from_pandas(df[mask], preserve_index=False)
+
+
 def generate_write_fn(
-    datasink_or_legacy_datasource: Union[Datasink, Datasource], **write_args
+    datasink_or_legacy_datasource: Union[Datasink, Datasource],
+    filter_fn: Optional[Callable[[Dict[str, Any]], bool]] = None,
+    filter_expr: Optional["Expr"] = None,
+    **write_args,
 ) -> Callable[[Iterator[Block], TaskContext], Iterator[Block]]:
     def fn(blocks: Iterator[Block], ctx: TaskContext) -> Iterator[Block]:
-        """Writes the blocks to the given datasink or legacy datasource.
+        """Write blocks to the datasink, optionally filtering before write.
 
-        Outputs the original blocks to be written."""
-        # Create a copy of the iterator, so we can return the original blocks.
-        it1, it2 = itertools.tee(blocks, 2)
+        When a filter is provided, filters blocks before writing but returns the
+        original unfiltered blocks for downstream processing (e.g., checkpoint).
+        """
+        has_filter = filter_expr is not None or filter_fn is not None
+
+        # Only tee the iterator when filtering is needed
+        if has_filter:
+            blocks_to_write, blocks_to_return = itertools.tee(blocks, 2)
+            if filter_expr is not None:
+                blocks_to_write = _filter_blocks_with_expr(blocks_to_write, filter_expr)
+            else:
+                blocks_to_write = _filter_blocks_with_fn(blocks_to_write, filter_fn)
+        else:
+            # No filtering: both variables reference the same iterator
+            blocks_to_write = blocks
+            blocks_to_return = blocks
+
         if isinstance(datasink_or_legacy_datasource, Datasink):
             ctx.kwargs["_datasink_write_return"] = datasink_or_legacy_datasource.write(
-                it1, ctx
+                blocks_to_write, ctx
             )
         else:
-            datasink_or_legacy_datasource.write(it1, ctx, **write_args)
+            datasink_or_legacy_datasource.write(blocks_to_write, ctx, **write_args)
 
-        return it2
+        return blocks_to_return
 
     return fn
 
@@ -119,7 +159,12 @@ def _plan_write_op_internal(
     input_physical_dag = physical_children[0]
 
     datasink = op.datasink_or_legacy_datasource
-    write_fn = generate_write_fn(datasink, **op.write_args)
+    write_fn = generate_write_fn(
+        datasink,
+        filter_fn=op.filter_fn,
+        filter_expr=op.filter_expr,
+        **op.write_args,
+    )
 
     # Build transform chain: pre_write -> write -> post_write
     pre_transforms = pre_transformations or []
