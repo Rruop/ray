@@ -15,6 +15,7 @@ from .default_autoscaling_coordinator import (
 )
 from .default_cluster_autoscaler import DefaultClusterAutoscaler
 from .default_cluster_autoscaler_v2 import DefaultClusterAutoscalerV2
+from .noop_cluster_autoscaler import NoOpClusterAutoscaler
 
 if TYPE_CHECKING:
     from ray.data._internal.execution.resource_manager import ResourceManager
@@ -24,12 +25,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 CLUSTER_AUTOSCALER_ENV_KEY = "RAY_DATA_CLUSTER_AUTOSCALER"
-DEFAULT_CLUSTER_AUTOSCALER_VERSION = "V2"
+DEFAULT_CLUSTER_AUTOSCALER_VERSION = "NOOP"
 
 
 class ClusterAutoscalerVersion(str, enum.Enum):
     V2 = "V2"
     V1 = "V1"
+    NOOP = "NOOP"
 
 
 def create_cluster_autoscaler(
@@ -59,6 +61,9 @@ def create_cluster_autoscaler(
             execution_id=execution_id,
         )
 
+    elif cluster_autoscaler_version == ClusterAutoscalerVersion.NOOP:
+        return NoOpClusterAutoscaler()
+
     else:
         valid_values = [version.value for version in ClusterAutoscalerVersion]
         raise ValueError(
@@ -69,6 +74,7 @@ def create_cluster_autoscaler(
 
 __all__ = [
     "ClusterAutoscaler",
+    "NoOpClusterAutoscaler",
     # Objects related to the `AutoscalingCoordinator`.
     "AutoscalingCoordinator",
     "DefaultAutoscalingCoordinator",
