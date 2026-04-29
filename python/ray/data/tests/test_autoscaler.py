@@ -14,7 +14,10 @@ from ray.data._internal.actor_autoscaler import (
     NoOpActorAutoscaler,
     create_actor_autoscaler,
 )
-from ray.data._internal.cluster_autoscaler import DefaultClusterAutoscaler
+from ray.data._internal.cluster_autoscaler import (
+    DefaultClusterAutoscaler,
+    NoOpClusterAutoscaler,
+)
 from ray.data._internal.execution.operators.actor_pool_map_operator import _ActorPool
 from ray.data._internal.execution.operators.base_physical_operator import (
     InternalQueueOperatorMixin,
@@ -928,6 +931,25 @@ def test_noop_actor_autoscaler():
     # Verify topology and resource_manager are stored
     assert autoscaler._topology is topology
     assert autoscaler._resource_manager is resource_manager
+
+
+def test_noop_cluster_autoscaler_reports_current_cluster_resources():
+    """Test that NoOpClusterAutoscaler returns current cluster resources."""
+    autoscaler = NoOpClusterAutoscaler()
+
+    mock_resources = {
+        "CPU": 4,
+        "GPU": 1,
+        "object_store_memory": 1024,
+        "memory": 2048,
+    }
+    with patch("ray.cluster_resources", return_value=mock_resources):
+        result = autoscaler.get_total_resources()
+
+    expected = ExecutionResources(
+        cpu=4, gpu=1, object_store_memory=1024, memory=2048
+    )
+    assert result == expected
 
 
 def test_create_actor_autoscaler_disabled():

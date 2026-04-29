@@ -1,5 +1,7 @@
-from ray.data._internal.cluster_autoscaler import ClusterAutoscaler
-from ray.data._internal.execution.interfaces.execution_options import ExecutionResources
+import ray
+
+from .base_cluster_autoscaler import ClusterAutoscaler
+from ray.data._internal.execution.interfaces import ExecutionResources
 
 
 class NoOpClusterAutoscaler(ClusterAutoscaler):
@@ -18,5 +20,5 @@ class NoOpClusterAutoscaler(ClusterAutoscaler):
         pass
 
     def get_total_resources(self) -> ExecutionResources:
-        """Return infinite resources since we're not managing scaling."""
-        return ExecutionResources.inf()
+        """Return current cluster resources (no scaling, so total equals current)."""
+        return ExecutionResources.from_resource_dict(ray.cluster_resources())
