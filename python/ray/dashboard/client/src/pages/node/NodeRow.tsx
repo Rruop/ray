@@ -59,6 +59,7 @@ export const NodeRow = ({
     networkSpeed = [0, 0],
     raylet,
     logicalResources,
+    podName = "",
   } = node;
 
   const objectStoreTotalMemory =
@@ -95,6 +96,19 @@ export const NodeRow = ({
         </IconButton>
       </TableCell>
       <TableCell align="center">
+        <Tooltip title={raylet.nodeId} arrow>
+          <div>
+            <NodeLink
+              nodeId={raylet.nodeId}
+              to={`nodes/${raylet.nodeId}`}
+            />
+          </div>
+        </Tooltip>
+      </TableCell>
+      <TableCell align="center">
+        <Box minWidth={TEXT_COL_MIN_WIDTH}>{podName}</Box>
+      </TableCell>
+      <TableCell align="center">
         <Box minWidth={TEXT_COL_MIN_WIDTH}>{hostname}</Box>
       </TableCell>
       <TableCell>
@@ -110,23 +124,6 @@ export const NodeRow = ({
         ) : (
           "-"
         )}
-      </TableCell>
-      <TableCell align="center">
-        <Tooltip title={raylet.nodeId} arrow>
-          <div>
-            <NodeLink
-              nodeId={raylet.nodeId}
-              to={`nodes/${raylet.nodeId}`}
-              sx={{
-                display: "block",
-                width: "50px",
-                overflow: "hidden",
-                textOverflow: "ellipsis",
-                whiteSpace: "nowrap",
-              }}
-            />
-          </div>
-        </Tooltip>
       </TableCell>
       <TableCell align="center">
         <Box minWidth={TEXT_COL_MIN_WIDTH}>
@@ -248,11 +245,6 @@ export const WorkerRow = ({ node, worker }: WorkerRowProps) => {
       <TableCell>
         {/* Empty because workers do not have an expand / unexpand button. */}
       </TableCell>
-      <TableCell align="center">{cmdline[0]}</TableCell>
-      <TableCell>
-        <StatusChip type="worker" status="ALIVE" />
-      </TableCell>
-      <TableCell align="center">N/A</TableCell>
       <TableCell align="center">
         {coreWorker && (
           <Tooltip title={coreWorker.workerId} arrow>
@@ -271,6 +263,12 @@ export const WorkerRow = ({ node, worker }: WorkerRowProps) => {
           </Tooltip>
         )}
       </TableCell>
+      <TableCell align="center">{/* Pod - N/A for workers */}</TableCell>
+      <TableCell align="center">{cmdline[0]}</TableCell>
+      <TableCell>
+        <StatusChip type="worker" status="ALIVE" />
+      </TableCell>
+      <TableCell align="center">N/A</TableCell>
       <TableCell align="center">{pid}</TableCell>
       <TableCell>
         <Link component={RouterLink} to={workerLogUrl} target="_blank">

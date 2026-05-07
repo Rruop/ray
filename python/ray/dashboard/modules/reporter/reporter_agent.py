@@ -450,6 +450,7 @@ class ReporterAgent(
         self._log_dir = dashboard_agent.log_dir
         self._is_head_node = dashboard_agent.is_head
         self._hostname = socket.gethostname()
+        self._pod_name = os.environ.get("RAY_CLOUD_INSTANCE_ID") or ""
         # (pid, created_time) -> psutil.Process
         self._workers = {}
         # psutil.Process of the parent.
@@ -1138,6 +1139,7 @@ class ReporterAgent(
         stats = {
             "now": now,
             "hostname": self._hostname,
+            "pod_name": self._pod_name,
             "ip": self._ip,
             "cpu": self._get_cpu_percent(IN_KUBERNETES_POD),
             "cpus": self._cpu_counts,
@@ -1946,7 +1948,7 @@ class ReporterAgent(
             stats_dict = dashboard_utils.to_google_style(recursive_asdict(stats))
 
             parsed_stats = StatsPayload.parse_obj(stats_dict)
-            out = json.dumps(parsed_stats.dict())
+            out = json.dumps(parsed_stats.dict(by_alias=True))
             return out
         else:
             # NOTE: This converts keys to "Google style", (e.g: "processes_pids" -> "processesPids")

@@ -2,6 +2,7 @@ import useSWR from "swr";
 import {
   getStateApiDownloadLogUrl,
   getStateApiLog,
+  LogError,
   StateApiLogInput,
 } from "../../service/log";
 
@@ -23,7 +24,7 @@ export const useStateApiLogs = (
   );
 
   return {
-    log: isLoading ? "Loading..." : log,
+    log: isLoading ? "Loading..." : (log as string | LogError | undefined),
     downloadUrl,
     refresh: mutate,
     path,

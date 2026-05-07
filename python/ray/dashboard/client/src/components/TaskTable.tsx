@@ -7,6 +7,7 @@ import {
   TableCell,
   TableHead,
   TableRow,
+  TableSortLabel,
   TextField,
   TextFieldProps,
   Tooltip,
@@ -39,6 +40,8 @@ export type TaskTableProps = {
   actorId?: string;
 };
 
+type SortDirection = "asc" | "desc";
+
 const TaskTable = ({
   tasks = [],
   jobId,
@@ -56,7 +59,27 @@ const TaskTable = ({
   });
   const [taskIdFilterValue, setTaskIdFilterValue] = useState(filterToTaskId);
   const [pageSize, setPageSize] = useState(10);
-  const taskList = tasks.filter(filterFunc);
+  const [sortField, setSortField] = useState<"start_time_ms" | "end_time_ms" | null>(null);
+  const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
+
+  const handleSortClick = (field: "start_time_ms" | "end_time_ms") => {
+    if (sortField === field) {
+      setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
+    } else {
+      setSortField(field);
+      setSortDirection("asc");
+    }
+  };
+
+  let taskList = tasks.filter(filterFunc);
+  if (sortField === "start_time_ms" || sortField === "end_time_ms") {
+    taskList = [...taskList].sort((a, b) => {
+      const aVal = a[sortField] ?? 0;
+      const bVal = b[sortField] ?? 0;
+      return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
+    });
+  }
+
   const {
     items: list,
     constrainedPage,
@@ -86,6 +109,8 @@ const TaskTable = ({
         </Typography>
       ),
     },
+    { label: "Start Time", sortKey: "start_time_ms" as const },
+    { label: "End Time", sortKey: "end_time_ms" as const },
     { label: "Duration" },
     { label: "Function or class name" },
     { label: "Node ID" },
@@ -198,14 +223,24 @@ const TaskTable = ({
         <Table>
           <TableHead>
             <TableRow>
-              {columns.map(({ label, helpInfo }) => (
+              {columns.map(({ label, helpInfo, sortKey }: any) => (
                 <TableCell align="center" key={label}>
                   <Box
                     display="flex"
                     justifyContent="center"
                     alignItems="center"
                   >
-                    {label}
+                    {sortKey ? (
+                      <TableSortLabel
+                        active={sortField === sortKey}
+                        direction={sortField === sortKey ? sortDirection : "asc"}
+                        onClick={() => handleSortClick(sortKey)}
+                      >
+                        {label}
+                      </TableSortLabel>
+                    ) : (
+                      label
+                    )}
                     {helpInfo && (
                       <HelpInfo sx={{ marginLeft: 1 }}>{helpInfo}</HelpInfo>
                     )}
@@ -252,6 +287,16 @@ const TaskTable = ({
                   </TableCell>
                   <TableCell align="center">
                     <TaskTableActions task={task} />
+                  </TableCell>
+                  <TableCell align="center">
+                    {start_time_ms && start_time_ms > 0
+                      ? new Date(start_time_ms).toLocaleString()
+                      : "-"}
+                  </TableCell>
+                  <TableCell align="center">
+                    {end_time_ms && end_time_ms > 0
+                      ? new Date(end_time_ms).toLocaleString()
+                      : "-"}
                   </TableCell>
                   <TableCell align="center">
                     {start_time_ms && start_time_ms > 0 ? (

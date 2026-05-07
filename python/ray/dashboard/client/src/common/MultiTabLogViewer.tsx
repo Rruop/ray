@@ -1,10 +1,11 @@
-import { Box, IconButton, Tab, Tabs, Typography } from "@mui/material";
+import { Box, IconButton, Link, Tab, Tabs, Typography } from "@mui/material";
 import React, { useEffect, useState } from "react";
 import { RiExternalLinkLine, RiSortAsc, RiSortDesc } from "react-icons/ri";
-import { Link } from "react-router-dom";
+import { Link as RouterLink } from "react-router-dom";
 import { useLocalStorage } from "usehooks-ts";
 import { useStateApiLogs } from "../pages/log/hooks";
 import { LogViewer } from "../pages/log/LogViewer";
+import { LogError } from "../service/log";
 import { HideableBlock } from "./CollapsibleSection";
 import { ClassNameProps } from "./props";
 
@@ -98,7 +99,7 @@ export const MultiTabLogViewer = ({
                     // Prevent the tab from changing by setting value to the current value
                     setValue(value);
                   }}
-                  component={Link}
+                  component={RouterLink}
                   to={otherLogsLink}
                   target="_blank"
                   rel="noopener noreferrer"
@@ -220,7 +221,14 @@ const ActorLogViewer = ({
     { actorId, suffix },
     `actor-log-${actorId}.${suffix}`,
   );
-  return <ApiLogViewer apiData={apiData} height={height} />;
+  return (
+    <ApiLogViewer
+      apiData={apiData}
+      height={height}
+      fallbackNodeId={null}
+      actorId={actorId}
+    />
+  );
 };
 
 const TaskLogViewer = ({
@@ -240,19 +248,53 @@ const TaskLogViewer = ({
 const ApiLogViewer = ({
   apiData: { downloadUrl, log, path, refresh },
   height = 300,
+  fallbackNodeId,
+  actorId,
 }: {
   apiData: ReturnType<typeof useStateApiLogs>;
   height: number;
+  fallbackNodeId?: string | null;
+  actorId?: string | null;
 }) => {
-  return typeof log === "string" ? (
-    <LogViewer
-      log={log}
-      path={path}
-      downloadUrl={downloadUrl !== null ? downloadUrl : undefined}
-      height={height}
-      onRefreshClick={refresh}
-    />
-  ) : (
-    <Typography color="error">Failed to load</Typography>
+  if (typeof log === "string") {
+    return (
+      <LogViewer
+        log={log}
+        path={path}
+        downloadUrl={downloadUrl !== null ? downloadUrl : undefined}
+        height={height}
+        onRefreshClick={refresh}
+      />
+    );
+  }
+  // Log failed to load - determine reason from error code
+  const logError = log as LogError | undefined;
+  const isCleanedUp = logError?.code === "LOG_CLEANED_UP";
+  const logsPageUrl = fallbackNodeId
+    ? `/logs/?nodeId=${encodeURIComponent(fallbackNodeId)}`
+    : actorId
+    ? `/logs/?actorId=${encodeURIComponent(actorId)}`
+    : `/logs/`;
+  return (
+    <Box sx={{ padding: 2 }}>
+      <Typography color="error" gutterBottom>
+        {isCleanedUp
+          ? "Log file has been cleaned up and is no longer available."
+          : "Failed to load log. The actor may have died or the node is unreachable."}
+      </Typography>
+      <Typography variant="body2">
+        You can browse logs manually on the{" "}
+        <Link component={RouterLink} to={logsPageUrl}>
+          Logs page
+        </Link>
+        {actorId && (
+          <span>
+            {" "}or run:{" "}
+            <code>ray logs actor --id {actorId}</code>
+          </span>
+        )}
+        .
+      </Typography>
+    </Box>
   );
 };

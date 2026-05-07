@@ -51,13 +51,13 @@ DEFAULT_DOWNLOAD_FILENAME = "file.txt"
 
 # Max number of entries from API server to the client
 RAY_MAX_LIMIT_FROM_API_SERVER = env_integer(
-    "RAY_MAX_LIMIT_FROM_API_SERVER", 10 * 1000
+    "RAY_MAX_LIMIT_FROM_API_SERVER", 30 * 1000
 )  # 10k
 
 # Max number of entries from data sources (rest will be truncated at the
 # data source, e.g. raylet)
 RAY_MAX_LIMIT_FROM_DATA_SOURCE = env_integer(
-    "RAY_MAX_LIMIT_FROM_DATA_SOURCE", 10 * 1000
+    "RAY_MAX_LIMIT_FROM_DATA_SOURCE", 30 * 1000
 )  # 10k
 
 

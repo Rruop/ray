@@ -18,6 +18,12 @@ if BaseModel is None:
     raise ModuleNotFoundError("Please install pydantic via `pip install pydantic`.")
 
 
+class LogCleanedUpError(FileNotFoundError):
+    """Raised when the log file cannot be found because it has been cleaned up."""
+
+    pass
+
+
 logger = logging.getLogger(__name__)
 
 WORKER_LOG_PATTERN = re.compile(r".*worker-([0-9a-f]+)-([0-9a-f]+)-(\d+).(out|err)")
@@ -238,14 +244,70 @@ class LogsManager:
                 "Actor is not scheduled yet."
             )
         node_id = NodeID(node_id_binary)
-        log_filename = await self._resolve_worker_file(
-            node_id_hex=node_id.hex(),
-            worker_id_hex=worker_id.hex(),
-            pid=None,
-            suffix=suffix,
-            timeout=timeout,
+
+        # First try the actor's original node.
+        try:
+            log_filename = await self._resolve_worker_file(
+                node_id_hex=node_id.hex(),
+                worker_id_hex=worker_id.hex(),
+                pid=None,
+                suffix=suffix,
+                timeout=timeout,
+            )
+            if log_filename is not None:
+                return node_id.hex(), log_filename
+        except Exception:
+            logger.warning(
+                f"Failed to resolve log file for actor {actor_id} on node "
+                f"{node_id.hex()}. The node may be dead. "
+                "Falling back to searching all alive nodes."
+            )
+
+        # Fallback: search all alive nodes for the worker log file.
+        # This handles the case where the actor's original node is dead but
+        # the log files were persisted on another reachable node (e.g. shared
+        # storage), or the node_id recorded in GCS is stale.
+        logger.info(
+            f"Searching all alive nodes for actor {actor_id} "
+            f"worker log (worker_id={worker_id.hex()})."
         )
-        return node_id.hex(), log_filename
+        try:
+            all_node_info = await self.client.get_all_node_info(timeout=timeout)
+        except Exception as e:
+            raise FileNotFoundError(
+                f"Could not find log file for actor {actor_id}: "
+                f"original node {node_id.hex()} is unreachable and "
+                f"failed to list nodes for fallback search: {e}"
+            )
+
+        for node in all_node_info.node_info_list:
+            candidate_node_id = NodeID(node.node_id).hex()
+            if candidate_node_id == node_id.hex():
+                # Already tried this node above.
+                continue
+            try:
+                log_filename = await self._resolve_worker_file(
+                    node_id_hex=candidate_node_id,
+                    worker_id_hex=worker_id.hex(),
+                    pid=None,
+                    suffix=suffix,
+                    timeout=timeout,
+                )
+                if log_filename is not None:
+                    logger.info(
+                        f"Found actor {actor_id} log on fallback node "
+                        f"{candidate_node_id}: {log_filename}"
+                    )
+                    return candidate_node_id, log_filename
+            except Exception:
+                # Node unreachable, skip.
+                continue
+
+        raise LogCleanedUpError(
+            f"Could not find log file for actor {actor_id} "
+            f"(worker_id={worker_id.hex()}) on any alive node. "
+            "The log file may have been cleaned up."
+        )
 
     async def _resolve_task_filename(
         self, task_id: str, attempt_number: int, suffix: str, timeout: int

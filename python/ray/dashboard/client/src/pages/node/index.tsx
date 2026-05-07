@@ -36,10 +36,11 @@ const codeTextStyle = {
 };
 const columns = [
   { label: "" }, // Expand button
+  { label: "ID" },
+  { label: "Pod" },
   { label: "Host / Worker Process name" },
   { label: "State" },
   { label: "State Message" },
-  { label: "ID" },
   { label: "IP / PID" },
   { label: "Actions" },
   {
@@ -274,6 +275,12 @@ const Nodes = () => {
         <Grid container alignItems="center">
           <Grid item>
             <SearchInput
+              label="Node ID"
+              onChange={(value) => changeFilter("nodeId", value.trim())}
+            />
+          </Grid>
+          <Grid item>
+            <SearchInput
               label="Host"
               onChange={(value) => changeFilter("hostname", value.trim())}
             />
@@ -282,12 +289,6 @@ const Nodes = () => {
             <SearchInput
               label="IP"
               onChange={(value) => changeFilter("ip", value.trim())}
-            />
-          </Grid>
-          <Grid item>
-            <SearchInput
-              label="Node ID"
-              onChange={(value) => changeFilter("nodeId", value.trim())}
             />
           </Grid>
           <Grid item>

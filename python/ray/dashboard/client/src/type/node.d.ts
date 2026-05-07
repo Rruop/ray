@@ -5,6 +5,7 @@ import { Worker } from "./worker";
 export type NodeDetail = {
   now: number;
   hostname: string;
+  podName: string; // Cloud instance ID from RAY_CLOUD_INSTANCE_ID env var, empty string if not set
   ip: string;
   cpu: number; // cpu usage
   cpus?: number[]; // Logic CPU Count, Physical CPU Count

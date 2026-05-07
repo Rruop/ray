@@ -1,6 +1,15 @@
+import axios from "axios";
 import { get } from "./requestHandlers";
 
 export const MAX_LINES_FOR_LOGS = 50_000;
+
+export type LogErrorCode = "LOG_NOT_FOUND" | "LOG_CLEANED_UP" | "LOG_ERROR";
+
+export type LogError = {
+  error: true;
+  code: LogErrorCode;
+  message: string;
+};
 
 export type StateApiLogInput = {
   nodeId?: string | null;
@@ -63,17 +72,35 @@ export const getStateApiDownloadLogUrl = ({
   return `api/v0/logs/file?${variables.join("&")}`;
 };
 
-export const getStateApiLog = async (props: StateApiLogInput) => {
+export const getStateApiLog = async (
+  props: StateApiLogInput,
+): Promise<string | LogError | undefined> => {
   const url = getStateApiDownloadLogUrl({ ...props });
   if (url === null) {
     return undefined;
   }
-  const resp = await get<string>(url);
-  // Handle case where log file is empty.
-  if (resp.status === 200 && resp.data.length === 0) {
-    return "";
+  try {
+    const resp = await get<string>(url);
+    // Handle case where log file is empty.
+    if (resp.status === 200 && resp.data.length === 0) {
+      return "";
+    }
+    return resp.data;
+  } catch (e) {
+    if (axios.isAxiosError(e) && e.response?.status === 404) {
+      const errorCode = e.response.headers["x-log-error-code"];
+      return {
+        error: true,
+        code: errorCode === "LOG_CLEANED_UP" ? "LOG_CLEANED_UP" : "LOG_NOT_FOUND",
+        message: e.response.data ?? String(e),
+      };
+    }
+    return {
+      error: true,
+      code: "LOG_ERROR",
+      message: String(e),
+    };
   }
-  return resp.data;
 };
 
 type ListStateApiLogsResponse = {

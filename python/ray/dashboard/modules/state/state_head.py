@@ -19,7 +19,7 @@ from ray.dashboard.consts import (
     RAY_STATE_SERVER_MAX_HTTP_REQUEST_ALLOWED,
     RAY_STATE_SERVER_MAX_HTTP_REQUEST_ENV_NAME,
 )
-from ray.dashboard.modules.log.log_manager import LogsManager
+from ray.dashboard.modules.log.log_manager import LogCleanedUpError, LogsManager
 from ray.dashboard.state_aggregator import StateAPIManager
 from ray.dashboard.state_api_utils import (
     do_reply,
@@ -279,6 +279,15 @@ class StateHead(SubprocessModule, RateLimitedModule):
             # Force close the connection and do no-op.
             response.force_close()
             raise
+        except LogCleanedUpError as e:
+            logger.warning("Log file cleaned up: %s", e)
+            raise aiohttp.web.HTTPNotFound(
+                text=str(e),
+                headers={"X-Log-Error-Code": "LOG_CLEANED_UP"},
+            )
+        except FileNotFoundError as e:
+            logger.warning("Log file not found: %s", e)
+            raise aiohttp.web.HTTPNotFound(text=str(e))
         except Exception as e:
             logger.exception("Error while streaming logs")
             raise aiohttp.web.HTTPInternalServerError(text=str(e))

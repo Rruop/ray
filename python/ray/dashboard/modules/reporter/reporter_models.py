@@ -1,6 +1,6 @@
 from typing import Dict, List, Optional, Tuple
 
-from ray._common.pydantic_compat import PYDANTIC_INSTALLED, BaseModel
+from ray._common.pydantic_compat import PYDANTIC_INSTALLED, BaseModel, Field
 
 if PYDANTIC_INSTALLED:
 
@@ -159,6 +159,7 @@ if PYDANTIC_INSTALLED:
 
         now: float  # POSIX timestamp
         hostname: str
+        pod_name: str = Field(default="", alias="podName") 
         ip: str
         cpu: float  # CPU usage percentage
         cpus: Tuple[int, int]  # (logicalCpuCount, physicalCpuCount)
