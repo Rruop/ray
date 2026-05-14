@@ -101,13 +101,21 @@ class DefaultActorAutoscaler(ActorAutoscaler):
         op: "PhysicalOperator",
         op_state: "OpState",
     ) -> ActorPoolScalingRequest:
-        # If all inputs have been consumed, short-circuit
+        # If all inputs have been consumed, release all actors at once
+        # instead of step-wise scale down, so downstream ops can immediately
+        # claim the freed resources.
         if op.has_completed() or (
             op._inputs_complete and op_state.total_enqueued_input_blocks() == 0
         ):
-            num_to_scale_down = self._compute_downscale_delta(actor_pool)
-            return ActorPoolScalingRequest.downscale(
-                delta=-num_to_scale_down, force=True, reason="consumed all inputs"
+            num_to_scale_down = actor_pool.current_size()
+            if num_to_scale_down > 0:
+                return ActorPoolScalingRequest.downscale(
+                    delta=-num_to_scale_down,
+                    force=True,
+                    reason="consumed all inputs",
+                )
+            return ActorPoolScalingRequest.no_op(
+                reason="consumed all inputs, pool already empty"
             )
 
         if actor_pool.current_size() < actor_pool.min_size():
