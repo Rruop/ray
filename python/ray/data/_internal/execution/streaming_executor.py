@@ -608,10 +608,14 @@ class StreamingExecutor(Executor, threading.Thread):
             stats.extra_metrics = op.metrics.as_dict(skip_internal_metrics=True)
         # Use executor-level accumulated values for error metrics across all operators
         stats.extra_metrics["num_errored_blocks"] = self._num_errored_blocks
+        # Always assign a ``Timer`` so downstream consumers can call
+        # ``.get()`` / ``.avg()`` / ``.max()`` unconditionally. When
+        # ``_initial_stats`` is absent we hand back an empty Timer (count
+        # 0); the Timer's zero-sample semantics yield 0 across all three.
         stats.streaming_exec_schedule_s = (
             self._initial_stats.streaming_exec_schedule_s
             if self._initial_stats
-            else None
+            else Timer()
         )
         return stats
 
