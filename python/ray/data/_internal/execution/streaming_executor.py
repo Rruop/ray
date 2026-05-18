@@ -122,6 +122,7 @@ class StreamingExecutor(Executor, threading.Thread):
 
         # Job configuration synchronization components (lazy initialized)
         self._config_controller = None
+        self._config_store = None
 
         self._last_debug_log_time = 0
 
@@ -257,6 +258,11 @@ class StreamingExecutor(Executor, threading.Thread):
 
         with self._shutdown_lock:
             if not self._execution_started or self._shutdown:
+                if self._shutdown:
+                    logger.debug(
+                        f"Executor for dataset {self._dataset_id} "
+                        f"already shut down, skipping"
+                    )
                 return
 
             start = time.perf_counter()
@@ -265,7 +271,7 @@ class StreamingExecutor(Executor, threading.Thread):
                 f"failed with {exception}" if exception else "completed successfully"
             )
 
-            logger.debug(
+            logger.info(
                 f"Shutting down executor for dataset {self._dataset_id} "
                 f"({status_detail})"
             )
@@ -279,6 +285,13 @@ class StreamingExecutor(Executor, threading.Thread):
 
             _num_shutdown += 1
             self._shutdown = True
+
+            # Clean up execution config immediately before other shutdown work.
+            # This must run early because SIGKILL may arrive within 3 seconds
+            # (RAY_JOB_STOP_WAIT_TIME_S) and the operations below (join, stats,
+            # operator shutdown) can easily exceed that deadline.
+            self._maybe_delete_execution_config()
+
             # Give the scheduling loop some time to finish processing.
             self.join(timeout=2.0)
             self._update_stats_metrics(
@@ -366,15 +379,35 @@ class StreamingExecutor(Executor, threading.Thread):
             store = create_execution_config_store(
                 data_context=self._data_context,
                 job_id=job_id,
+                dataset_id=self._dataset_id,
             )
             if store is None:
                 return
 
             store.init(self._generate_initial_operator_config(job_id))
+            self._config_store = store
             self._config_controller = ConfigController(self._topology, store)
             logger.info("Operator configuration synchronization initialized")
         except Exception as e:
             logger.warning(f"Failed to initialize operator config sync: {e}")
+
+    def _maybe_delete_execution_config(self) -> None:
+        """Delete execution config from store on completion if configured.
+
+        This method is idempotent -- calling it multiple times is harmless.
+        """
+        try:
+            if not self._data_context.delete_execution_config_on_completion:
+                return
+            if self._config_store is None:
+                return
+            self._config_store.delete()
+            self._config_store = None
+            logger.info(
+                f"Deleted execution config for dataset {self._dataset_id}"
+            )
+        except Exception as e:
+            logger.warning(f"Failed to delete execution config on completion: {e}")
 
     def _generate_initial_operator_config(self, job_id: str):
         """Generate initial operator configuration from topology.
@@ -392,7 +425,7 @@ class StreamingExecutor(Executor, threading.Thread):
             ActorPoolOperatorConfig,
         )
 
-        config = ExecutionConfig(job_id=job_id)
+        config = ExecutionConfig(job_id=job_id, dataset_id=self._dataset_id)
 
         for op in self._topology.keys():
             if isinstance(op, TaskPoolMapOperator):
@@ -738,6 +771,7 @@ class StreamingExecutor(Executor, threading.Thread):
                 op_output_rows = op.metrics.rows_task_outputs_generated
             op_info = {
                 "name": op.name,
+                "execution_config_op_id": op.id,
                 "progress": op_state.num_completed_tasks,
                 "total": op.num_outputs_total(),
                 "total_rows": op.num_output_rows_total(),
@@ -889,6 +923,11 @@ class _ClosingIterator(OutputIterator):
         #
         # NOTE: This also handles ``StopIteration``
         except BaseException as e:
+            if not isinstance(e, StopIteration):
+                logger.info(
+                    f"_ClosingIterator caught {type(e).__name__} for dataset "
+                    f"{self._executor._dataset_id}, triggering shutdown"
+                )
             # Asynchronously shutdown the executor (ie avoid unnecessary
             # synchronization on tasks termination)
             self._executor.shutdown(

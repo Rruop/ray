@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 # GCS storage constants - used by GcsExecutionConfigStore and config_client
 GCS_KEY_PREFIX = "ray_data_execution_config_"
 GCS_KEY_TEMPLATE = f"{GCS_KEY_PREFIX}{{job_id}}"
+GCS_KEY_TEMPLATE_WITH_DATASET = f"{GCS_KEY_PREFIX}{{job_id}}::{{dataset_id}}"
 GCS_NAMESPACE = "ray_data_execution_config"
 
 
@@ -52,10 +53,20 @@ class ExecutionConfigStore(ABC):
         """
         pass
 
+    @abstractmethod
+    def delete(self) -> bool:
+        """Delete the stored configuration.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        pass
+
 
 def create_execution_config_store(
     data_context: "DataContext",
     job_id: Optional[str] = None,
+    dataset_id: Optional[str] = None,
 ) -> Optional[ExecutionConfigStore]:
     """
     Create an execution configuration store based on DataContext configuration.
@@ -63,6 +74,7 @@ def create_execution_config_store(
     Args:
         data_context: The DataContext containing store configuration.
         job_id: Job/execution ID (required for gcs and kconf stores).
+        dataset_id: Optional dataset ID for per-dataset config isolation.
 
     Returns:
         ExecutionConfigStore instance, or None if creation fails.
@@ -75,6 +87,7 @@ def create_execution_config_store(
         return GcsExecutionConfigStore(
             gcs_client=ray._private.worker.global_worker.gcs_client,
             job_id=job_id,
+            dataset_id=dataset_id,
         )
 
     if store_type == "memory":
@@ -109,6 +122,8 @@ def create_execution_config_store(
             )
 
         full_key = f"{kconf_key}.job_{job_id}"
+        if dataset_id is not None:
+            full_key = f"{full_key}__dataset_{dataset_id}"
 
         return KconfExecutionConfigStore(key=full_key, token=kconf_token)
 

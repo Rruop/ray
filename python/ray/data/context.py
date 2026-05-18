@@ -330,6 +330,10 @@ DEFAULT_EXECUTION_CONFIG_KCONF_KEY: Optional[str] = env_string(
 DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN: Optional[str] = env_string(
     "RAY_DATA_EXECUTION_CONFIG_KCONF_TOKEN", "kconf_flemiaczh7l9uelx696col56fo"
 )
+# Whether to delete execution config from store when dataset execution completes
+DEFAULT_DELETE_EXECUTION_CONFIG_ON_COMPLETION: bool = env_bool(
+    "RAY_DATA_DELETE_EXECUTION_CONFIG_ON_COMPLETION", True
+)
 
 DEFAULT_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO: float = env_float(
     "RAY_DATA_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO", 10.0
@@ -844,6 +848,8 @@ class DataContext:
     execution_config_kconf_key: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_KEY
     # Kconf token (only used when store_type is "kconf")
     execution_config_kconf_token: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN
+    # Whether to delete execution config from store when dataset execution completes
+    delete_execution_config_on_completion: bool = DEFAULT_DELETE_EXECUTION_CONFIG_ON_COMPLETION
 
     def __post_init__(self):
         # The additonal ray remote args that should be added to

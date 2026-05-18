@@ -6,7 +6,7 @@ import threading
 from abc import abstractmethod
 from typing import Callable, Dict, Generic, Optional, TypeVar
 
-from kconf.client import update_config, create_config, KConfValueType
+from kconf.client import update_config, create_config, remove_config, KConfValueType
 from kconf.exception import KConfError
 from kconf.get_config import get_string_config
 from kconf.watcher import StringWatcher, add_watcher
@@ -321,3 +321,19 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
         except KConfError as e:
             logger.warning(f"Config not found for key {self._key}: {e}")
             return None
+
+    def delete(self) -> bool:
+        """Delete the stored configuration from kconf.
+
+        Returns:
+            True if deleted, False if not found or failed.
+        """
+        with self._lock:
+            try:
+                remove_config(self._key, self._token)
+                self._config = None
+                logger.info(f"Deleted configuration from kconf for key: {self._key}")
+                return True
+            except KConfError as e:
+                logger.error(f"Failed to delete configuration from kconf: {e}")
+                return False

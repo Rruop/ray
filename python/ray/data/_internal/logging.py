@@ -1,3 +1,4 @@
+import copy
 import logging
 import logging.config
 import os
@@ -46,7 +47,7 @@ DEFAULT_CONFIG = {
     },
     "loggers": {
         "ray.data": {
-            "level": "DEBUG",
+            "level": "INFO",
             "handlers": ["file", "console"],
             "propagate": False,
         },
@@ -62,6 +63,11 @@ RAY_DATA_LOG_ENCODING_ENV_VAR_NAME = "RAY_DATA_LOG_ENCODING"
 
 # Env. variable to specify the logging config path use defaults if not set
 RAY_DATA_LOGGING_CONFIG_ENV_VAR_NAME = "RAY_DATA_LOGGING_CONFIG"
+
+# Env. variable to override the log level for the ray.data logger.
+# Applies to both file and console handlers. Valid values: DEBUG, INFO, WARNING, ERROR.
+# Default is INFO.
+RAY_DATA_LOG_LEVEL_ENV_VAR_NAME = "RAY_DATA_LOG_LEVEL"
 
 _DATASET_LOGGER_HANDLER = {}
 _ACTIVE_DATASET = None
@@ -190,7 +196,10 @@ def _get_logging_config() -> Optional[dict]:
     if config_path is not None:
         config = _load_logging_config(config_path)
     else:
-        config = DEFAULT_CONFIG
+        # Deep copy to avoid mutating the module-level DEFAULT_CONFIG,
+        # which would cause errors on subsequent calls (e.g., removing
+        # a handler that was already removed).
+        config = copy.deepcopy(DEFAULT_CONFIG)
         if log_encoding is not None and log_encoding.upper() == "JSON":
             for logger in config["loggers"].values():
                 for (
@@ -199,6 +208,13 @@ def _get_logging_config() -> Optional[dict]:
                 ) in RAY_DATA_LOG_HANDLER_JSON_SUBSTITUTIONS.items():
                     logger["handlers"].remove(old_handler_name)
                     logger["handlers"].append(new_handler_name)
+
+    # Override logger level if RAY_DATA_LOG_LEVEL is set.
+    # This applies to the logger itself (controls what reaches all handlers).
+    log_level = os.environ.get(RAY_DATA_LOG_LEVEL_ENV_VAR_NAME)
+    if log_level is not None:
+        for logger_config in config.get("loggers", {}).values():
+            logger_config["level"] = log_level.upper()
 
     return config
 

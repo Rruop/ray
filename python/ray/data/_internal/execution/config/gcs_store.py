@@ -9,6 +9,7 @@ from ray.data._internal.execution.config.models import ExecutionConfig
 from ray.data._internal.execution.config.store import (
     ExecutionConfigStore,
     GCS_KEY_TEMPLATE,
+    GCS_KEY_TEMPLATE_WITH_DATASET,
     GCS_NAMESPACE,
 )
 
@@ -35,6 +36,7 @@ class GcsExecutionConfigStore(ExecutionConfigStore):
         self,
         gcs_client: GcsClient,
         job_id: Optional[str] = None,
+        dataset_id: Optional[str] = None,
         timeout: int = 30
     ):
         """
@@ -44,15 +46,21 @@ class GcsExecutionConfigStore(ExecutionConfigStore):
             gcs_client: The GCS client for accessing the global control store.
             job_id: Job ID to associate with this configuration.
                    If not provided, "default" will be used.
+            dataset_id: Optional dataset ID for per-dataset config isolation.
             timeout: Timeout in seconds for GCS operations.
         """
         self._gcs_client = gcs_client
         self._job_id = job_id or "default"
+        self._dataset_id = dataset_id
         self._timeout = timeout
         self._lock = threading.Lock()
 
     def _get_key(self) -> bytes:
-        """Get the GCS key for this job's configuration."""
+        """Get the GCS key for this store's configuration."""
+        if self._dataset_id is not None:
+            return GCS_KEY_TEMPLATE_WITH_DATASET.format(
+                job_id=self._job_id, dataset_id=self._dataset_id
+            ).encode()
         return GCS_KEY_TEMPLATE.format(job_id=self._job_id).encode()
 
     def get(self) -> Optional[ExecutionConfig]:
@@ -135,7 +143,45 @@ class GcsExecutionConfigStore(ExecutionConfigStore):
                 logger.error(f"Failed to initialize configuration in GCS: {e}")
                 return False
 
+    def delete(self) -> bool:
+        """Delete the stored configuration from GCS.
+
+        Returns:
+            True if deleted, False if not found.
+        """
+        with self._lock:
+            try:
+                key = self._get_key()
+                existing = self._gcs_client.internal_kv_get(
+                    key,
+                    namespace=GCS_NAMESPACE,
+                    timeout=self._timeout,
+                )
+
+                if existing is None:
+                    return False
+
+                self._gcs_client.internal_kv_del(
+                    key,
+                    False,
+                    namespace=GCS_NAMESPACE,
+                    timeout=self._timeout,
+                )
+                logger.debug(
+                    f"Deleted configuration from GCS for job: {self._job_id}"
+                )
+                return True
+
+            except Exception as e:
+                logger.error(f"Failed to delete configuration from GCS: {e}")
+                return False
+
     @property
     def job_id(self) -> str:
         """Get the job ID associated with this store."""
         return self._job_id
+
+    @property
+    def dataset_id(self) -> Optional[str]:
+        """Get the dataset ID associated with this store."""
+        return self._dataset_id

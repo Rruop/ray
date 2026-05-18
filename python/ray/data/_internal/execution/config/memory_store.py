@@ -40,3 +40,11 @@ class MemoryExecutionConfigStore(ExecutionConfigStore):
                 return False
             self._config = config
             return True
+
+    def delete(self) -> bool:
+        """Delete the stored configuration."""
+        with self._lock:
+            if self._config is None:
+                return False
+            self._config = None
+            return True

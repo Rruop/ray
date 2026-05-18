@@ -22,6 +22,7 @@ from .store import (
     create_execution_config_store,
     GCS_KEY_PREFIX,
     GCS_KEY_TEMPLATE,
+    GCS_KEY_TEMPLATE_WITH_DATASET,
     GCS_NAMESPACE,
 )
 from .gcs_store import GcsExecutionConfigStore
@@ -45,6 +46,7 @@ __all__ = [
     # GCS constants
     "GCS_KEY_PREFIX",
     "GCS_KEY_TEMPLATE",
+    "GCS_KEY_TEMPLATE_WITH_DATASET",
     "GCS_NAMESPACE",
     # Store implementations
     "GcsExecutionConfigStore",

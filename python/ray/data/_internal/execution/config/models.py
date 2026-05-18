@@ -117,6 +117,7 @@ class ExecutionConfig:
 
     Attributes:
         job_id: The job ID or submission ID associated with this configuration.
+        dataset_id: Optional dataset identifier for per-dataset config isolation.
         operators: Mapping from operator ID to its configuration.
 
     Example:
@@ -128,6 +129,7 @@ class ExecutionConfig:
     """
 
     job_id: Optional[str] = None
+    dataset_id: Optional[str] = None
     operators: Dict[str, OperatorConfig] = field(default_factory=dict)
 
     def to_json(self) -> str:
@@ -154,6 +156,8 @@ class ExecutionConfig:
         }
         if self.job_id is not None:
             result["job_id"] = self.job_id
+        if self.dataset_id is not None:
+            result["dataset_id"] = self.dataset_id
         return result
 
     @classmethod
@@ -168,6 +172,7 @@ class ExecutionConfig:
         }
         return cls(
             job_id=data.get("job_id"),
+            dataset_id=data.get("dataset_id"),
             operators=operators,
         )
 
