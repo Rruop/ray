@@ -57,11 +57,11 @@ export const useSorter = (initialSortKey?: string) => {
       [a, b] = [instanceA, instanceB];
     }
 
-    if (!get(a, sorter.key)) {
+    if (get(a, sorter.key) === null || get(a, sorter.key) === undefined) {
       return -1;
     }
 
-    if (!get(b, sorter.key)) {
+    if (get(b, sorter.key) === null || get(b, sorter.key) === undefined) {
       return 1;
     }
 

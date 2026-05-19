@@ -251,7 +251,7 @@ export const StateApiLogViewerPage = () => {
       : `/logs/?nodeId=${nodeId}`;
 
   return (
-    <Box sx={{ padding: 2, width: "100%" }}>
+    <Box sx={{ padding: 2, width: "100%", height: "calc(100vh - 100px)", display: "flex", flexDirection: "column" }}>
       <TitleCard title="Logs Viewer">
         <Paper elevation={0}>
           {!nodeId && <p>Select a node to view logs</p>}
@@ -273,14 +273,15 @@ export const StateApiLogViewerPage = () => {
             </Box>
           )}
         </Paper>
-        <Paper elevation={0}>
+        <Paper elevation={0} sx={{ flex: 1, minHeight: 400, display: "flex", flexDirection: "column" }}>
           {nodeId && fileName ? (
             <StateApiLogViewer
               data={{
                 nodeId,
                 filename: fileName,
               }}
-              height={600}
+              autoHeight
+              minHeight={400}
             />
           ) : (
             <Typography color="error">Invalid url parameters</Typography>

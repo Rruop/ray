@@ -51,6 +51,10 @@ export const useNodeList = () => {
     ...e,
     state: e.raylet.state,
     logicalResources: nodeLogicalResources[e.raylet.nodeId],
+    gpuUtilization:
+      e.gpus && e.gpus.length > 0
+        ? e.gpus.reduce((sum, gpu) => sum + (gpu.utilizationGpu ?? 0), 0)
+        : null,
   }));
 
   const sortedList = _.sortBy(nodeListWithAdditionalInfo, (node) => {

@@ -315,6 +315,7 @@ const Nodes = () => {
                 ["mem[2]", "Used Memory"],
                 ["mem[0]", "Total Memory"],
                 ["cpu", "CPU"],
+                ["gpuUtilization", "GPU"],
                 ["networkSpeed[0]", "Sent"],
                 ["networkSpeed[1]", "Received"],
                 ["disk./.used", "Used Disk"],

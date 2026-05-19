@@ -1,15 +1,24 @@
-import { SearchOutlined } from "@mui/icons-material";
+import {
+  KeyboardArrowDown,
+  KeyboardArrowUp,
+  SearchOutlined,
+} from "@mui/icons-material";
 import {
   Box,
   Button,
+  IconButton,
   InputAdornment,
   LinearProgress,
   Switch,
   TextField,
+  Tooltip,
+  Typography,
 } from "@mui/material";
-import React, { memo, useContext, useState } from "react";
+import React, { memo, useCallback, useContext, useRef, useState } from "react";
 import { GlobalContext } from "../../App";
-import LogVirtualView from "../../components/LogView/LogVirtualView";
+import LogVirtualView, {
+  LogVirtualViewHandle,
+} from "../../components/LogView/LogVirtualView";
 
 const useLogViewer = () => {
   const [search, setSearch] =
@@ -18,9 +27,14 @@ const useLogViewer = () => {
       lineNumber?: string;
       fontSize?: number;
       revert?: boolean;
-    }>();
+      searchMode?: "filter" | "locate";
+    }>({ searchMode: "locate" });
   const [startTime, setStart] = useState<string>();
   const [endTime, setEnd] = useState<string>();
+  const [matchInfo, setMatchInfo] = useState<{
+    total: number;
+    currentIndex: number;
+  }>({ total: 0, currentIndex: -1 });
 
   return {
     search,
@@ -29,6 +43,8 @@ const useLogViewer = () => {
     setStart,
     endTime,
     setEnd,
+    matchInfo,
+    setMatchInfo,
   };
 };
 
@@ -38,6 +54,10 @@ type LogViewerProps = {
   downloadUrl?: string;
   onRefreshClick?: () => void;
   height?: number;
+  /** Use AutoSizer to fill available height */
+  autoHeight?: boolean;
+  /** Minimum height when using autoHeight */
+  minHeight?: number;
 };
 
 /**
@@ -51,10 +71,41 @@ export const LogViewer = memo(
     downloadUrl,
     onRefreshClick,
     height = 600,
+    autoHeight = false,
+    minHeight = 400,
   }: LogViewerProps) => {
-    const { search, setSearch, startTime, setStart, endTime, setEnd } =
-      useLogViewer();
+    const {
+      search,
+      setSearch,
+      startTime,
+      setStart,
+      endTime,
+      setEnd,
+      matchInfo,
+      setMatchInfo,
+    } = useLogViewer();
     const { themeMode } = useContext(GlobalContext);
+    const logViewRef = useRef<LogVirtualViewHandle>(null);
+
+    const handlePrevMatch = useCallback(() => {
+      if (matchInfo.total > 0 && logViewRef.current) {
+        const newIndex =
+          matchInfo.currentIndex <= 0
+            ? matchInfo.total - 1
+            : matchInfo.currentIndex - 1;
+        logViewRef.current.scrollToMatch(newIndex);
+      }
+    }, [matchInfo]);
+
+    const handleNextMatch = useCallback(() => {
+      if (matchInfo.total > 0 && logViewRef.current) {
+        const newIndex =
+          matchInfo.currentIndex >= matchInfo.total - 1
+            ? 0
+            : matchInfo.currentIndex + 1;
+        logViewRef.current.scrollToMatch(newIndex);
+      }
+    }, [matchInfo]);
 
     return (
       <React.Fragment>
@@ -68,6 +119,16 @@ export const LogViewer = memo(
                   onChange: ({ target: { value } }) => {
                     setSearch({ ...search, keywords: value });
                   },
+                  onKeyDown: (e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      if (e.shiftKey) {
+                        handlePrevMatch();
+                      } else {
+                        handleNextMatch();
+                      }
+                    }
+                  },
                   type: "",
                   endAdornment: (
                     <InputAdornment position="end">
@@ -80,6 +141,45 @@ export const LogViewer = memo(
                   ),
                 }}
               />
+              {/* Search mode navigation controls */}
+              {search?.searchMode === "locate" && search?.keywords && (
+                <Box
+                  sx={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    margin: 1,
+                    gap: 0.5,
+                  }}
+                >
+                  <Typography variant="body2" sx={{ minWidth: 60 }}>
+                    {matchInfo.total > 0
+                      ? `${matchInfo.currentIndex + 1} / ${matchInfo.total}`
+                      : "0 / 0"}
+                  </Typography>
+                  <Tooltip title="Previous match (Shift+Enter)">
+                    <span>
+                      <IconButton
+                        size="small"
+                        onClick={handlePrevMatch}
+                        disabled={matchInfo.total === 0}
+                      >
+                        <KeyboardArrowUp />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                  <Tooltip title="Next match (Enter)">
+                    <span>
+                      <IconButton
+                        size="small"
+                        onClick={handleNextMatch}
+                        disabled={matchInfo.total === 0}
+                      >
+                        <KeyboardArrowDown />
+                      </IconButton>
+                    </span>
+                  </Tooltip>
+                </Box>
+              )}
               <TextField
                 id="datetime-local"
                 label="Start Time"
@@ -106,10 +206,22 @@ export const LogViewer = memo(
                 }}
               />
               <Box sx={{ margin: 1 }}>
+                Filter Mode:{" "}
+                <Tooltip title="Filter mode shows only matching lines. Locate mode shows all lines with navigation.">
+                  <Switch
+                    checked={search?.searchMode === "filter"}
+                    onChange={(_, checked) =>
+                      setSearch({
+                        ...search,
+                        searchMode: checked ? "filter" : "locate",
+                      })
+                    }
+                  />
+                </Tooltip>
                 Reverse:{" "}
                 <Switch
                   checked={search?.revert}
-                  onChange={(e, v) => setSearch({ ...search, revert: v })}
+                  onChange={(_, checked) => setSearch({ ...search, revert: checked })}
                 />
                 {onRefreshClick && (
                   <Button
@@ -143,7 +255,10 @@ export const LogViewer = memo(
               </Box>
             </div>
             <LogVirtualView
+              ref={logViewRef}
               height={height}
+              autoHeight={autoHeight}
+              minHeight={minHeight}
               revert={search?.revert}
               keywords={search?.keywords}
               focusLine={Number(search?.lineNumber) || undefined}
@@ -153,6 +268,8 @@ export const LogViewer = memo(
               theme={themeMode}
               startTime={startTime}
               endTime={endTime}
+              searchMode={search?.searchMode}
+              onMatchInfoChange={setMatchInfo}
             />
           </div>
         )}

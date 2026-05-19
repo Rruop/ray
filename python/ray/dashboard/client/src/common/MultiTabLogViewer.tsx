@@ -169,54 +169,73 @@ const isLogViewerDataActor = (data: LogViewerData): data is ActorData =>
 const isLogViewerDataTask = (data: LogViewerData): data is TaskData =>
   "taskId" in data;
 
-export type StateApiLogViewerProps = {
+type LogViewerSizeProps = {
   height?: number;
+  /** Use AutoSizer to fill available height */
+  autoHeight?: boolean;
+  /** Minimum height when using autoHeight */
+  minHeight?: number;
+};
+
+const DEFAULT_SIZE_PROPS: Required<LogViewerSizeProps> = {
+  height: 300,
+  autoHeight: false,
+  minHeight: 400,
+};
+
+export type StateApiLogViewerProps = LogViewerSizeProps & {
   data: LogViewerData;
 };
 
 export const StateApiLogViewer = ({
-  height = 300,
+  height = DEFAULT_SIZE_PROPS.height,
+  autoHeight = DEFAULT_SIZE_PROPS.autoHeight,
+  minHeight = DEFAULT_SIZE_PROPS.minHeight,
   data,
 }: StateApiLogViewerProps) => {
+  const sizeProps = { height, autoHeight, minHeight };
+
   if (isLogViewerDataText(data)) {
-    return <TextLogViewer height={height} contents={data.contents} />;
-  } else if (isLogViewerDataActor(data)) {
-    return <ActorLogViewer height={height} {...data} />;
-  } else if (isLogViewerDataTask(data)) {
-    return <TaskLogViewer height={height} {...data} />;
-  } else {
-    return <FileLogViewer height={height} {...data} />;
+    return <TextLogViewer {...sizeProps} contents={data.contents} />;
   }
+  if (isLogViewerDataActor(data)) {
+    return <ActorLogViewer {...sizeProps} {...data} />;
+  }
+  if (isLogViewerDataTask(data)) {
+    return <TaskLogViewer {...sizeProps} {...data} />;
+  }
+  return <FileLogViewer {...sizeProps} {...data} />;
 };
 
+type InternalLogViewerProps = Required<LogViewerSizeProps>;
+
 const TextLogViewer = ({
-  height = 300,
+  height,
+  autoHeight,
+  minHeight,
   contents,
-}: {
-  height: number;
-  contents: string;
-}) => {
-  return <LogViewer log={contents} height={height} />;
+}: InternalLogViewerProps & { contents: string }) => {
+  return <LogViewer log={contents} height={height} autoHeight={autoHeight} minHeight={minHeight} />;
 };
 
 const FileLogViewer = ({
-  height = 300,
+  height,
+  autoHeight,
+  minHeight,
   nodeId,
   filename,
-}: {
-  height: number;
-} & FileData) => {
+}: InternalLogViewerProps & FileData) => {
   const apiData = useStateApiLogs({ nodeId, filename }, filename);
-  return <ApiLogViewer apiData={apiData} height={height} />;
+  return <ApiLogViewer apiData={apiData} height={height} autoHeight={autoHeight} minHeight={minHeight} />;
 };
 
 const ActorLogViewer = ({
-  height = 300,
+  height,
+  autoHeight,
+  minHeight,
   actorId,
   suffix,
-}: {
-  height: number;
-} & ActorData) => {
+}: InternalLogViewerProps & ActorData) => {
   const apiData = useStateApiLogs(
     { actorId, suffix },
     `actor-log-${actorId}.${suffix}`,
@@ -225,6 +244,8 @@ const ActorLogViewer = ({
     <ApiLogViewer
       apiData={apiData}
       height={height}
+      autoHeight={autoHeight}
+      minHeight={minHeight}
       fallbackNodeId={null}
       actorId={actorId}
     />
@@ -232,30 +253,31 @@ const ActorLogViewer = ({
 };
 
 const TaskLogViewer = ({
-  height = 300,
+  height,
+  autoHeight,
+  minHeight,
   taskId,
   suffix,
-}: {
-  height: number;
-} & TaskData) => {
+}: InternalLogViewerProps & TaskData) => {
   const apiData = useStateApiLogs(
     { taskId, suffix },
     `task-log-${taskId}.${suffix}`,
   );
-  return <ApiLogViewer apiData={apiData} height={height} />;
+  return <ApiLogViewer apiData={apiData} height={height} autoHeight={autoHeight} minHeight={minHeight} />;
 };
 
 const ApiLogViewer = ({
   apiData: { downloadUrl, log, path, refresh },
-  height = 300,
+  height,
+  autoHeight,
+  minHeight,
   fallbackNodeId,
   actorId,
 }: {
   apiData: ReturnType<typeof useStateApiLogs>;
-  height: number;
   fallbackNodeId?: string | null;
   actorId?: string | null;
-}) => {
+} & InternalLogViewerProps) => {
   if (typeof log === "string") {
     return (
       <LogViewer
@@ -263,6 +285,8 @@ const ApiLogViewer = ({
         path={path}
         downloadUrl={downloadUrl !== null ? downloadUrl : undefined}
         height={height}
+        autoHeight={autoHeight}
+        minHeight={minHeight}
         onRefreshClick={refresh}
       />
     );

@@ -1,18 +1,22 @@
-import { Box, Paper } from "@mui/material";
+import { Box, Paper, SxProps, Theme } from "@mui/material";
 import React, { PropsWithChildren, ReactNode } from "react";
 
 const TitleCard = ({
   title,
   children,
-}: PropsWithChildren<{ title?: ReactNode | string }>) => {
+  sx,
+}: PropsWithChildren<{ title?: ReactNode | string; sx?: SxProps<Theme> }>) => {
   return (
     <Paper
-      sx={{
-        padding: 2,
-        paddingTop: 1.5,
-        marginX: 1,
-        marginY: 2,
-      }}
+      sx={[
+        {
+          padding: 2,
+          paddingTop: 1.5,
+          marginX: 1,
+          marginY: 2,
+        },
+        ...(Array.isArray(sx) ? sx : [sx]),
+      ]}
       elevation={0}
     >
       {title && (
@@ -27,7 +31,7 @@ const TitleCard = ({
           {title}
         </Box>
       )}
-      <Box>{children}</Box>
+      <Box sx={{ flex: 1, display: "flex", flexDirection: "column" }}>{children}</Box>
     </Paper>
   );
 };

@@ -1,10 +1,9 @@
 import { Box, Button, Grid, MenuItem, Select } from "@mui/material";
-import React, { useCallback, useContext, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { GlobalContext } from "../../App";
-import LogVirtualView from "../../components/LogView/LogVirtualView";
 import TitleCard from "../../components/TitleCard";
 import { getJmap, getJstack, getJstat } from "../../service/util";
+import { LogViewer } from "../log/LogViewer";
 
 const CMDResult = () => {
   const { cmd, ip, pid } = useParams() as {
@@ -14,7 +13,6 @@ const CMDResult = () => {
   };
   const [result, setResult] = useState<string>();
   const [option, setOption] = useState("gcutil");
-  const { themeMode } = useContext(GlobalContext);
   const executeJstat = useCallback(
     () =>
       getJstat(ip, pid, option)
@@ -63,7 +61,7 @@ const CMDResult = () => {
   }, [cmd, executeJstat, ip, pid]);
 
   return (
-    <Box sx={{ padding: 4, width: "100%" }}>
+    <Box sx={{ padding: 4, width: "100%", height: "calc(100vh - 100px)", display: "flex", flexDirection: "column" }}>
       <TitleCard title={cmd}>
         {cmd === "jstat" && (
           <Box sx={{ padding: 2, marginTop: 2 }}>
@@ -88,7 +86,7 @@ const CMDResult = () => {
                     "gccause",
                     "printcompilation",
                   ].map((e) => (
-                    <MenuItem value={e}>{e}</MenuItem>
+                    <MenuItem key={e} value={e}>{e}</MenuItem>
                   ))}
                 </Select>
               </Grid>
@@ -99,12 +97,11 @@ const CMDResult = () => {
           </Box>
         )}
       </TitleCard>
-      <TitleCard title={`IP: ${ip} / Pid: ${pid}`}>
-        <LogVirtualView
-          content={result || "loading"}
-          language="prolog"
-          height={800}
-          theme={themeMode}
+      <TitleCard title={`IP: ${ip} / Pid: ${pid}`} sx={{ flex: 1, display: "flex", flexDirection: "column", minHeight: 400 }}>
+        <LogViewer
+          log={result || "loading"}
+          autoHeight
+          minHeight={400}
         />
       </TitleCard>
     </Box>

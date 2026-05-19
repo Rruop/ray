@@ -9,6 +9,7 @@ import {
   TableCell,
   TableHead,
   TableRow,
+  TableSortLabel,
   TextField,
   TextFieldProps,
   Tooltip,
@@ -242,7 +243,7 @@ const ActorTable = ({
         </Typography>
       ),
     },
-    { label: "Uptime" },
+    { label: "Uptime", sortKey: uptimeSorterKey },
     { label: "Job ID" },
     { label: "PID" },
     { label: "IP" },
@@ -565,14 +566,37 @@ const ActorTable = ({
         <Table>
           <TableHead>
             <TableRow>
-              {columns.map(({ label, helpInfo }) => (
+              {columns.map(({ label, helpInfo, sortKey }: any) => (
                 <TableCell align="center" key={label}>
                   <Box
                     display="flex"
                     justifyContent="center"
                     alignItems="center"
                   >
-                    {label}
+                    {sortKey ? (
+                      <TableSortLabel
+                        active={sorterKey === sortKey}
+                        direction={
+                          sorterKey === sortKey
+                            ? descVal
+                              ? "desc"
+                              : "asc"
+                            : "asc"
+                        }
+                        onClick={() => {
+                          if (sorterKey === sortKey) {
+                            setOrderDesc(!descVal);
+                          } else {
+                            setSortKey(sortKey);
+                            setOrderDesc(false);
+                          }
+                        }}
+                      >
+                        {label}
+                      </TableSortLabel>
+                    ) : (
+                      label
+                    )}
                     {helpInfo && (
                       <HelpInfo sx={{ marginLeft: 1 }}>{helpInfo}</HelpInfo>
                     )}

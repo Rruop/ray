@@ -59,10 +59,18 @@ const TaskTable = ({
   });
   const [taskIdFilterValue, setTaskIdFilterValue] = useState(filterToTaskId);
   const [pageSize, setPageSize] = useState(10);
-  const [sortField, setSortField] = useState<"start_time_ms" | "end_time_ms" | null>(null);
+  const [sortField, setSortField] = useState<"start_time_ms" | "end_time_ms" | "duration" | null>(null);
   const [sortDirection, setSortDirection] = useState<SortDirection>("asc");
 
-  const handleSortClick = (field: "start_time_ms" | "end_time_ms") => {
+  const getTaskDuration = (task: Task): number => {
+    if (!task.start_time_ms || task.start_time_ms <= 0) {
+      return 0;
+    }
+    const end = task.end_time_ms && task.end_time_ms > 0 ? task.end_time_ms : Date.now();
+    return end - task.start_time_ms;
+  };
+
+  const handleSortClick = (field: "start_time_ms" | "end_time_ms" | "duration") => {
     if (sortField === field) {
       setSortDirection((prev) => (prev === "asc" ? "desc" : "asc"));
     } else {
@@ -76,6 +84,12 @@ const TaskTable = ({
     taskList = [...taskList].sort((a, b) => {
       const aVal = a[sortField] ?? 0;
       const bVal = b[sortField] ?? 0;
+      return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
+    });
+  } else if (sortField === "duration") {
+    taskList = [...taskList].sort((a, b) => {
+      const aVal = getTaskDuration(a);
+      const bVal = getTaskDuration(b);
       return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
     });
   }
@@ -111,7 +125,7 @@ const TaskTable = ({
     },
     { label: "Start Time", sortKey: "start_time_ms" as const },
     { label: "End Time", sortKey: "end_time_ms" as const },
-    { label: "Duration" },
+    { label: "Duration", sortKey: "duration" as const },
     { label: "Function or class name" },
     { label: "Node ID" },
     { label: "Actor ID" },
