@@ -239,6 +239,11 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
     # === Inputs-related metrics ===
     num_inputs_received: int = metric_field(
         default=0,
+        description="Number of input RefBundles received by operator.",
+        metrics_group=MetricsGroup.INPUTS,
+    )
+    num_block_inputs_received: int = metric_field(
+        default=0,
         description="Number of input blocks received by operator.",
         metrics_group=MetricsGroup.INPUTS,
     )
@@ -862,6 +867,7 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
     def on_input_received(self, input: RefBundle):
         """Callback when the operator receives a new input."""
         self.num_inputs_received += 1
+        self.num_block_inputs_received += len(input.blocks)
         self.num_row_inputs_received += input.num_rows() or 0
         self.bytes_inputs_received += input.size_bytes()
 

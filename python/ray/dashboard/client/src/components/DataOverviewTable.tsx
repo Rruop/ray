@@ -39,7 +39,14 @@ const columns = [
     ),
     align: "center",
   },
-  { label: "Rows Outputted" },
+  {
+    label: "Rows Input",
+    helpInfo: <Typography>Rows inputted by input operator.</Typography>,
+  },
+  {
+    label: "Blocks Input",
+    helpInfo: <Typography>Total blocks inputted by operator.</Typography>,
+  },
   {
     label: "Queued Blocks",
     helpInfo: (
@@ -47,6 +54,10 @@ const columns = [
         Number of blocks waiting in an input queue to be processed.
       </Typography>
     ),
+  },
+  {
+    label: "Rows Outputted",
+    helpInfo: <Typography>Rows outputted by output operator.</Typography>,
   },
   {
     label: "Memory Usage (current / max)",
@@ -235,6 +246,9 @@ const DataRow = ({
           0
         )}
       </TableCell>
+      <TableCell align="right">{data.input_rows}</TableCell>
+      <TableCell align="right">{data.input_blocks}</TableCell>
+      <TableCell align="right">{data.queued_blocks}</TableCell>
       <TableCell align="right">{data.output_rows}</TableCell>
       <TableCell align="right">
         {isOperatorRow ? operatorMetrics.queued_blocks : ""}

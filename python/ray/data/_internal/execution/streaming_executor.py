@@ -730,7 +730,12 @@ class StreamingExecutor(Executor, threading.Thread):
         for i, (op, op_state) in enumerate(self._topology.items()):
             op_id = self._get_operator_id(op, i)
             op_errored_blocks = op.metrics.num_errored_blocks
-            op_output_rows = op.metrics.row_outputs_taken
+            # InputDataBuffer doesn't run tasks, so rows_task_outputs_generated
+            # is always 0. Use row_outputs_taken instead.
+            if isinstance(op, InputDataBuffer):
+                op_output_rows = op.metrics.row_outputs_taken
+            else:
+                op_output_rows = op.metrics.rows_task_outputs_generated
             op_info = {
                 "name": op.name,
                 "progress": op_state.num_completed_tasks,
@@ -739,6 +744,8 @@ class StreamingExecutor(Executor, threading.Thread):
                 "queued_blocks": op_state.total_enqueued_input_blocks(),
                 "num_errored_blocks": op_errored_blocks,
                 "output_rows": op_output_rows,
+                "input_rows": op.metrics.num_row_inputs_received,
+                "input_blocks": op.metrics.num_block_inputs_received,
                 "state": DatasetState.FINISHED.name
                 if op.has_execution_finished()
                 else state,
@@ -771,7 +778,10 @@ class StreamingExecutor(Executor, threading.Thread):
             "progress": last_state.num_completed_tasks,
             "total": last_op.num_outputs_total(),
             "total_rows": last_op.num_output_rows_total(),
-            "output_rows": last_op.metrics.row_outputs_taken,
+            "output_rows": last_op.metrics.rows_task_outputs_generated,
+            "input_rows": last_op.metrics.num_row_inputs_received,
+            "input_blocks": last_op.metrics.num_block_inputs_received,
+            "queued_blocks": last_state.total_enqueued_input_blocks(),
             "num_errored_blocks": self._num_errored_blocks,
             "end_time": time.time()
             if state in (DatasetState.FINISHED.name, DatasetState.FAILED.name)
