@@ -37,8 +37,14 @@ PATH="/opt/python/${PYTHON}/bin:$PATH" RAY_INSTALL_JAVA=0 \
 "/opt/python/${PYTHON}/bin/python" -m pip wheel -v -w dist . --no-deps
 
 
-if [[ "${RAY_DISABLE_EXTRA_CPP:-}" != 1 ]]; then
-  # build ray-cpp wheel
+# RAY_INSTALL_EXTRA_CPP: 1=build ray-cpp wheel, 0=skip (default)
+# Backward compatibility: RAY_DISABLE_EXTRA_CPP=1 is equivalent to RAY_INSTALL_EXTRA_CPP=0
+RAY_INSTALL_EXTRA_CPP="${RAY_INSTALL_EXTRA_CPP:-0}"
+if [[ "${RAY_DISABLE_EXTRA_CPP:-0}" == "1" ]]; then
+  RAY_INSTALL_EXTRA_CPP=0
+fi
+
+if [[ "$RAY_INSTALL_EXTRA_CPP" == "1" ]]; then
   PATH="/opt/python/${PYTHON}/bin:$PATH" RAY_INSTALL_JAVA=0 \
   RAY_INSTALL_CPP=1 "/opt/python/${PYTHON}/bin/python" -m pip wheel -v -w dist . --no-deps
 fi
@@ -54,4 +60,16 @@ for path in dist/*.whl; do
   fi
 done
 mv dist/*.whl ../.whl/
-csc sync ../.whl luoyang/ray
+
+# Upload wheel to CSC storage.
+# RAY_CSC_CUSTOM_PATH: custom upload path (takes priority if set)
+# RAY_RELEASE: 0=test environment (default), 1=release environment
+if [[ -n "${RAY_CSC_CUSTOM_PATH:-}" ]]; then
+  CSC_DEST="$RAY_CSC_CUSTOM_PATH"
+elif [[ "${RAY_RELEASE:-0}" == "1" ]]; then
+  CSC_DEST="luoyang/ray-release"
+else
+  CSC_DEST="luoyang/ray-test"
+fi
+
+csc sync ../.whl "$CSC_DEST"
