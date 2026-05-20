@@ -396,12 +396,19 @@ void NormalTaskSubmitter::RequestNewWorkerIfNeeded(const SchedulingKey &scheduli
                 RequestNewWorkerIfNeeded(scheduling_key);
               }
             } else if (reply.rejected()) {
-              RAY_LOG(DEBUG) << "Lease rejected " << lease_id;
               // It might happen when the first raylet has a stale view
               // of the spillback raylet resources.
               // Retry the request at the first raylet since the resource view may be
               // refreshed.
               RAY_CHECK(is_spillback);
+              sched_entry.spillback_retry_count++;
+              RAY_LOG_EVERY_MS(INFO, 10 * 1000)
+                  << "Lease rejected (id: " << lease_id
+                  << " name: " << function_or_actor_name << ") target_node_id: "
+                  << NodeID::FromBinary(raylet_address.node_id())
+                  << " target_ip: " << raylet_address.ip_address()
+                  << ". spillback_retry_count: " << sched_entry.spillback_retry_count
+                  << ". Retrying on local node.";
               RequestNewWorkerIfNeeded(scheduling_key);
             } else if (!reply.worker_address().node_id().empty()) {
               // We got a lease for a worker. Add the lease client state and try to
@@ -415,6 +422,7 @@ void NormalTaskSubmitter::RequestNewWorkerIfNeeded(const SchedulingKey &scheduli
                                    reply.resource_mapping(),
                                    scheduling_key,
                                    lease_id);
+              sched_entry.spillback_retry_count = 0;
               RAY_CHECK(sched_entry.active_workers.size() >= 1);
               OnWorkerIdle(reply.worker_address(),
                            scheduling_key,
@@ -425,12 +433,13 @@ void NormalTaskSubmitter::RequestNewWorkerIfNeeded(const SchedulingKey &scheduli
             } else {
               // The raylet redirected us to a different raylet to retry at.
               RAY_CHECK(!is_spillback);
-              RAY_LOG(DEBUG) << "Redirect lease " << lease_id << " from raylet "
-                             << NodeID::FromBinary(raylet_address.node_id())
-                             << " to raylet "
-                             << NodeID::FromBinary(
-                                    reply.retry_at_raylet_address().node_id())
-                             << " for " << function_or_actor_name;
+              RAY_LOG_EVERY_MS(INFO, 10 * 1000)
+                  << "Spillback: redirect lease " << lease_id << " from local raylet "
+                  << NodeID::FromBinary(raylet_address.node_id()) << " to remote raylet "
+                  << NodeID::FromBinary(
+                         reply.retry_at_raylet_address().node_id())
+                  << " (ip: " << reply.retry_at_raylet_address().ip_address() << ")"
+                  << " for " << function_or_actor_name;
 
               RequestNewWorkerIfNeeded(scheduling_key, &reply.retry_at_raylet_address());
             }
@@ -438,14 +447,27 @@ void NormalTaskSubmitter::RequestNewWorkerIfNeeded(const SchedulingKey &scheduli
             // A lease request to a remote raylet failed. Retry locally if the lease is
             // still needed.
             // TODO(swang): Fail after some number of retries?
-            RAY_LOG_EVERY_MS(INFO, 30 * 1000)
-                << "Retrying attempt to schedule lease (id: " << lease_id
-                << " name: " << function_or_actor_name
-                << ") at remote node (id: " << raylet_address.node_id()
-                << " ip: " << raylet_address.ip_address()
-                << "). Try again "
-                   "on a local node. Error: "
-                << status.ToString();
+            sched_entry.spillback_retry_count++;
+            const char *failure_reason;
+            if (!status.IsTimedOut()) {
+              failure_reason = "rpc_error";
+            } else if (status.ToString().find("waiting for") != std::string::npos) {
+              failure_reason = "connection_failed";
+            } else {
+              failure_reason = "grpc_deadline_exceeded";
+            }
+            RAY_LOG(WARNING) << "Remote lease failed (id: " << lease_id
+                             << " name: " << function_or_actor_name
+                             << ") target_node_id: "
+                             << NodeID::FromBinary(raylet_address.node_id())
+                             << " target_ip: " << raylet_address.ip_address()
+                             << ". Retrying on local node."
+                             << " reason: " << failure_reason
+                             << " spillback_retry_count: "
+                             << sched_entry.spillback_retry_count
+                             << " timeout_config_ms: "
+                             << RayConfig::instance().worker_lease_timeout_ms()
+                             << " error: " << status.ToString();
 
             RequestNewWorkerIfNeeded(scheduling_key);
           } else {

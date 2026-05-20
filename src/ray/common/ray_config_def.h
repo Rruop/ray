@@ -1028,6 +1028,15 @@ RAY_CONFIG(uint32_t, raylet_rpc_server_reconnect_timeout_base_s, 1)
 /// Maximum timeout for raylet grpc server reconnection.
 RAY_CONFIG(uint32_t, raylet_rpc_server_reconnect_timeout_max_s, 60)
 
+/// Timeout in milliseconds for RequestWorkerLease RPC to a remote raylet.
+/// Only applied to spillback (remote) lease requests; local lease requests use
+/// infinite timeout (-1) since the local raylet is expected to always respond.
+/// When a spillback lease request to a dead node times out, the task will be
+/// rescheduled locally via the NormalTaskSubmitter retry path.
+/// This prevents permanent scheduling deadlocks caused by infinite gRPC retries
+/// to dead nodes. Set to -1 to disable (infinite timeout, original behavior).
+RAY_CONFIG(int64_t, worker_lease_timeout_ms, 600000)
+
 // The number of grpc threads spun up on the worker process. This config is consumed
 // by the raylet and then broadcast to the worker process at time of the worker
 // process getting spawned.  Setting to zero or less maintains the default

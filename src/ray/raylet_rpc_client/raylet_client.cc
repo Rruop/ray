@@ -67,7 +67,10 @@ void RayletClient::RequestWorkerLease(
                             request,
                             callback,
                             grpc_client_,
-                            /*method_timeout_ms*/ -1);
+                            /*method_timeout_ms*/
+                            grant_or_reject
+                                ? RayConfig::instance().worker_lease_timeout_ms()
+                                : -1);
 }
 
 void RayletClient::PrestartWorkers(

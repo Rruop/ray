@@ -320,6 +320,9 @@ class NormalTaskSubmitter {
     // Keep track of how many workers have tasks to do.
     uint32_t num_busy_workers = 0;
     int64_t last_reported_backlog_size = 0;
+    // Number of consecutive spillback retries (remote lease failed → retry locally).
+    // Reset to 0 when a worker is successfully granted.
+    uint32_t spillback_retry_count = 0;
 
     // Check whether it's safe to delete this SchedulingKeyEntry from the
     // scheduling_key_entries_ hashmap.
