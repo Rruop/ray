@@ -970,6 +970,13 @@ class ListApiResponse:
     partial_failure_warning: Optional[str] = ""
     # A list of warnings to print.
     warnings: Optional[List[str]] = None
+    # State counts for ALL entries in GCS buffer, including entries without
+    # task_info that are invisible to normal queries. Only set for task queries.
+    total_state_counts: Optional[Dict[str, int]] = None
+    # Total entries stored in GCS buffer for this query's candidate set.
+    num_total_stored: Optional[int] = None
+    # Number of entries filtered on GCS side (missing task_info + user filters).
+    num_filtered_on_gcs: Optional[int] = None
 
 
 """
@@ -1543,6 +1550,10 @@ class SummaryApiResponse:
     partial_failure_warning: Optional[str] = ""
     # A list of warnings to print.
     warnings: Optional[List[str]] = None
+    total_state_counts: Optional[Dict[str, int]] = None
+    # Passthrough from ListApiResponse; see ListApiResponse for documentation.
+    num_total_stored: Optional[int] = None
+    num_filtered_on_gcs: Optional[int] = None
 
 
 def resource_to_schema(resource: StateResource) -> StateSchema:

@@ -873,6 +873,10 @@ message GetTaskEventsReply {
   int64 num_filtered_on_gcs = 6;
   // Number of task events truncated due to the limit.
   int64 num_truncated = 7;
+  // State counts for ALL entries in the candidate set, including entries
+  // without task_info that are normally filtered from query results.
+  // Key is TaskStatus enum name (e.g. "RUNNING", "FINISHED"), value is count.
+  map<string, int64> total_state_counts = 8;
 }
 
 // Service for task info access.

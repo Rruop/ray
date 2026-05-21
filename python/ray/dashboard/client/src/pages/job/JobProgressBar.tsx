@@ -38,6 +38,7 @@ export const JobProgressBar = ({
     isLoading: progressLoading,
     driverExists,
     totalTasks,
+    totalStateCounts,
     latestFetchTimestamp: progressTimestamp,
   } = useJobProgress(jobId, advancedProgressBarExpanded);
   const {
@@ -84,6 +85,7 @@ export const JobProgressBar = ({
         onClick={() =>
           setAdvancedProgressBarExpanded(!advancedProgressBarExpanded)
         }
+        totalStateCounts={totalStateCounts}
         controls={
           <FormControlLabel
             control={

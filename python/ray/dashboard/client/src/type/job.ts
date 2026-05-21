@@ -142,6 +142,9 @@ export type StateApiJobProgressByTaskNameRsp = {
       result: StateApiJobProgressByTaskName;
       num_filtered: number;
       total: number;
+      total_state_counts?: { [stateName: string]: number };
+      num_total_stored?: number;
+      num_filtered_on_gcs?: number;
     };
   };
   msg: string;

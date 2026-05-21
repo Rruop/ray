@@ -339,6 +339,11 @@ class StateAPIManager:
                 total=num_total,
                 num_after_truncation=num_after_truncation,
                 num_filtered=num_filtered,
+                total_state_counts=dict(reply.total_state_counts)
+                if reply.total_state_counts
+                else None,
+                num_total_stored=reply.num_total_stored,
+                num_filtered_on_gcs=reply.num_filtered_on_gcs,
             )
 
         # In the error case
@@ -615,6 +620,9 @@ class StateAPIManager:
             warnings=warnings,
             num_after_truncation=result.num_after_truncation,
             num_filtered=result.num_filtered,
+            total_state_counts=result.total_state_counts,
+            num_total_stored=result.num_total_stored,
+            num_filtered_on_gcs=result.num_filtered_on_gcs,
         )
 
     async def summarize_actors(self, option: SummaryApiOptions) -> SummaryApiResponse:

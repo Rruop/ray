@@ -423,6 +423,22 @@ bool apply_predicate_ignore_case(std::string_view lhs,
 
 }  // namespace
 
+// Returns the latest (highest-numbered) TaskStatus for a task event,
+// or NIL if no state_updates are present.
+ray::rpc::TaskStatus GetLatestTaskStatus(const rpc::TaskEvents &task_event) {
+  if (!task_event.has_state_updates()) {
+    return ray::rpc::TaskStatus::NIL;
+  }
+  const auto *descriptor = ray::rpc::TaskStatus_descriptor();
+  for (int i = descriptor->value_count() - 1; i >= 0; --i) {
+    if (task_event.state_updates().state_ts_ns().contains(
+            descriptor->value(i)->number())) {
+      return static_cast<ray::rpc::TaskStatus>(descriptor->value(i)->number());
+    }
+  }
+  return ray::rpc::TaskStatus::NIL;
+}
+
 void GcsTaskManager::HandleGetTaskEvents(rpc::GetTaskEventsRequest request,
                                          rpc::GetTaskEventsReply *reply,
                                          rpc::SendReplyCallback send_reply_callback) {
@@ -553,18 +569,7 @@ void GcsTaskManager::HandleGetTaskEvents(rpc::GetTaskEventsRequest request,
       const google::protobuf::EnumDescriptor *task_status_descriptor =
           ray::rpc::TaskStatus_descriptor();
 
-      // Figure out the latest state of a task.
-      ray::rpc::TaskStatus state = ray::rpc::TaskStatus::NIL;
-      if (task_event.has_state_updates()) {
-        for (int i = task_status_descriptor->value_count() - 1; i >= 0; --i) {
-          if (task_event.state_updates().state_ts_ns().contains(
-                  task_status_descriptor->value(i)->number())) {
-            state = static_cast<ray::rpc::TaskStatus>(
-                task_status_descriptor->value(i)->number());
-            break;
-          }
-        }
-      }
+      ray::rpc::TaskStatus state = GetLatestTaskStatus(task_event);
 
       if (!std::all_of(filters.state_filters().begin(),
                        filters.state_filters().end(),
@@ -582,9 +587,17 @@ void GcsTaskManager::HandleGetTaskEvents(rpc::GetTaskEventsRequest request,
   };
 
   int64_t num_filtered = 0;
+  absl::flat_hash_map<std::string, int64_t> total_state_counts;
   Status status = Status::OK();
   try {
     for (auto &task_event : *task_events | boost::adaptors::reversed) {
+      // Count state for all entries that have state_updates,
+      // including those without task_info that are filtered from results.
+      if (task_event.has_state_updates()) {
+        auto latest_state = GetLatestTaskStatus(task_event);
+        total_state_counts[ray::rpc::TaskStatus_Name(latest_state)]++;
+      }
+
       if (!filter_fn(task_event)) {
         num_filtered++;
         continue;
@@ -611,6 +624,9 @@ void GcsTaskManager::HandleGetTaskEvents(rpc::GetTaskEventsRequest request,
     reply->set_num_total_stored(task_events->size());
     reply->set_num_truncated(num_limit_truncated);
     reply->set_num_filtered_on_gcs(num_filtered);
+    for (const auto &[state_name, state_count] : total_state_counts) {
+      (*reply->mutable_total_state_counts())[state_name] = state_count;
+    }
   } catch (std::invalid_argument &e) {
     // When encounter invalid filter predicate
     status = Status::InvalidArgument(e.what());

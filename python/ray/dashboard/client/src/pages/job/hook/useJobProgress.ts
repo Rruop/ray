@@ -78,7 +78,12 @@ const useFetchStateApiProgressByTaskName = (
         const summary = formatSummaryToTaskProgress(
           rsp.data.data.result.result,
         );
-        return { summary, totalTasks: rsp.data.data.result.num_filtered };
+        const totalStateCounts = rsp.data.data.result.total_state_counts;
+        return {
+          summary,
+          totalTasks: rsp.data.data.result.num_filtered,
+          totalStateCounts,
+        };
       } else {
         setError(true);
         setRefresh(false);
@@ -130,6 +135,7 @@ export const useJobProgress = (
   return {
     progress: summed,
     totalTasks: data?.totalTasks,
+    totalStateCounts: data?.totalStateCounts,
     isLoading,
     msg,
     error,
