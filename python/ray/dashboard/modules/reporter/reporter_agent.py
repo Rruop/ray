@@ -450,7 +450,7 @@ class ReporterAgent(
         self._log_dir = dashboard_agent.log_dir
         self._is_head_node = dashboard_agent.is_head
         self._hostname = socket.gethostname()
-        self._pod_name = os.environ.get("RAY_CLOUD_INSTANCE_ID") or ""
+        self._pod_name = os.environ.get("RAY_CLOUD_INSTANCE_ID") or os.environ.get("MY_POD_NAME") or os.environ.get("MY_NAME") or ""
         # (pid, created_time) -> psutil.Process
         self._workers = {}
         # psutil.Process of the parent.
