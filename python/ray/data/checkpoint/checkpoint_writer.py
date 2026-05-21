@@ -196,6 +196,14 @@ class BatchBasedCheckpointWriter(CheckpointWriter):
                     import pyarrow.compute as pc
                     import pyarrow as pa
                     col = checkpoint_ids_table.column(0)
+                    # `pa.string()` uses int32 offsets so a single Array is
+                    # capped at 2 GB of payload; `pc.unique` materialises its
+                    # result as one Array and raises ArrowCapacityError above
+                    # that limit. Casting to `pa.large_string()` (int64
+                    # offsets) lifts the cap. The cast is zero-copy when
+                    # offsets fit in int32 and otherwise stays correct.
+                    if pa.types.is_string(col.type):
+                        col = col.cast(pa.large_string())
                     unique_col = pc.unique(col)
                     dedup_table = pa.table([unique_col], names=[self.id_col])
                     pq.write_table(

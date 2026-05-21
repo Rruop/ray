@@ -1228,6 +1228,46 @@ def test_write_block_checkpoint_with_pandas_df(restore_data_context, tmp_path):
     assert written_ids == expected_ids
 
 
+def test_write_block_checkpoint_dedup_string_column(
+    restore_data_context, tmp_path
+):
+    """``need_deduplication`` must work on ``pa.string()`` id columns
+    without hitting PyArrow's 2 GB single-array limit.
+
+    Regression test: ``pc.unique`` materialises its result as a single
+    Array. When the input column type is ``pa.string()`` (int32 offsets,
+    2 GB cap), an input whose total payload exceeds that cap would crash
+    with ``ArrowCapacityError``. ``BatchBasedCheckpointWriter`` casts
+    string columns to ``pa.large_string()`` (int64 offsets) before
+    dedup, lifting the cap. We exercise the cast on a small input so it
+    runs in CI; the cast path is what we care about, not the absolute
+    size.
+    """
+    ctx = ray.data.DataContext.get_current()
+
+    ctx.checkpoint_config = CheckpointConfig(
+        ID_COL,
+        str(tmp_path),
+        need_deduplication=True,
+    )
+
+    table = pa.table(
+        {
+            ID_COL: pa.array(["a", "b", "a", "c", "b"], type=pa.string()),
+        }
+    )
+    assert pa.types.is_string(table.column(ID_COL).type)
+
+    checkpoint_writer = BatchBasedCheckpointWriter(ctx.checkpoint_config)
+    checkpoint_writer.write_block_checkpoint(BlockAccessor.for_block(table))
+
+    assert len(os.listdir(tmp_path)) == 1
+    out = pa.parquet.read_table(tmp_path / os.listdir(tmp_path)[0])
+    written = sorted(out[ID_COL].to_pylist())
+    assert written == ["a", "b", "c"]
+    assert pa.types.is_large_string(out.column(ID_COL).type)
+
+
 def test_filter_rows_for_block():
     """Test BatchBasedCheckpointFilter.filter_rows_for_block."""
 
