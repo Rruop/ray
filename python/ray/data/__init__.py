@@ -82,6 +82,14 @@ _map_actor_context = None
 
 configure_logging()
 
+# Optional opt-in: apply the speculative-execution watchdog monkey-patch when
+# RAY_DATA_SPECULATION_ENABLED=1 is set. No-op otherwise.
+# See ray.data._internal.execution.watchdog_block_patch for details.
+from ray.data._internal.execution import watchdog_block_patch as _watchdog_block_patch
+
+_watchdog_block_patch._maybe_apply_on_import()
+del _watchdog_block_patch
+
 try:
     import pyarrow as pa
 
