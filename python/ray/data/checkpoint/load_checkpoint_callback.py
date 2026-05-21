@@ -10,6 +10,7 @@ from ray.data._internal.execution.execution_callback import (
 from ray.data._internal.execution.streaming_executor import StreamingExecutor
 from ray.data.block import Block
 from ray.data.checkpoint import CheckpointConfig
+from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
 from ray.data.checkpoint.checkpoint_filter import BatchBasedCheckpointFilter
 from ray.types import ObjectRef
 
@@ -32,6 +33,7 @@ class LoadCheckpointCallback(ExecutionCallback):
 
         self._ckpt_filter = self._create_checkpoint_filter(config)
         self._checkpoint_ref: Optional[ObjectRef[Block]] = None
+        self._bloom_filter_ref: Optional[ObjectRef[BloomFilterCheckpoint]] = None
 
     def _create_checkpoint_filter(
         self, config: CheckpointConfig
@@ -52,8 +54,16 @@ class LoadCheckpointCallback(ExecutionCallback):
     def before_execution_starts(self, executor: StreamingExecutor):
         assert self._config is executor._data_context.checkpoint_config
 
-        # Load checkpoint data before execution starts.
-        self._checkpoint_ref = self._load_checkpoint_data()
+        # Bloom filter is built once on a worker (returns ObjectRef[BloomFilterCheckpoint])
+        # and broadcast to every map task via task kwargs. The default and
+        # roaring-bitmap paths instead carry the raw checkpoint id table.
+        # Redis-backed checkpoints take precedence regardless of use_bloom_filter:
+        # the worker-side dispatch in util.py short-circuits to Redis and never
+        # reads the bloom kwarg.
+        if self._config.use_bloom_filter and not self._config.redis_checkpoint_key:
+            self._bloom_filter_ref = self._ckpt_filter.load_bloom_filter()
+        else:
+            self._checkpoint_ref = self._load_checkpoint_data()
 
     def after_execution_succeeds(self, executor: StreamingExecutor):
         assert self._config is executor._data_context.checkpoint_config
@@ -71,3 +81,14 @@ class LoadCheckpointCallback(ExecutionCallback):
     def load_checkpoint(self) -> ObjectRef[Block]:
         #assert self._checkpoint_ref is not None
         return self._checkpoint_ref
+
+    def load_bloom_filter(self) -> Optional[ObjectRef[BloomFilterCheckpoint]]:
+        """Return the ObjectRef of the shared, pre-built bloom filter.
+
+        Set once in :py:meth:`before_execution_starts` when the
+        :class:`CheckpointConfig` has ``use_bloom_filter=True``; ``None``
+        otherwise. The returned ``ObjectRef`` is injected into every map
+        task's kwargs so that all workers share a single physical copy of
+        the bloom filter through the Ray object store.
+        """
+        return self._bloom_filter_ref

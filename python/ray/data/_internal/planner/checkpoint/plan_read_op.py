@@ -10,6 +10,7 @@ from ray.data._internal.logical.operators import Read
 from ray.data._internal.output_buffer import OutputBlockSizeOption
 from ray.data._internal.planner.plan_read_op import plan_read_op
 from ray.data.checkpoint.util import (
+    BLOOM_FILTER_KWARG_NAME,
     CHECKPOINTED_IDS_KWARG_NAME,
     filter_checkpointed_rows_for_blocks,
 )
@@ -21,6 +22,7 @@ def plan_read_op_with_checkpoint_filter(
     physical_children: List[PhysicalOperator],
     data_context: DataContext,
     load_checkpoint: Optional[Callable[[], ObjectRef]] = None,
+    load_bloom_filter: Optional[Callable[[], Optional[ObjectRef]]] = None,
 ) -> PhysicalOperator:
     physical_op = plan_read_op(op, physical_children, data_context)
 
@@ -39,9 +41,21 @@ def plan_read_op_with_checkpoint_filter(
         ]
     )
 
-    if load_checkpoint is not None:
+    cc = data_context.checkpoint_config
+    use_bloom = (
+        load_bloom_filter is not None
+        and cc is not None
+        and cc.use_bloom_filter
+        and not cc.redis_checkpoint_key
+    )
+    if use_bloom:
+        physical_op.add_map_task_kwargs_fn(
+            lambda: {BLOOM_FILTER_KWARG_NAME: load_bloom_filter()}
+        )
+    elif load_checkpoint is not None:
         physical_op.add_map_task_kwargs_fn(
             lambda: {CHECKPOINTED_IDS_KWARG_NAME: load_checkpoint()}
         )
 
     return physical_op
+

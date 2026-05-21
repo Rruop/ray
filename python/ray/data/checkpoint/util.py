@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 # Checkpoint keyword argument name
 CHECKPOINTED_IDS_KWARG_NAME = "checkpointed_ids"
+BLOOM_FILTER_KWARG_NAME = "bloom_filter"
 
 
 class PrefixTrie:
@@ -69,25 +70,34 @@ def filter_checkpointed_rows_for_blocks(
     )
 
     ckpt_filter = BatchBasedCheckpointFilter(checkpoint_config)
-    checkpointed_ids = task_context.kwargs[CHECKPOINTED_IDS_KWARG_NAME]
     redis_checkpoint_key = ckpt_filter.redis_checkpoint_key
     use_roaring_bitmap = ckpt_filter.use_roaring_bitmap
+    use_bloom_filter = ckpt_filter.use_bloom_filter and not redis_checkpoint_key
+
+    if use_bloom_filter:
+        bloom = task_context.kwargs[BLOOM_FILTER_KWARG_NAME]
+        checkpointed_ids = None
+    else:
+        bloom = None
+        checkpointed_ids = task_context.kwargs.get(CHECKPOINTED_IDS_KWARG_NAME)
+
     def filter_fn(block: Block) -> Block:
-        if not redis_checkpoint_key :
-            if not use_roaring_bitmap:
-                return ckpt_filter.filter_rows_for_block(
-                    block=block,
-                    checkpointed_ids=checkpointed_ids,
-                )
-            else:
-                return ckpt_filter.filter_rows_for_block_with_raoring_bitmap(
-                    block=block,
-                    checkpointed_ids=checkpointed_ids,
-                )
-        else:
-            return ckpt_filter.filter_block_by_redis_ckpt(
-                block=block
+        if redis_checkpoint_key:
+            return ckpt_filter.filter_block_by_redis_ckpt(block=block)
+        if use_bloom_filter:
+            return ckpt_filter.filter_rows_for_block_with_bloom_filter(
+                block=block,
+                bloom=bloom,
             )
+        if use_roaring_bitmap:
+            return ckpt_filter.filter_rows_for_block_with_raoring_bitmap(
+                block=block,
+                checkpointed_ids=checkpointed_ids,
+            )
+        return ckpt_filter.filter_rows_for_block(
+            block=block,
+            checkpointed_ids=checkpointed_ids,
+        )
 
     for block in blocks:
         filtered_block = filter_fn(block)
@@ -108,13 +118,29 @@ def filter_checkpointed_rows_for_batches(
     )
 
     ckpt_filter = BatchBasedCheckpointFilter(checkpoint_config)
-    checkpointed_ids = task_context.kwargs[CHECKPOINTED_IDS_KWARG_NAME]
 
-    def filter_fn(batch: DataBatch) -> DataBatch:
-        return ckpt_filter.filter_rows_for_batch(
-            batch=batch,
-            checkpointed_ids=checkpointed_ids,
-        )
+    use_bloom_filter = (
+        ckpt_filter.use_bloom_filter and not ckpt_filter.redis_checkpoint_key
+    )
+    if use_bloom_filter:
+        bloom = task_context.kwargs[BLOOM_FILTER_KWARG_NAME]
+
+        def filter_fn(batch: DataBatch) -> DataBatch:
+            arrow_block = BlockAccessor.batch_to_block(batch)
+            filtered = ckpt_filter.filter_rows_for_block_with_bloom_filter(
+                block=arrow_block,
+                bloom=bloom,
+            )
+            return BlockAccessor.for_block(filtered).to_batch_format(None)
+
+    else:
+        checkpointed_ids = task_context.kwargs[CHECKPOINTED_IDS_KWARG_NAME]
+
+        def filter_fn(batch: DataBatch) -> DataBatch:
+            return ckpt_filter.filter_rows_for_batch(
+                batch=batch,
+                checkpointed_ids=checkpointed_ids,
+            )
 
     for batch in batches:
         filtered_batch = filter_fn(batch)

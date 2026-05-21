@@ -199,11 +199,13 @@ class Planner:
 
             callbacks.append(checkpoint_callback)
             load_checkpoint = checkpoint_callback.load_checkpoint
+            load_bloom_filter = checkpoint_callback.load_bloom_filter
 
             # Dynamically set the plan functions for checkpointing because they
             # need to a reference to the checkpoint ref.
             self._plan_fns_for_checkpointing = self._get_plan_fns_for_checkpointing(
-                load_checkpoint
+                load_checkpoint,
+                load_bloom_filter,
             )
 
         elif checkpoint_config is not None:
@@ -312,11 +314,13 @@ class Planner:
     def _get_plan_fns_for_checkpointing(
         self,
         load_checkpoint: Callable[[], ObjectRef],
+        load_bloom_filter: Callable[[], Optional[ObjectRef]],
     ) -> Dict[Type[LogicalOperator], PlanLogicalOpFn]:
         plan_fns = {
             Read: functools.partial(
                 plan_read_op_with_checkpoint_filter,
                 load_checkpoint=load_checkpoint,
+                load_bloom_filter=load_bloom_filter,
             ),
             Write: plan_write_op_with_checkpoint_writer,
         }

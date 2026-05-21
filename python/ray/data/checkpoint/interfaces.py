@@ -67,6 +67,44 @@ class CheckpointConfig:
             completed rows.
         checkpoint_path_partition_filter: Filter for checkpoint files to load during
             restoration when reading from `checkpoint_path`.
+        use_bloom_filter: If true, use a Bloom Filter for per-block checkpoint
+            membership testing instead of the default sort + binary-search path.
+            The Bloom Filter path has zero false negatives (no row is ever
+            re-processed) and configurable false positives (a tiny number of
+            unprocessed rows may be skipped). It removes the need to sort the
+            checkpointed-id dataset, which avoids a full distributed shuffle.
+            Mutually exclusive with ``use_roaring_bitmap``.
+        bloom_filter_error_rate: Target false-positive rate of the Bloom Filter.
+            Must lie in the open interval ``(0, 1)``. Smaller values trade memory
+            for fewer over-filtered rows. Only used when
+            ``use_bloom_filter=True``. Defaults to ``1e-6``.
+
+            Approximate memory footprint of the filter, per Ray Data worker
+            node (the filter is built once and shared via the object store,
+            so all map workers on a node share a single mmap-backed copy):
+
+            ============  ================  ================
+            data size n   memory @ 1e-4     memory @ 1e-6
+            ============  ================  ================
+            1 M           2.29 MB           3.43 MB
+            10 M          22.85 MB          34.28 MB
+            100 M         228.53 MB         342.79 MB
+            500 M         1.12 GB           1.67 GB
+            1 B           2.23 GB           3.35 GB
+            5 B           11.16 GB          16.74 GB
+            ============  ================  ================
+
+            Rules of thumb: ``1e-4`` uses ~2.40 bytes/item with 13 hashes;
+            ``1e-6`` uses ~3.59 bytes/item with 20 hashes. Choose ``1e-4``
+            when over-filtering a few rows out of 10,000 is acceptable
+            (typical for idempotent downstream operators) and memory is the
+            scarcer resource; choose ``1e-6`` or smaller when even rare
+            duplicate-skip is costly (e.g. non-idempotent side effects).
+
+        Note: Only one of `post_checkpoint_filter_expr` or `post_checkpoint_filter_fn` can be set.
+        When set, data will be checkpointed first, then filtered before writing to the
+        final destination. This ensures filtered data is also recorded in checkpoint
+        and won't be reprocessed on restart.
     """
 
     DEFAULT_CHECKPOINT_PATH_BUCKET_ENV_VAR = "RAY_DATA_CHECKPOINT_PATH_BUCKET"
@@ -91,6 +129,8 @@ class CheckpointConfig:
         redis_checkpoint_pipeline_batch_size: Optional[int] = 1000,
         redis_data_storage_as_roaring_bitmap: bool = True,
         use_roaring_bitmap: bool = False,
+        use_bloom_filter: bool = False,
+        bloom_filter_error_rate: float = 1e-6,
         need_deduplication: bool = False,
         write_checkpoint_retry_number: Optional[int] = 10,
     ):
@@ -131,9 +171,22 @@ class CheckpointConfig:
         self.redis_checkpoint_pipeline_batch_size = redis_checkpoint_pipeline_batch_size
         self.redis_data_storage_as_roaring_bitmap = redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap: bool = use_roaring_bitmap
+        self.use_bloom_filter: bool = use_bloom_filter
+        self.bloom_filter_error_rate: float = bloom_filter_error_rate
         self.write_checkpoint_retry_number = write_checkpoint_retry_number
         self.need_deduplication = need_deduplication
 
+
+        if use_bloom_filter and use_roaring_bitmap:
+            raise InvalidCheckpointingConfig(
+                "`use_bloom_filter` and `use_roaring_bitmap` are mutually exclusive; "
+                "set at most one of them."
+            )
+        if not 0.0 < bloom_filter_error_rate < 1.0:
+            raise InvalidCheckpointingConfig(
+                "`bloom_filter_error_rate` must be in the open interval (0, 1), "
+                f"got {bloom_filter_error_rate!r}."
+            )
 
     def _get_default_checkpoint_path(self) -> str:
         artifact_storage = os.environ.get(self.DEFAULT_CHECKPOINT_PATH_BUCKET_ENV_VAR)

@@ -1270,6 +1270,231 @@ def test_filter_rows_for_block():
     assert filtered_block.equals(expected_block)
 
 
+def test_bloom_filter_checkpoint_basic():
+    """Construction, membership and false-negative guarantees of BloomFilterCheckpoint."""
+    import numpy as np
+
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    ids = np.arange(1000, dtype=np.uint64)
+    bf = BloomFilterCheckpoint(ids, error_rate=1e-6)
+
+    assert len(bf) == 1000
+    assert bf.num_bits >= 1000
+    assert bf.num_hashes >= 1
+
+    membership = bf.contains_many(ids)
+    assert membership.dtype == bool
+    assert membership.all(), "Bloom filter must have zero false negatives"
+
+    out_of_set = np.arange(10_000, 11_000, dtype=np.uint64)
+    fp_rate = bf.contains_many(out_of_set).mean()
+    assert fp_rate < 0.05, (
+        f"Empirical FPR for an unrelated 1k sample was {fp_rate:.4f}, "
+        "which is far above the design target."
+    )
+
+
+def test_bloom_filter_checkpoint_empty():
+    """Empty input should produce an empty filter with no false positives."""
+    import numpy as np
+
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    bf = BloomFilterCheckpoint(np.empty(0, dtype=np.uint64))
+    assert len(bf) == 0
+
+    probe = np.array([1, 2, 3], dtype=np.uint64)
+    assert not bf.contains_many(probe).any()
+
+
+def test_bloom_filter_checkpoint_from_string_table():
+    """String id columns are hashed to uint64 before insertion."""
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    table = pyarrow.table({ID_COL: [f"row-{i}" for i in range(500)]})
+    bf = BloomFilterCheckpoint.from_pyarrow_table(table, ID_COL, error_rate=1e-6)
+
+    same = pyarrow.table({ID_COL: [f"row-{i}" for i in range(500)]})
+    from ray.data.checkpoint.bloom_filter import _hash_id_column_to_uint64
+
+    assert bf.contains_many(_hash_id_column_to_uint64(same, ID_COL)).all()
+
+
+def test_bloom_filter_checkpoint_invalid_error_rate():
+    """``error_rate`` must lie strictly in (0, 1)."""
+    import numpy as np
+
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    ids = np.arange(8, dtype=np.uint64)
+    with pytest.raises(ValueError):
+        BloomFilterCheckpoint(ids, error_rate=0.0)
+    with pytest.raises(ValueError):
+        BloomFilterCheckpoint(ids, error_rate=1.0)
+
+
+def test_bloom_filter_handles_multi_chunk_string_column():
+    """``_hash_id_column_to_uint64`` must process chunked arrays without
+    calling ``combine_chunks`` so it works on string tables larger than
+    PyArrow's 2 GB single-array limit."""
+    from ray.data.checkpoint.bloom_filter import _hash_id_column_to_uint64
+
+    chunks = [
+        pyarrow.array([f"row-{i}" for i in range(j * 100, (j + 1) * 100)])
+        for j in range(5)
+    ]
+    chunked = pyarrow.chunked_array(chunks)
+    assert chunked.num_chunks == 5
+    table = pyarrow.table({ID_COL: chunked})
+
+    result = _hash_id_column_to_uint64(table, ID_COL)
+    assert result.size == 500
+    assert len(set(result.tolist())) == 500
+
+
+def test_bloom_filter_rejects_null_across_chunks():
+    """NULL detection must work for chunked input as well as single arrays."""
+    from ray.data.checkpoint.bloom_filter import _hash_id_column_to_uint64
+
+    chunks = [
+        pyarrow.array(["a", "b"]),
+        pyarrow.array(["c", None, "d"]),
+    ]
+    table = pyarrow.table({ID_COL: pyarrow.chunked_array(chunks)})
+    with pytest.raises(ValueError, match="NULL"):
+        _hash_id_column_to_uint64(table, ID_COL)
+
+
+def test_filter_rows_for_block_with_bloom_filter():
+    """``BatchBasedCheckpointFilter`` filters rows using a pre-built bloom filter.
+
+    The new architecture builds the bloom filter once via
+    ``build_bloom_filter_remote`` and broadcasts it through the object store.
+    The filter method therefore takes a :class:`BloomFilterCheckpoint`, not a
+    raw checkpoint id table.
+    """
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    config = CheckpointConfig(
+        id_column=ID_COL,
+        checkpoint_path="/mock/path",
+        use_bloom_filter=True,
+    )
+
+    block = pyarrow.table(
+        {
+            ID_COL: list(range(10)),
+            "data": [str(i) for i in range(10)],
+        }
+    )
+    chunk1 = pyarrow.table({ID_COL: [1, 2, 4]})
+    chunk2 = pyarrow.table({ID_COL: [6, 8, 9, 11]})
+    chunk3 = pyarrow.table({ID_COL: [12, 13]})
+    checkpointed_ids = pyarrow.concat_tables([chunk1, chunk2, chunk3])
+    bloom = BloomFilterCheckpoint.from_pyarrow_table(checkpointed_ids, ID_COL)
+
+    expected_block = pyarrow.table(
+        {
+            ID_COL: [0, 3, 5, 7],
+            "data": ["0", "3", "5", "7"],
+        }
+    )
+
+    filter_instance = BatchBasedCheckpointFilter(config)
+    filtered_block = filter_instance.filter_rows_for_block_with_bloom_filter(
+        block=block,
+        bloom=bloom,
+    )
+
+    assert filtered_block.equals(expected_block)
+
+
+def test_filter_rows_for_block_with_bloom_filter_string_ids():
+    """Bloom Filter path works on string id columns."""
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    config = CheckpointConfig(
+        id_column=ID_COL,
+        checkpoint_path="/mock/path/strings",
+        use_bloom_filter=True,
+    )
+
+    block = pyarrow.table(
+        {
+            ID_COL: [f"row-{i}" for i in range(10)],
+            "data": [str(i) for i in range(10)],
+        }
+    )
+    checkpointed_ids = pyarrow.table(
+        {ID_COL: [f"row-{i}" for i in (1, 2, 4, 6, 8, 9)]}
+    )
+    bloom = BloomFilterCheckpoint.from_pyarrow_table(checkpointed_ids, ID_COL)
+
+    expected_block = pyarrow.table(
+        {
+            ID_COL: ["row-0", "row-3", "row-5", "row-7"],
+            "data": ["0", "3", "5", "7"],
+        }
+    )
+
+    filter_instance = BatchBasedCheckpointFilter(config)
+    filtered_block = filter_instance.filter_rows_for_block_with_bloom_filter(
+        block=block,
+        bloom=bloom,
+    )
+
+    assert filtered_block.equals(expected_block)
+
+
+def test_bloom_filter_bits_are_immutable_after_construction():
+    """``BloomFilterCheckpoint.bits`` must be a read-only numpy array.
+
+    Immutability is the contract that lets Ray plasma share the bloom filter
+    via ``MAP_SHARED`` mmap across all workers on a node. A regression here
+    would force every worker to allocate a private heap copy on
+    deserialization.
+    """
+    import numpy as np
+
+    from ray.data.checkpoint.bloom_filter import BloomFilterCheckpoint
+
+    ids = np.arange(100, dtype=np.uint64)
+    bf = BloomFilterCheckpoint(ids)
+    assert isinstance(bf.bits, np.ndarray)
+    assert bf.bits.dtype == np.uint8
+    assert not bf.bits.flags.writeable
+    with pytest.raises(ValueError):
+        bf.bits[0] = 0xFF
+
+
+def test_checkpoint_config_rejects_bloom_and_roaring_together():
+    """``use_bloom_filter`` and ``use_roaring_bitmap`` are mutually exclusive."""
+    with pytest.raises(InvalidCheckpointingConfig):
+        CheckpointConfig(
+            id_column=ID_COL,
+            checkpoint_path="/mock/path",
+            use_bloom_filter=True,
+            use_roaring_bitmap=True,
+        )
+
+
+def test_checkpoint_config_rejects_invalid_bloom_error_rate():
+    """``bloom_filter_error_rate`` must lie strictly in (0, 1)."""
+    with pytest.raises(InvalidCheckpointingConfig):
+        CheckpointConfig(
+            id_column=ID_COL,
+            checkpoint_path="/mock/path",
+            bloom_filter_error_rate=0.0,
+        )
+    with pytest.raises(InvalidCheckpointingConfig):
+        CheckpointConfig(
+            id_column=ID_COL,
+            checkpoint_path="/mock/path",
+            bloom_filter_error_rate=1.5,
+        )
+
+
 def test_checkpoint_restore_after_full_execution(
     ray_start_10_cpus_shared,
     tmp_path,

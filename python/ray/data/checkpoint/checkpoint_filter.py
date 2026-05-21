@@ -19,6 +19,11 @@ from ray.data.checkpoint import CheckpointConfig
 from ray.data.checkpoint.checkpoint_writer import PENDING_CHECKPOINT_SUFFIX
 from ray.data.checkpoint.util import build_pending_checkpoint_trie
 from ray.data.checkpoint.bitmap64 import RoaringBitmap64
+from ray.data.checkpoint.bloom_filter import (
+    BloomFilterCheckpoint,
+    _hash_id_column_to_uint64,
+    build_bloom_filter_remote,
+)
 from ray.data.datasource import PathPartitionFilter
 from ray.data.datasource.path_util import _unwrap_protocol
 from ray.types import ObjectRef
@@ -118,6 +123,8 @@ class CheckpointFilter(abc.ABC):
         self.redis_checkpoint_pipeline_batch_size = self.ckpt_config.redis_checkpoint_pipeline_batch_size
         self.redis_data_storage_as_roaring_bitmap = self.ckpt_config.redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap = self.ckpt_config.use_roaring_bitmap
+        self.use_bloom_filter = self.ckpt_config.use_bloom_filter
+        self.bloom_filter_error_rate = self.ckpt_config.bloom_filter_error_rate
 
 @ray.remote(num_cpus=0)
 def _clean_pending_checkpoints_task(
@@ -264,6 +271,7 @@ class CheckpointLoader:
         checkpoint_path_partition_filter: Optional[PathPartitionFilter] = None,
         checkpoint_read_override_num_blocks:Optional[int] = None,
         redis_data_storage_as_roaring_bitmap: bool = False,
+        use_bloom_filter: bool = False,
     ):
         """Initialize the CheckpointLoader.
 
@@ -286,6 +294,7 @@ class CheckpointLoader:
         self.redis_checkpoint_pipeline_batch_size = redis_checkpoint_pipeline_batch_size
         self.redis_data_storage_as_roaring_bitmap = redis_data_storage_as_roaring_bitmap
         self.use_roaring_bitmap = use_roaring_bitmap
+        self.use_bloom_filter = use_bloom_filter
 
     def remove_empty_parquet_files(self):
         from pyarrow.fs import FileSelector,FileType
@@ -404,8 +413,8 @@ class IdColumnCheckpointLoader(CheckpointLoader):
         Returns:
             The pre-processed checkpoint dataset
         """
-        # Sort by the ID column.
-        if self.use_roaring_bitmap==True:
+        # Bloom Filter and Roaring Bitmap paths do not require sorted input.
+        if self.use_bloom_filter or self.use_roaring_bitmap:
             return checkpoint_ds
         else:
             return checkpoint_ds.sort(self.id_column)
@@ -453,6 +462,7 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
             redis_checkpoint_pipeline_batch_size=self.ckpt_config.redis_checkpoint_pipeline_batch_size,
             redis_data_storage_as_roaring_bitmap=self.ckpt_config.redis_data_storage_as_roaring_bitmap,
             use_roaring_bitmap =self.ckpt_config.use_roaring_bitmap,
+            use_bloom_filter=self.ckpt_config.use_bloom_filter,
         )
         return loader.load_checkpoint()
 
@@ -490,6 +500,30 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
         except ray.exceptions.RayTaskError:
             logger.exception("Failed to clean up pending checkpoints")
             raise
+
+    def load_bloom_filter(self) -> ObjectRef[BloomFilterCheckpoint]:
+        """Build the bloom filter once via a remote task and return an ObjectRef.
+
+        Returns ``None`` when ``use_bloom_filter`` is not set on the
+        underlying :class:`CheckpointConfig`. Otherwise loads the checkpoint
+        id table, dispatches
+        :func:`ray.data.checkpoint.bloom_filter.build_bloom_filter_remote` on
+        a worker, and returns an ``ObjectRef`` to the built
+        :class:`BloomFilterCheckpoint`. The same ``ObjectRef`` is later
+        broadcast to every map worker via task kwargs so that all workers
+        share a single physical copy of the filter through the Ray object
+        store.
+        """
+        if not self.ckpt_config.use_bloom_filter:
+            return None
+        block_ref = self.load_checkpoint()
+        if block_ref is None:
+            return None
+        return build_bloom_filter_remote.remote(
+            block_ref,
+            self.id_column,
+            self.ckpt_config.bloom_filter_error_rate,
+        )
 
     def delete_checkpoint(self) -> None:
         self.filesystem.delete_dir(self.checkpoint_path_unwrapped)
@@ -606,6 +640,40 @@ class BatchBasedCheckpointFilter(CheckpointFilter):
         )
         keep_mask = ~mask
         return block.filter(pa.array(keep_mask))
+
+   
+
+    def filter_rows_for_block_with_bloom_filter(
+        self,
+        block: Block,
+        bloom: BloomFilterCheckpoint,
+    ) -> Block:
+        """Filter ``block`` using a pre-built :class:`BloomFilterCheckpoint`.
+
+        The Bloom Filter is built once per pipeline execution by
+        :func:`ray.data.checkpoint.bloom_filter.build_bloom_filter_remote`
+        and broadcast to every map worker via the Ray object store. This
+        method therefore performs only the per-block membership test —
+        construction never happens on the worker hot path.
+
+        Membership is tested in O(1) per id with zero false negatives; the
+        false-positive rate is controlled by ``self.bloom_filter_error_rate``
+        (chosen at filter construction time).
+        """
+        if len(block) == 0 or len(bloom) == 0:
+            return block
+
+        assert isinstance(block, pa.Table)
+        assert isinstance(bloom, BloomFilterCheckpoint), (
+            "filter_rows_for_block_with_bloom_filter expects a pre-built "
+            f"BloomFilterCheckpoint, got {type(bloom).__name__}"
+        )
+
+        block_uint64_ids = _hash_id_column_to_uint64(block, self.id_column)
+        in_checkpoint = bloom.contains_many(block_uint64_ids)
+        keep_mask = ~in_checkpoint
+        return block.filter(pa.array(keep_mask))
+
 
     def filter_block_by_redis_ckpt(
         self,
