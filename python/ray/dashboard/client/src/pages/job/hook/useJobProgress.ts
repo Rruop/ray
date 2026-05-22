@@ -42,6 +42,7 @@ const TASK_STATE_NAME_TO_PROGRESS_KEY: Record<TypeTaskStatus, TaskStatus> = {
   [TypeTaskStatus.RUNNING_IN_RAY_WAIT]: TaskStatus.RUNNING,
   [TypeTaskStatus.FINISHED]: TaskStatus.FINISHED,
   [TypeTaskStatus.FAILED]: TaskStatus.FAILED,
+  [TypeTaskStatus.GETTING_AND_PINNING_ARGS]: TaskStatus.RUNNING,
   [TypeTaskStatus.NIL]: TaskStatus.UNKNOWN,
 };
 
@@ -131,11 +132,26 @@ export const useJobProgress = (
     return acc;
   }, {} as TaskProgress);
 
+  // Prefer total_state_counts for progress segments when available.
+  // total_state_counts includes ALL entries in the GCS buffer (including
+  // zombie entries without task_info), providing accurate state distribution.
+  // The summary-based `summed` only counts entries with task_info, which
+  // can be much lower due to GCS buffer eviction in high-throughput scenarios.
+  const progressFromTotalStateCounts = data?.totalStateCounts
+    ? formatStateCountsToProgress(data.totalStateCounts)
+    : null;
+
+  const totalFromStateCounts = data?.totalStateCounts
+    ? Object.values(data.totalStateCounts).reduce(
+        (acc, count) => acc + count,
+        0,
+      )
+    : undefined;
+
   const driverExists = !jobId ? false : true;
   return {
-    progress: summed,
-    totalTasks: data?.totalTasks,
-    totalStateCounts: data?.totalStateCounts,
+    progress: progressFromTotalStateCounts ?? summed,
+    totalTasks: totalFromStateCounts ?? data?.totalTasks,
     isLoading,
     msg,
     error,

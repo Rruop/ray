@@ -2870,7 +2870,9 @@ Status CoreWorker::ExecuteTask(
                                                           task_spec.AttemptNumber(),
                                                           task_spec,
                                                           rpc::TaskStatus::RUNNING,
-                                                          /*include_task_info=*/false,
+                                                          /*include_task_info=*/
+                                                              RayConfig::instance()
+                                                                  .task_events_executor_include_task_info(),
                                                           update));
 
     worker_context_->SetCurrentTask(task_spec);

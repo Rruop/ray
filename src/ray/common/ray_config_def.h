@@ -492,6 +492,14 @@ RAY_CONFIG(uint64_t, task_events_send_batch_size, 10 * 1000)
 /// caps the number of file writes per iteration.
 RAY_CONFIG(uint64_t, export_task_events_write_batch_size, 10 * 1000)
 
+/// Whether the executor worker should include task_info when reporting
+/// RUNNING status to GCS. When true, task_info is sent redundantly from
+/// both submitter (at task creation) and executor (at RUNNING), reducing
+/// the chance of "zombie" entries in GCS that lack task_info.
+/// Trade-off: doubles per-task task_info bandwidth.
+/// Default: false (preserve existing behavior).
+RAY_CONFIG(bool, task_events_executor_include_task_info, false)
+
 /// Max number of profile events allowed to be tracked for a single task.
 /// Setting the value to -1 allows unlimited profile events to be tracked.
 RAY_CONFIG(int64_t, task_events_max_num_profile_events_per_task, 1000)

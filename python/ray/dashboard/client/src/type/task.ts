@@ -13,6 +13,7 @@ export enum TypeTaskStatus {
   RUNNING_IN_RAY_WAIT = "RUNNING_IN_RAY_WAIT",
   FINISHED = "FINISHED",
   FAILED = "FAILED",
+  GETTING_AND_PINNING_ARGS = "GETTING_AND_PINNING_ARGS",
 }
 
 export enum TypeTaskType {

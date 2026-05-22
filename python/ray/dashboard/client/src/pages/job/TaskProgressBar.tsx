@@ -11,7 +11,6 @@ export type TaskProgressBarProps = TaskProgress & {
   onClick?: () => void;
   total?: number;
   controls?: JSX.Element;
-  totalStateCounts?: { [stateName: string]: number };
 };
 
 export const TaskProgressBar = ({
@@ -30,7 +29,6 @@ export const TaskProgressBar = ({
   onClick,
   total,
   controls,
-  totalStateCounts,
 }: TaskProgressBarProps) => {
   const theme = useTheme<Theme>();
   const progress: ProgressBarSegment[] = [
@@ -48,11 +46,6 @@ export const TaskProgressBar = ({
       label: "Running",
       value: numRunning,
       color: theme.palette.primary.main,
-      hint:
-        totalStateCounts?.RUNNING != null &&
-        totalStateCounts.RUNNING !== numRunning
-          ? `${totalStateCounts.RUNNING} tasks running in total (${totalStateCounts.RUNNING - numRunning} not shown due to incomplete metadata)`
-          : undefined,
     },
     {
       label: "Waiting for scheduling",
