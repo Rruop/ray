@@ -106,7 +106,7 @@ export const NodeRow = ({
         </Tooltip>
       </TableCell>
       <TableCell align="center">
-        <Box minWidth={TEXT_COL_MIN_WIDTH}>{podName}</Box>
+        <Box minWidth={200} sx={{ wordBreak: "break-all", whiteSpace: "nowrap" }}>{podName}</Box>
       </TableCell>
       <TableCell align="center">
         <Box minWidth={TEXT_COL_MIN_WIDTH}>{hostname}</Box>
