@@ -16,6 +16,9 @@
 .jar
 /dashboard/client/build
 /.whl
+/bin
+/lib
+/pyvenv*
 
 # KubeRay config lives in a separate repository
 python/ray/autoscaler/kuberay/config

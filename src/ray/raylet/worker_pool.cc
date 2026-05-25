@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <deque>
+#include <random>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -146,21 +147,31 @@ WorkerPool::WorkerPool(instrumented_io_context &io_service,
     RAY_CHECK(!state.worker_command.empty()) << "Worker command must not be empty.";
   }
   // Initialize free ports list with all ports in the specified range.
+  // Ports are shuffled randomly to avoid predictable port allocation patterns.
+  auto shuffle_and_enqueue = [](std::queue<int> &q, std::vector<int> ports) {
+    std::random_device rd;
+    std::mt19937 rng(rd());
+    std::shuffle(ports.begin(), ports.end(), rng);
+    for (int port : ports) {
+      q.push(port);
+    }
+  };
   if (!worker_ports.empty()) {
     free_ports_ = std::make_unique<std::queue<int>>();
-    for (int port : worker_ports) {
-      free_ports_->push(port);
-    }
+    shuffle_and_enqueue(*free_ports_, worker_ports);
   } else if (min_worker_port != 0) {
     if (max_worker_port == 0) {
       max_worker_port = 65535;  // Maximum valid port number.
     }
     RAY_CHECK(min_worker_port > 0 && min_worker_port <= 65535);
     RAY_CHECK(max_worker_port >= min_worker_port && max_worker_port <= 65535);
-    free_ports_ = std::make_unique<std::queue<int>>();
+    std::vector<int> ports;
+    ports.reserve(max_worker_port - min_worker_port + 1);
     for (int port = min_worker_port; port <= max_worker_port; port++) {
-      free_ports_->push(port);
+      ports.push_back(port);
     }
+    free_ports_ = std::make_unique<std::queue<int>>();
+    shuffle_and_enqueue(*free_ports_, std::move(ports));
   }
 }
 
