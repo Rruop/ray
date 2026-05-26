@@ -115,6 +115,7 @@ class DataOpTask(OpTask):
             [ray.ObjectRef[BlockMetadata]], None
         ] = lambda metadata_ref: None,
         task_resource_bundle: Optional[ExecutionResources] = None,
+        worker_finished_callback: Callable[[], None] = lambda: None,
     ):
         """Create a DataOpTask
         Args:
@@ -128,6 +129,8 @@ class DataOpTask(OpTask):
             metadata_ready_callback: A callback that's invoked when a new block metadata
                 reference is ready. This is exposed as a seam for testing.
             task_resource_bundle: The execution resources of this task.
+            worker_finished_callback: A callback invoked when the worker-side task
+                finishes but outputs have not been fully consumed yet.
         """
         super().__init__(task_index, task_resource_bundle)
         # TODO(hchen): Right now, the streaming generator is required to yield a Block
@@ -139,6 +142,7 @@ class DataOpTask(OpTask):
         self._task_done_callback = task_done_callback
         self._block_ready_callback = block_ready_callback
         self._metadata_ready_callback = metadata_ready_callback
+        self._worker_finished_callback = worker_finished_callback
 
         # If the generator hasn't produced block metadata yet, or if the block metadata
         # object isn't available after we get a reference, we need store the pending
@@ -148,6 +152,7 @@ class DataOpTask(OpTask):
         self._pending_meta_ref: ray.ObjectRef[BlockMetadata] = ray.ObjectRef.nil()
 
         self._has_finished = False
+        self._worker_finished = False
 
     def get_waitable(self) -> ObjectRefGenerator:
         return self._streaming_gen
@@ -245,7 +250,19 @@ class DataOpTask(OpTask):
 
             bytes_read += meta.size_bytes
 
+        if not self._worker_finished and not self._has_finished:
+            ready, _ = ray.wait(
+                [self._streaming_gen.completed()], timeout=0, fetch_local=False
+            )
+            if ready:
+                self._worker_finished = True
+                self._worker_finished_callback()
+
         return bytes_read
+
+    @property
+    def worker_finished(self) -> bool:
+        return self._worker_finished or self._has_finished
 
     @property
     def has_finished(self) -> bool:

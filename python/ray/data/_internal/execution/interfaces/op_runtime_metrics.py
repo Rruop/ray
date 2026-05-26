@@ -365,6 +365,11 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
         description="Number of running tasks.",
         metrics_group=MetricsGroup.TASKS,
     )
+    num_tasks_worker_finished: int = metric_field(
+        default=0,
+        description="Number of tasks whose workers finished but outputs not fully consumed.",
+        metrics_group=MetricsGroup.TASKS,
+    )
     num_tasks_have_outputs: int = metric_field(
         default=0,
         description="Number of tasks that already have output.",
@@ -510,6 +515,8 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
 
         self._per_node_metrics: Dict[str, NodeMetrics] = defaultdict(NodeMetrics)
         self._per_node_metrics_enabled: bool = op.data_context.enable_per_node_metrics
+
+        self._worker_finished_task_indices: set = set()
 
         self._cum_max_uss_bytes: Optional[int] = None
         self._issue_detector_hanging = 0
@@ -936,8 +943,16 @@ class OpRuntimeMetrics(metaclass=OpRuntimesMetricsMeta):
                 node_metrics.bytes_outputs_of_finished_tasks += meta.size_bytes
                 node_metrics.blocks_outputs_of_finished_tasks += 1
 
+    def on_task_worker_finished(self, task_index: int):
+        """Callback when a task's worker has finished but outputs are not fully consumed."""
+        self._worker_finished_task_indices.add(task_index)
+        self.num_tasks_worker_finished += 1
+
     def on_task_finished(self, task_index: int, exception: Optional[Exception]):
         """Callback when a task is finished."""
+        if task_index in self._worker_finished_task_indices:
+            self.num_tasks_worker_finished -= 1
+            self._worker_finished_task_indices.discard(task_index)
         self.num_tasks_running -= 1
         self.num_tasks_finished += 1
         if exception is not None:

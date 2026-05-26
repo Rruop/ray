@@ -624,11 +624,17 @@ class MapOperator(InternalQueueOperatorMixin, OneToOneOperator, ABC):
             if task_done_callback:
                 task_done_callback()
 
+        def _worker_finished_cb(task_index: int):
+            self._metrics.on_task_worker_finished(task_index)
+
         data_task = DataOpTask(
             task_index,
             gen,
             lambda output: _output_ready_callback(task_index, output),
             functools.partial(_task_done_callback, task_index),
+            worker_finished_callback=functools.partial(
+                _worker_finished_cb, task_index
+            ),
         )
         self._metrics.on_task_submitted(
             task_index, inputs, task_id=data_task.get_task_id()

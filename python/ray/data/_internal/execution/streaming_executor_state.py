@@ -1011,18 +1011,12 @@ def format_op_state_summary(
     """Get a formatted summary of the OpState for progress reporting."""
     # Active tasks with running/queued breakdown if available
     active = op_state.op.num_active_tasks()
-
-    # Try to get task distribution (running vs queued) if the operator supports it
-    if hasattr(op_state.op, "get_task_distribution"):
-        try:
-            estimated_running, estimated_queued = op_state.op.get_task_distribution()
-            desc = f"Tasks: {active} (running={estimated_running}, queued={estimated_queued})"
-        except Exception:
-            # Fallback to simple format if get_task_distribution fails
-            desc = f"Tasks: {active}"
+    worker_finished = op_state.op.metrics.num_tasks_worker_finished
+    if worker_finished > 0:
+        running = active - worker_finished
+        desc = f"Tasks: {active} ({running} running, {worker_finished} finished)"
     else:
         desc = f"Tasks: {active}"
-
     if (
         op_state.op._in_task_submission_backpressure
         or op_state.op._in_task_output_backpressure
