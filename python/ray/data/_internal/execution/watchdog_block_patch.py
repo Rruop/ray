@@ -61,9 +61,15 @@ Behaviour:
   Once an operator has both
     - ``completion_ratio >= RAY_WATCHDOG_MIN_COMPLETION_RATIO`` (default 0.95),
     - and zero real progress for ``RAY_WATCHDOG_STALL_S`` seconds (default 600),
-  we kill the oldest live task on every cycle (one per ``RAY_DETECTION_INTERVAL_S``)
-  until progress resumes or all tasks are gone — bounded by
-  ``RAY_WATCHDOG_MAX_KILLED``.
+  we kill the oldest live tasks. Up to
+  ``ceil(total_tasks * RAY_WATCHDOG_PER_OP_KILL_RATIO)`` tasks may be killed per
+  operator over its entire lifetime — beyond that we leave remaining hung tasks
+  alone for the phantom-queue handler. The kill loop within a single cycle is
+  serial (single-threaded scheduler loop), so ``_force_complete_task`` races are
+  not a concern even when batching.
+
+  The global ``RAY_WATCHDOG_MAX_KILLED`` budget (across all ops) still applies
+  on top of the per-op cap.
 
   Phantom queue (``active_count==0`` but ``op._output_queue`` still has bundles)
   is handled by calling ``mark_execution_finished`` once.
@@ -94,6 +100,10 @@ Environment variables:
     Maximum number of tasks the watchdog may force-complete before aborting
     the dataset via ``WatchdogBudgetExceeded``. Set to ``0`` to forbid any
     data loss.
+``RAY_WATCHDOG_PER_OP_KILL_RATIO`` (default ``0.01`` = 1%)
+    Per-op cumulative kill cap as a fraction of total tasks. Set to ``0`` for
+    legacy one-task-per-cycle behaviour with no per-op ceiling (still bounded
+    by ``RAY_WATCHDOG_MAX_KILLED``).
 """
 
 import inspect
@@ -114,6 +124,29 @@ PHANTOM_STALL_S = float(
     os.environ.get("RAY_WATCHDOG_PHANTOM_STALL_S", str(WATCHDOG_STALL_S))
 )
 WATCHDOG_MAX_KILLED = int(os.environ.get("RAY_WATCHDOG_MAX_KILLED", "-1"))
+
+# Per-operator kill ratio cap. When stalled, the watchdog batch-kills up to
+# ``ceil(total_tasks * WATCHDOG_PER_OP_KILL_RATIO)`` stuck tasks in a single
+# cycle (instead of the historical one-task-per-cycle), so the tail of a stuck
+# operator drains in one 600s window rather than ``stuck_count * STALL_S``
+# seconds.
+#
+# The cap is **per-op cumulative across the op's lifetime**, not per-cycle — we
+# keep a running ``op_killed`` counter in per-op state and never exceed it.
+# This keeps the data-loss bound predictable: at most ``ratio * total_tasks``
+# bundles per operator are ever dropped, no matter how the watchdog cycles.
+#
+# Default 0.01 (1%). On a 192k-task operator this allows ~1925 kills, which is
+# more than enough to drain typical tail stalls (5-50 hung tasks). On a
+# 100-task operator the cap becomes 1, which degrades to the historical
+# one-at-a-time behaviour — acceptable since small ops rarely hit tail-stall.
+#
+# 0.0 disables batch kill entirely: falls back to legacy one-task-per-cycle
+# behaviour with no per-op cumulative ceiling (still bounded by MAX_KILLED).
+# 1.0 means the watchdog may kill every active task in one cycle once stalled.
+WATCHDOG_PER_OP_KILL_RATIO = float(
+    os.environ.get("RAY_WATCHDOG_PER_OP_KILL_RATIO", "0.01")
+)
 
 
 class WatchdogStalledError(Exception):
@@ -142,6 +175,8 @@ _metrics = {
 
 _applied = False
 
+_last_check: Dict[int, float] = {}
+
 
 def get_metrics() -> Dict[str, int]:
     """Return a copy of the watchdog metrics counter dict."""
@@ -155,6 +190,7 @@ def _new_state(now: float) -> Dict:
         "last_finished": 0,
         "force_done": set(),
         "phantom_handled": False,
+        "op_killed": 0,
     }
 
 
@@ -220,6 +256,7 @@ def _force_complete_task(op, task_idx: int, st: Dict, reason: str) -> bool:
             data_task._task_done_callback(exc)
             data_task._has_finished = True
         st["force_done"].add(task_idx)
+        st["op_killed"] += 1
         _metrics["watchdog_killed"] += 1
         if (
             WATCHDOG_MAX_KILLED >= 0
@@ -314,22 +351,56 @@ def _check_operator(op, now: float) -> None:
         return
 
     candidates.sort(key=lambda x: x[1])
-    victim_idx, victim_start = candidates[0]
+
+    if WATCHDOG_PER_OP_KILL_RATIO <= 0.0:
+        op_cap = None
+        remaining_budget = 1
+    else:
+        op_cap = max(1, int(total * WATCHDOG_PER_OP_KILL_RATIO + 0.5))
+        remaining_budget = max(0, op_cap - st["op_killed"])
+        if remaining_budget == 0:
+            return
+
+    victims = candidates[:remaining_budget]
+    cap_repr = f"{st['op_killed']}/{op_cap}" if op_cap is not None else "legacy-1per-cycle"
     logger.warning(
         f"[patch_dbs] WATCHDOG: {op.name} stalled {stalled_s:.0f}s "
         f"(finished={finished_real}, active={active_count}, "
         f"ratio={completion_ratio:.5f}). "
-        f"Killing oldest task {victim_idx} (runtime={now - victim_start:.0f}s)."
+        f"Killing {len(victims)} task(s) "
+        f"(op_killed={cap_repr}, oldest_runtime="
+        f"{now - victims[0][1]:.0f}s)."
     )
-    if _force_complete_task(
-        op,
-        victim_idx,
-        st,
-        reason=f"stalled {stalled_s:.0f}s at ratio {completion_ratio:.5f}",
-    ):
+
+    killed_any = False
+    reason = f"stalled {stalled_s:.0f}s at ratio {completion_ratio:.5f}"
+    for victim_idx, _ in victims:
+        if _force_complete_task(op, victim_idx, st, reason=reason):
+            killed_any = True
+
+    if killed_any:
         # Give Ray at least one detection cycle to react to the eviction
         # before fairly judging whether progress resumed.
         st["last_progress_ts"] = now
+
+
+def _run_watchdog(topology) -> None:
+    now = time.time()
+    for op in topology:
+        if not _should_monitor(op):
+            continue
+        op_id = id(op)
+        if now - _last_check.get(op_id, 0.0) < DETECTION_INTERVAL_S:
+            continue
+        _last_check[op_id] = now
+        try:
+            _check_operator(op, now)
+        except WatchdogBudgetExceeded:
+            raise
+        except Exception as e:
+            logger.error(
+                f"[patch_dbs] Watchdog error on {op.name}: {e}", exc_info=True
+            )
 
 
 def apply() -> None:
@@ -390,26 +461,6 @@ def apply() -> None:
     _orig_step = StreamingExecutor._scheduling_loop_step
     _step_takes_topology = "topology" in inspect.signature(_orig_step).parameters
 
-    _last_check: Dict[int, float] = {}
-
-    def _run_watchdog(topology) -> None:
-        now = time.time()
-        for op in topology:
-            if not _should_monitor(op):
-                continue
-            op_id = id(op)
-            if now - _last_check.get(op_id, 0.0) < DETECTION_INTERVAL_S:
-                continue
-            _last_check[op_id] = now
-            try:
-                _check_operator(op, now)
-            except WatchdogBudgetExceeded:
-                raise
-            except Exception as e:
-                logger.error(
-                    f"[patch_dbs] Watchdog error on {op.name}: {e}", exc_info=True
-                )
-
     if _step_takes_topology:
         def _patched_step(self, topology):  # pyright: ignore[reportRedeclaration]
             _run_watchdog(topology)
@@ -427,7 +478,8 @@ def apply() -> None:
         f"MIN_COMPLETION_RATIO={WATCHDOG_MIN_COMPLETION_RATIO}, "
         f"DETECTION_INTERVAL_S={DETECTION_INTERVAL_S}, "
         f"PHANTOM_STALL_S={PHANTOM_STALL_S}, "
-        f"MAX_KILLED={WATCHDOG_MAX_KILLED}"
+        f"MAX_KILLED={WATCHDOG_MAX_KILLED}, "
+        f"PER_OP_KILL_RATIO={WATCHDOG_PER_OP_KILL_RATIO}"
     )
 
 

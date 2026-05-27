@@ -237,7 +237,8 @@ class WatchdogTests(unittest.TestCase):
                 self.mod._check_operator(op, t0 + 601)
 
     def test_max_killed_budget_aborts_after_threshold(self):
-        with mock.patch.object(self.mod, "WATCHDOG_MAX_KILLED", 2):
+        with mock.patch.object(self.mod, "WATCHDOG_MAX_KILLED", 2), \
+                mock.patch.object(self.mod, "WATCHDOG_PER_OP_KILL_RATIO", 0.0):
             op = _FakeOp()
             for _ in range(3):
                 op.submit_task()
@@ -251,6 +252,112 @@ class WatchdogTests(unittest.TestCase):
             self.mod._check_operator(op, t0 + 1300)
             with self.assertRaises(self.mod.WatchdogBudgetExceeded):
                 self.mod._check_operator(op, t0 + 2000)
+
+    def test_batch_kill_drains_tail_within_per_op_cap(self):
+        with mock.patch.object(self.mod, "WATCHDOG_PER_OP_KILL_RATIO", 0.05):
+            op = _FakeOp()
+            stuck_indices = [op.submit_task() for _ in range(7)]
+            for _ in range(193):
+                idx = op.submit_task()
+                op.finish_task_naturally(idx)
+            self.assertEqual(len(op._data_tasks), 7)
+
+            t0 = 11000.0
+            self.mod._check_operator(op, t0)
+            self.mod._check_operator(op, t0 + 601)
+
+            self.assertEqual(self.mod._metrics["watchdog_killed"], 7)
+            for idx in stuck_indices:
+                self.assertNotIn(idx, op._data_tasks)
+            st = self.mod._state[id(op)]
+            self.assertEqual(st["op_killed"], 7)
+
+    def test_batch_kill_respects_per_op_cap_partial_drain(self):
+        with mock.patch.object(self.mod, "WATCHDOG_PER_OP_KILL_RATIO", 0.02):
+            op = _FakeOp()
+            stuck_indices = [op.submit_task() for _ in range(10)]
+            for _ in range(190):
+                idx = op.submit_task()
+                op.finish_task_naturally(idx)
+            self.assertEqual(len(op._data_tasks), 10)
+
+            t0 = 12000.0
+            self.mod._check_operator(op, t0)
+            self.mod._check_operator(op, t0 + 601)
+
+            self.assertEqual(self.mod._metrics["watchdog_killed"], 4)
+            st = self.mod._state[id(op)]
+            self.assertEqual(st["op_killed"], 4)
+            self.assertEqual(len(op._data_tasks), 6)
+
+            self.mod._check_operator(op, t0 + 1300)
+            self.assertEqual(self.mod._metrics["watchdog_killed"], 4)
+            self.assertEqual(st["op_killed"], 4)
+            self.assertEqual(len(op._data_tasks), 6)
+
+    def test_batch_kill_zero_ratio_falls_back_to_one_per_cycle(self):
+        with mock.patch.object(self.mod, "WATCHDOG_PER_OP_KILL_RATIO", 0.0):
+            op = _FakeOp()
+            [op.submit_task() for _ in range(5)]
+            for _ in range(195):
+                idx = op.submit_task()
+                op.finish_task_naturally(idx)
+
+            t0 = 13000.0
+            self.mod._check_operator(op, t0)
+            self.mod._check_operator(op, t0 + 601)
+            self.assertEqual(self.mod._metrics["watchdog_killed"], 1)
+
+            self.mod._check_operator(op, t0 + 1300)
+            self.assertEqual(self.mod._metrics["watchdog_killed"], 2)
+
+    def test_batch_kill_global_budget_aborts_mid_batch(self):
+        with mock.patch.object(self.mod, "WATCHDOG_PER_OP_KILL_RATIO", 0.5), \
+                mock.patch.object(self.mod, "WATCHDOG_MAX_KILLED", 3):
+            op = _FakeOp()
+            [op.submit_task() for _ in range(8)]
+            for _ in range(192):
+                idx = op.submit_task()
+                op.finish_task_naturally(idx)
+
+            t0 = 14000.0
+            self.mod._check_operator(op, t0)
+
+            with self.assertRaises(self.mod.WatchdogBudgetExceeded):
+                self.mod._check_operator(op, t0 + 601)
+            self.assertEqual(self.mod._metrics["watchdog_killed"], 4)
+
+    def test_run_watchdog_propagates_budget_exceeded(self):
+        """_run_watchdog MUST re-raise WatchdogBudgetExceeded so Ray Data aborts.
+
+        Pre-existing bug: a bare ``except Exception`` in _run_watchdog used to
+        swallow WatchdogBudgetExceeded, defeating RAY_WATCHDOG_MAX_KILLED.
+        """
+        with mock.patch.object(self.mod, "WATCHDOG_MAX_KILLED", 0), \
+                mock.patch.object(self.mod, "WATCHDOG_PER_OP_KILL_RATIO", 0.0):
+            op = _FakeOp()
+            op.submit_task()
+            for _ in range(199):
+                second = op.submit_task()
+                op.finish_task_naturally(second)
+
+            with mock.patch.object(self.mod.time, "time", return_value=20000.0):
+                self.mod._run_watchdog([op])
+            with mock.patch.object(self.mod.time, "time", return_value=20601.0):
+                with self.assertRaises(self.mod.WatchdogBudgetExceeded):
+                    self.mod._run_watchdog([op])
+
+    def test_run_watchdog_swallows_unexpected_errors(self):
+        """Non-budget exceptions stay swallowed so one bad op cannot kill the executor."""
+        op = _FakeOp()
+        op.submit_task()
+
+        def _boom(op, now):
+            raise RuntimeError("synthetic operator failure")
+
+        with mock.patch.object(self.mod, "_check_operator", side_effect=_boom):
+            with mock.patch.object(self.mod.time, "time", return_value=30000.0):
+                self.mod._run_watchdog([op])
 
 
 if __name__ == "__main__":
