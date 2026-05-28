@@ -1069,3 +1069,17 @@ RAY_CONFIG(size_t, gcs_resource_broadcast_max_batch_size, 1)
 // before the timeout, the batch will be broadcasted eagerly. This flag only applies if
 // `gcs_resource_broadcast_max_batch_size != 1`.
 RAY_CONFIG(uint64_t, gcs_resource_broadcast_max_batch_delay_ms, 0)
+
+/// Object replication strategy for preemptible (spot) nodes.
+/// "none": disabled. "push_to_stable_node": push object replicas to a stable node.
+RAY_CONFIG(std::string, object_replication_strategy, "none")
+
+/// The node label value that identifies a preemptible node.
+/// Compared against the "ray.io/node-market-type" label.
+RAY_CONFIG(std::string, preemptible_node_market_type, "spot")
+
+/// Minimum object size in bytes to trigger replication.
+RAY_CONFIG(int64_t, object_replication_min_size, 100 * 1024)
+
+/// Maximum number of concurrent object replications per node.
+RAY_CONFIG(int64_t, object_replication_max_concurrent, 10)

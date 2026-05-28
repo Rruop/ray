@@ -121,6 +121,11 @@ class ObjectManagerInterface {
   virtual void HandleObjectAdded(const ObjectInfo &object_info) = 0;
   virtual void HandleObjectDeleted(const ObjectID &object_id) = 0;
 
+  virtual void Push(const ObjectID &object_id, const NodeID &node_id) = 0;
+
+  /// Get the size of a local object. Returns -1 if the object is not local.
+  virtual int64_t GetObjectSize(const ObjectID &object_id) const = 0;
+
   virtual ~ObjectManagerInterface() = default;
 };
 
@@ -216,7 +221,9 @@ class ObjectManager : public ObjectManagerInterface,
   ///
   /// \param object_id The object's object id.
   /// \param node_id The remote node's id.
-  void Push(const ObjectID &object_id, const NodeID &node_id);
+  void Push(const ObjectID &object_id, const NodeID &node_id) override;
+
+  int64_t GetObjectSize(const ObjectID &object_id) const override;
 
   /// Pull a bundle of objects. This will attempt to make all objects in the
   /// bundle local until the request is canceled with the returned ID.

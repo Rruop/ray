@@ -318,6 +318,14 @@ void ObjectManager::HandleSendFinished(const ObjectID &object_id,
   }
 }
 
+int64_t ObjectManager::GetObjectSize(const ObjectID &object_id) const {
+  auto it = local_objects_.find(object_id);
+  if (it == local_objects_.end()) {
+    return -1;
+  }
+  return it->second.object_info.GetObjectSize();
+}
+
 void ObjectManager::Push(const ObjectID &object_id, const NodeID &node_id) {
   RAY_LOG(DEBUG).WithField(object_id)
       << "Push object on " << self_node_id_ << " to " << node_id << " of object";

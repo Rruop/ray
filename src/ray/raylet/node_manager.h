@@ -19,6 +19,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <random>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -344,6 +345,15 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
 
  private:
   FRIEND_TEST(NodeManagerStaticTest, TestHandleReportWorkerBacklog);
+
+  void MaybeReplicateObject(const ObjectInfo &object_info);
+
+  /// Check if this node is a preemptible (spot) node based on its labels.
+  bool IsPreemptibleNode() const;
+
+  /// Select a random stable (non-preemptible) node for object replication.
+  /// Returns NodeID::Nil() if no stable node is available.
+  NodeID SelectStableNode() const;
 
   /// Handle an accepted client connection.
   void HandleAccept(const boost::system::error_code &error);
@@ -969,6 +979,18 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
 
   /// The socket to listen on for new clients.
   local_stream_socket socket_;
+
+  /// Cached result of IsPreemptibleNode() computed at construction time.
+  bool is_preemptible_node_cached_ = false;
+
+  /// Random number generator for SelectStableNode().
+  mutable std::mt19937 rng_{std::random_device{}()};
+
+  /// Number of object replications currently in flight.
+  std::atomic<int64_t> replications_in_flight_{0};
+
+  ray::stats::Sum object_replication_succeeded_{GetObjectReplicationSucceededMetric()};
+  ray::stats::Sum object_replication_skipped_{GetObjectReplicationSkippedMetric()};
 };
 
 }  // namespace ray::raylet

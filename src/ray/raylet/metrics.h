@@ -208,5 +208,22 @@ inline ray::stats::Gauge GetLocalResourceViewNodeCountGaugeMetric() {
   };
 }
 
+inline ray::stats::Sum GetObjectReplicationSucceededMetric() {
+  return ray::stats::Sum{
+      /*name=*/"object_replication_succeeded",
+      /*description=*/
+      "Total number of object replications pushed to a stable node.",
+      /*unit=*/"requests"};
+}
+
+inline ray::stats::Sum GetObjectReplicationSkippedMetric() {
+  return ray::stats::Sum{
+      /*name=*/"object_replication_skipped",
+      /*description=*/
+      "Total number of object replications skipped (too small, concurrency limit, etc).",
+      /*unit=*/"requests",
+      /*tag_keys=*/{"Reason"}};
+}
+
 }  // namespace raylet
 }  // namespace ray

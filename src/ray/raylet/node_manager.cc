@@ -290,6 +290,7 @@ NodeManager::NodeManager(
 
   worker_pool_.SetRuntimeEnvAgentClient(std::move(runtime_env_agent_client));
   worker_pool_.Start();
+  is_preemptible_node_cached_ = IsPreemptibleNode();
   periodical_runner_->RunFnPeriodically([this]() { GCWorkerFailureReason(); },
                                         RayConfig::instance().task_failure_entry_ttl_ms(),
                                         "NodeManager.GCTaskFailureReason");
@@ -2446,8 +2447,8 @@ void NodeManager::HandleObjectLocal(const ObjectInfo &object_info) {
         });
   }
 
-  // An object was created so we may be over the spill
-  // threshold now.
+  MaybeReplicateObject(object_info);
+
   SpillIfOverPrimaryObjectsThreshold();
 }
 
@@ -3526,6 +3527,111 @@ void NodeManager::HandleCancelLocalTask(rpc::CancelLocalTaskRequest request,
           timer->cancel();
         }
       });
+}
+
+bool NodeManager::IsPreemptibleNode() const {
+  auto it = initial_config_.labels.find("ray.io/node-market-type");
+  if (it == initial_config_.labels.end()) {
+    return false;
+  }
+  return it->second ==
+         RayConfig::instance().preemptible_node_market_type();
+}
+
+NodeID NodeManager::SelectStableNode() const {
+  const auto &resource_view =
+      cluster_resource_scheduler_.GetClusterResourceManager().GetResourceView();
+  std::vector<NodeID> stable_nodes;
+  const auto &preemptible_type =
+      RayConfig::instance().preemptible_node_market_type();
+  for (const auto &[scheduling_node_id, node] : resource_view) {
+    NodeID node_id = NodeID::FromBinary(scheduling_node_id.Binary());
+    if (node_id == self_node_id_) {
+      continue;
+    }
+    const auto &labels = node.GetLocalView().labels;
+    auto it = labels.find("ray.io/node-market-type");
+    if (it == labels.end() || it->second != preemptible_type) {
+      stable_nodes.push_back(node_id);
+    }
+  }
+  if (stable_nodes.empty()) {
+    return NodeID::Nil();
+  }
+  std::uniform_int_distribution<size_t> dist(0, stable_nodes.size() - 1);
+  return stable_nodes[dist(rng_)];
+}
+
+NodeID NodeManager::SelectMigrationTarget() const {
+  const auto &resource_view =
+      cluster_resource_scheduler_.GetClusterResourceManager().GetResourceView();
+  std::vector<NodeID> candidates;
+  for (const auto &[scheduling_node_id, node] : resource_view) {
+    NodeID node_id = NodeID::FromBinary(scheduling_node_id.Binary());
+    if (node_id == self_node_id_) {
+      continue;
+    }
+    if (node.GetLocalView().is_draining) {
+      continue;
+    }
+    candidates.push_back(node_id);
+  }
+  if (candidates.empty()) {
+    return NodeID::Nil();
+  }
+  std::uniform_int_distribution<size_t> dist(0, candidates.size() - 1);
+  return candidates[dist(rng_)];
+}
+
+void NodeManager::MigratePinnedObjectsForDrain(
+    std::function<void()> on_complete) {
+  local_object_manager_.MigrateAllPinnedObjects(
+      /*select_target=*/[this]() { return SelectMigrationTarget(); },
+      /*push_object=*/
+      [this](const ObjectID &obj_id, const NodeID &target) {
+        object_manager_.Push(obj_id, target);
+      },
+      std::move(on_complete));
+}
+
+void NodeManager::MaybeReplicateObject(const ObjectInfo &object_info) {
+  const auto &strategy = RayConfig::instance().object_replication_strategy();
+  if (strategy != "push_to_stable_node") {
+    object_replication_skipped_.Record(1, {{"Reason", "disabled"}});
+    return;
+  }
+
+  if (!is_preemptible_node_cached_) {
+    object_replication_skipped_.Record(1, {{"Reason", "not_preemptible"}});
+    return;
+  }
+
+  if (object_info.data_size < RayConfig::instance().object_replication_min_size()) {
+    object_replication_skipped_.Record(1, {{"Reason", "too_small"}});
+    return;
+  }
+
+  int64_t max_concurrent = RayConfig::instance().object_replication_max_concurrent();
+  int64_t current = replications_in_flight_.load(std::memory_order_relaxed);
+  if (current >= max_concurrent) {
+    object_replication_skipped_.Record(1, {{"Reason", "concurrency_limit"}});
+    return;
+  }
+  replications_in_flight_.fetch_add(1, std::memory_order_relaxed);
+
+  NodeID target_node = SelectStableNode();
+  if (target_node.IsNil()) {
+    replications_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    object_replication_skipped_.Record(1, {{"Reason", "no_stable_node"}});
+    return;
+  }
+
+  RAY_LOG(INFO).WithField(object_info.object_id)
+      << "Replicating object (" << object_info.data_size
+      << " bytes) to stable node " << target_node;
+  object_manager_.Push(object_info.object_id, target_node);
+  object_replication_succeeded_.Record(1);
+  replications_in_flight_.fetch_sub(1, std::memory_order_relaxed);
 }
 
 }  // namespace ray::raylet
