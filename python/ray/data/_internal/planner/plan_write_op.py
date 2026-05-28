@@ -57,19 +57,14 @@ def generate_write_fn(
         When a filter is provided, filters blocks before writing but returns the
         original unfiltered blocks for downstream processing (e.g., checkpoint).
         """
-        has_filter = filter_expr is not None or filter_fn is not None
+        # Always tee the iterator so downstream transforms (checkpoint, stats)
+        # can access the original blocks after write() consumes its copy.
+        blocks_to_write, blocks_to_return = itertools.tee(blocks, 2)
 
-        # Only tee the iterator when filtering is needed
-        if has_filter:
-            blocks_to_write, blocks_to_return = itertools.tee(blocks, 2)
-            if filter_expr is not None:
-                blocks_to_write = _filter_blocks_with_expr(blocks_to_write, filter_expr)
-            else:
-                blocks_to_write = _filter_blocks_with_fn(blocks_to_write, filter_fn)
-        else:
-            # No filtering: both variables reference the same iterator
-            blocks_to_write = blocks
-            blocks_to_return = blocks
+        if filter_expr is not None:
+            blocks_to_write = _filter_blocks_with_expr(blocks_to_write, filter_expr)
+        elif filter_fn is not None:
+            blocks_to_write = _filter_blocks_with_fn(blocks_to_write, filter_fn)
 
         if isinstance(datasink_or_legacy_datasource, Datasink):
             ctx.kwargs["_datasink_write_return"] = datasink_or_legacy_datasource.write(
