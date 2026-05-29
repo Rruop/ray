@@ -1233,6 +1233,163 @@ Status CoreWorker::SealExisting(const ObjectID &object_id,
   return Status::OK();
 }
 
+namespace {
+bool IsNodePreemptibleFromLabels(const rpc::GcsNodeInfo &node_info) {
+  auto it = node_info.labels().find("ray.io/node-market-type");
+  return it != node_info.labels().end() &&
+         it->second == RayConfig::instance().preemptible_node_market_type();
+}
+}  // namespace
+
+std::optional<bool> CoreWorker::IsNodePreemptibleCached(const NodeID &node_id) const {
+  absl::MutexLock lock(&preemptible_cache_mutex_);
+  auto it = preemptible_node_cache_.find(node_id);
+  if (it != preemptible_node_cache_.end()) {
+    return it->second;
+  }
+  return std::nullopt;
+}
+
+void CoreWorker::CacheNodePreemptible(const NodeID &node_id, bool is_preemptible) {
+  absl::MutexLock lock(&preemptible_cache_mutex_);
+  preemptible_node_cache_[node_id] = is_preemptible;
+}
+
+void CoreWorker::MaybeTriggerPinTransfer(const ObjectID &object_id,
+                                         const NodeID &new_location_node_id) {
+  const auto &strategy = RayConfig::instance().object_replication_strategy();
+  if (strategy != "push_to_stable_node") {
+    return;
+  }
+
+  bool owned_by_us = false;
+  NodeID pinned_at;
+  bool spilled = false;
+  bool ref_exists =
+      reference_counter_->IsPlasmaObjectPinnedOrSpilled(object_id, &owned_by_us,
+                                                        &pinned_at, &spilled);
+  if (!ref_exists || !owned_by_us || pinned_at.IsNil() || spilled) {
+    return;
+  }
+  if (pinned_at == new_location_node_id) {
+    return;
+  }
+
+  {
+    absl::MutexLock lock(&pin_transfer_mutex_);
+    if (pin_transfers_in_flight_.contains(object_id)) {
+      return;
+    }
+  }
+
+  auto pinned_at_preemptible = IsNodePreemptibleCached(pinned_at);
+  auto new_loc_preemptible = IsNodePreemptibleCached(new_location_node_id);
+
+  if (pinned_at_preemptible.has_value() && new_loc_preemptible.has_value()) {
+    if (*pinned_at_preemptible && !*new_loc_preemptible) {
+      auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(
+          new_location_node_id);
+      if (!node_info.has_value()) {
+        RAY_LOG(DEBUG).WithField(object_id).WithField(new_location_node_id)
+            << "Cannot get node address for pin transfer target, skipping";
+        return;
+      }
+      auto addr = rpc::RayletClientPool::GenerateRayletAddress(
+          new_location_node_id,
+          node_info->node_manager_address(),
+          node_info->node_manager_port());
+      DoPinTransfer(object_id, new_location_node_id, addr);
+    }
+    return;
+  }
+
+  std::vector<NodeID> uncached_nodes;
+  if (!pinned_at_preemptible.has_value()) {
+    uncached_nodes.push_back(pinned_at);
+  }
+  if (!new_loc_preemptible.has_value()) {
+    uncached_nodes.push_back(new_location_node_id);
+  }
+
+  gcs_client_->Nodes().AsyncGetAll(
+      [this, object_id, pinned_at, new_location_node_id](
+          const Status &status, std::vector<rpc::GcsNodeInfo> &&node_info_list) {
+        if (!status.ok()) {
+          RAY_LOG(DEBUG).WithField(object_id)
+              << "Failed to query GCS for node labels: " << status;
+          return;
+        }
+
+        for (const auto &node_info : node_info_list) {
+          auto node_id = NodeID::FromBinary(node_info.node_id());
+          CacheNodePreemptible(node_id, IsNodePreemptibleFromLabels(node_info));
+        }
+
+        auto pa = IsNodePreemptibleCached(pinned_at);
+        auto nl = IsNodePreemptibleCached(new_location_node_id);
+        if (!pa.has_value() || !nl.has_value()) {
+          RAY_LOG(DEBUG).WithField(object_id)
+              << "Node label info not found after GCS query, skipping pin transfer";
+          return;
+        }
+
+        if (*pa && !*nl) {
+          auto node_info = gcs_client_->Nodes().GetNodeAddressAndLiveness(
+              new_location_node_id);
+          if (!node_info.has_value()) {
+            RAY_LOG(DEBUG).WithField(object_id).WithField(new_location_node_id)
+                << "Cannot get node address for pin transfer target, skipping";
+            return;
+          }
+          auto addr = rpc::RayletClientPool::GenerateRayletAddress(
+              new_location_node_id,
+              node_info->node_manager_address(),
+              node_info->node_manager_port());
+          DoPinTransfer(object_id, new_location_node_id, addr);
+        }
+      },
+      /*timeout_ms=*/-1,
+      uncached_nodes);
+}
+
+void CoreWorker::DoPinTransfer(const ObjectID &object_id,
+                               const NodeID &stable_node_id,
+                               const rpc::Address &stable_node_address) {
+  {
+    absl::MutexLock lock(&pin_transfer_mutex_);
+    if (!pin_transfers_in_flight_.insert(object_id).second) {
+      return;
+    }
+  }
+
+  RAY_LOG(INFO).WithField(object_id).WithField(stable_node_id)
+      << "Initiating pin transfer to stable node";
+
+  raylet_client_pool_->GetOrConnectByAddress(stable_node_address)
+      ->PinObjectIDs(
+          rpc_address_,
+          {object_id},
+          /*generator_id=*/ObjectID::Nil(),
+          [this, object_id, stable_node_id](
+              const Status &status, const rpc::PinObjectIDsReply &reply) {
+            {
+              absl::MutexLock lock(&pin_transfer_mutex_);
+              pin_transfers_in_flight_.erase(object_id);
+            }
+
+            if (status.ok() && reply.successes_size() > 0 && reply.successes(0)) {
+              RAY_LOG(INFO).WithField(object_id).WithField(stable_node_id)
+                  << "Pin transfer succeeded, updating pinned location";
+              reference_counter_->UpdateObjectPinnedAtRaylet(object_id, stable_node_id);
+            } else {
+              RAY_LOG(DEBUG).WithField(object_id).WithField(stable_node_id)
+                  << "Pin transfer failed: "
+                  << (status.ok() ? "object not found at node" : status.ToString())
+                  << ". Original pin location unchanged.";
+            }
+          });
+}
+
 void CoreWorker::ExperimentalRegisterMutableObjectWriter(
     const ObjectID &writer_object_id, const std::vector<NodeID> &remote_reader_node_ids) {
   SubscribeToNodeChanges();
@@ -3893,6 +4050,10 @@ void CoreWorker::AddObjectLocationOwner(const ObjectID &object_id,
       reference_counter_->AddDynamicReturn(object_id, maybe_generator_id);
     }
     RAY_UNUSED(reference_counter_->AddObjectLocation(object_id, node_id));
+  }
+
+  if (reference_exists) {
+    MaybeTriggerPinTransfer(object_id, node_id);
   }
 }
 

@@ -1973,5 +1973,33 @@ class CoreWorker : public std::enable_shared_from_this<CoreWorker> {
   // Shutdown synchronization primitives
   std::atomic<bool> connected_{true};
   std::atomic<bool> event_loops_running_{false};
+
+  /// Cache: NodeID → is_preemptible. Lazily populated via GCS AsyncGetAll.
+  /// Node labels are immutable after startup, so caching is safe.
+  absl::flat_hash_map<NodeID, bool> preemptible_node_cache_
+      ABSL_GUARDED_BY(preemptible_cache_mutex_);
+  mutable absl::Mutex preemptible_cache_mutex_;
+
+  /// Objects currently undergoing pin transfer. Prevents duplicate transfers.
+  absl::flat_hash_set<ObjectID> pin_transfers_in_flight_
+      ABSL_GUARDED_BY(pin_transfer_mutex_);
+  mutable absl::Mutex pin_transfer_mutex_;
+
+  /// Check if we should transfer the pin from a preemptible node to a stable node.
+  /// Called from AddObjectLocationOwner when a new location is reported.
+  void MaybeTriggerPinTransfer(const ObjectID &object_id,
+                               const NodeID &new_location_node_id);
+
+  /// Execute the pin transfer: pin the object at the stable node and update
+  /// the pinned location on success.
+  void DoPinTransfer(const ObjectID &object_id,
+                     const NodeID &stable_node_id,
+                     const rpc::Address &stable_node_address);
+
+  /// Look up cached preemptible status for a node.
+  std::optional<bool> IsNodePreemptibleCached(const NodeID &node_id) const;
+
+  /// Cache a node's preemptible status.
+  void CacheNodePreemptible(const NodeID &node_id, bool is_preemptible);
 };
 }  // namespace ray::core
