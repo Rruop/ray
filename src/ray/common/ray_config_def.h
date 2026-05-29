@@ -1083,3 +1083,12 @@ RAY_CONFIG(int64_t, object_replication_min_size, 100 * 1024)
 
 /// Maximum number of concurrent object replications per node.
 RAY_CONFIG(int64_t, object_replication_max_concurrent, 10)
+
+/// Whether to enable object-aware drain for GPU nodes.
+/// When enabled, draining nodes will wait for pinned objects to be consumed
+/// or migrated before shutting down.
+RAY_CONFIG(bool, enable_object_aware_drain, true)
+
+/// Timeout in milliseconds for waiting pinned objects to be naturally consumed
+/// during drain. After this timeout, objects will be actively migrated.
+RAY_CONFIG(int64_t, gpu_node_object_drain_timeout_ms, 30000)

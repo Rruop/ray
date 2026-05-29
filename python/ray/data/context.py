@@ -738,6 +738,11 @@ class DataContext:
     # Kconf token (only used when store_type is "kconf")
     execution_config_kconf_token: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN
 
+    # GPU node proactive drain settings
+    # When enabled, Ray Data will proactively drain GPU nodes after all
+    # GPU operators on that node have finished execution.
+    gpu_node_proactive_drain_enabled: bool = True
+
     def __post_init__(self):
         # The additonal ray remote args that should be added to
         # the task-pool-based data tasks.

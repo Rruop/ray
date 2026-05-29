@@ -64,6 +64,15 @@ class LocalObjectManagerInterface {
 
   virtual int64_t GetPrimaryBytes() const = 0;
 
+  /// Returns true if there are any pinned objects on this node.
+  virtual bool HasPinnedObjects() const = 0;
+
+  /// Migrate all pinned objects to other nodes during drain.
+  virtual void MigrateAllPinnedObjects(
+      std::function<NodeID()> select_target,
+      std::function<void(const ObjectID &, const NodeID &)> push_object,
+      std::function<void()> on_complete) = 0;
+
   virtual bool HasLocallySpilledObjects() const = 0;
 
   virtual std::string DebugString() const = 0;

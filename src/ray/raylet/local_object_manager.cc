@@ -670,6 +670,44 @@ int64_t LocalObjectManager::GetPrimaryBytes() const {
   return pinned_objects_size_ + num_bytes_pending_spill_;
 }
 
+void LocalObjectManager::MigrateAllPinnedObjects(
+    std::function<NodeID()> select_target,
+    std::function<void(const ObjectID &, const NodeID &)> push_object,
+    std::function<void()> on_complete) {
+  std::vector<ObjectID> objects_to_migrate;
+  for (const auto &[object_id, _] : pinned_objects_) {
+    objects_to_migrate.push_back(object_id);
+  }
+
+  if (objects_to_migrate.empty()) {
+    on_complete();
+    return;
+  }
+
+  RAY_LOG(INFO) << "Migrating " << objects_to_migrate.size()
+                << " pinned objects for drain";
+
+  auto remaining =
+      std::make_shared<std::atomic<int64_t>>(objects_to_migrate.size());
+
+  for (const auto &object_id : objects_to_migrate) {
+    NodeID target = select_target();
+    if (target.IsNil()) {
+      RAY_LOG(WARNING) << "No migration target available for object " << object_id;
+      if (remaining->fetch_sub(1) == 1) {
+        on_complete();
+      }
+      continue;
+    }
+    RAY_LOG(DEBUG) << "Pushing object " << object_id << " to node " << target
+                   << " for drain migration";
+    push_object(object_id, target);
+    if (remaining->fetch_sub(1) == 1) {
+      on_complete();
+    }
+  }
+}
+
 bool LocalObjectManager::HasLocallySpilledObjects() const {
   if (!is_external_storage_type_fs_) {
     // External storage is not local.

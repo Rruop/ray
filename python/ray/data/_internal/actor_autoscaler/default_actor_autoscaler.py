@@ -12,6 +12,9 @@ from ray.data._internal.execution.interfaces.execution_options import ExecutionR
 from ray.data.context import WARN_PREFIX, AutoscalingConfig
 
 if TYPE_CHECKING:
+    from ray.data._internal.execution.gpu_node_drain_manager import (
+        GPUNodeDrainManager,
+    )
     from ray.data._internal.execution.interfaces import PhysicalOperator
     from ray.data._internal.execution.resource_manager import ResourceManager
     from ray.data._internal.execution.streaming_executor_state import OpState, Topology
@@ -27,6 +30,7 @@ class DefaultActorAutoscaler(ActorAutoscaler):
         *,
         config: AutoscalingConfig,
         actor_pool_resizing_policy: Optional[ActorPoolResizingPolicy] = None,
+        gpu_drain_manager: Optional["GPUNodeDrainManager"] = None,
     ):
         super().__init__(topology, resource_manager)
 
@@ -37,6 +41,12 @@ class DefaultActorAutoscaler(ActorAutoscaler):
             config.actor_pool_util_downscaling_threshold
         )
         self._actor_pool_max_upscaling_delta = config.actor_pool_max_upscaling_delta
+        self._gpu_drain_manager = gpu_drain_manager
+        self._drained_ops: set = set()
+        # Nodes pending drain — populated during actor kill, drained on next tick.
+        # This provides a natural delay window for workers to exit after ray.kill,
+        # resolving the kill→idle race condition without sleep or threads.
+        self._pending_drain_nodes: set = set()
 
         self._actor_pool_resizing_policy = (
             actor_pool_resizing_policy
@@ -52,10 +62,53 @@ class DefaultActorAutoscaler(ActorAutoscaler):
         for op, state in self._topology.items():
             actor_pools = op.get_autoscaling_actor_pools()
             for actor_pool in actor_pools:
-                # Trigger auto-scaling
-                actor_pool.scale(
-                    self._derive_target_scaling_config(actor_pool, op, state)
-                )
+                # If the operator has finished and we have a drain manager,
+                # force release GPU actors and record nodes for drain.
+                # This must run BEFORE scale() to avoid scale's del-based
+                # release racing with our ray.kill-based release.
+                if (
+                    self._gpu_drain_manager is not None
+                    and op.has_execution_finished()
+                    and id(op) not in self._drained_ops
+                ):
+                    self._force_release_actors(op, actor_pool)
+                    self._drained_ops.add(id(op))
+                else:
+                    # Normal auto-scaling path.
+                    actor_pool.scale(
+                        self._derive_target_scaling_config(actor_pool, op, state)
+                    )
+
+        # Process pending drain requests at end of tick.
+        # By this point, workers killed earlier in this tick (or previous ticks)
+        # have likely exited, so the node is idle and drain will be accepted.
+        if self._pending_drain_nodes and self._gpu_drain_manager is not None:
+            for node_id in list(self._pending_drain_nodes):
+                self._gpu_drain_manager.request_drain_for_node(node_id)
+                self._pending_drain_nodes.discard(node_id)
+
+    def _force_release_actors(self, op, actor_pool):
+        """Force release GPU actors and record nodes for drain on next tick."""
+        from ray.data._internal.execution.operators.actor_pool_map_operator import (
+            _ActorPool,
+        )
+
+        if not isinstance(actor_pool, _ActorPool):
+            return
+
+        # Only drain for GPU operators.
+        if actor_pool.per_actor_resource_usage().gpu <= 0:
+            return
+
+        # Aggregate actors by node.
+        actors_by_node = {}
+        for actor, actor_state in list(actor_pool.running_actors().items()):
+            actors_by_node.setdefault(actor_state.actor_location, []).append(actor)
+
+        for node_id in actors_by_node:
+            actor_pool.force_release_actors_on_node(node_id)
+            # Record for drain on next tick (delay allows worker exit).
+            self._pending_drain_nodes.add(node_id)
 
     def _compute_utilization(self, actor_pool: AutoscalingActorPool) -> float:
         """Compute the utilization of the actor pool.

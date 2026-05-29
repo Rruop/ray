@@ -291,6 +291,17 @@ NodeManager::NodeManager(
   worker_pool_.SetRuntimeEnvAgentClient(std::move(runtime_env_agent_client));
   worker_pool_.Start();
   is_preemptible_node_cached_ = IsPreemptibleNode();
+
+  // Wire object-aware drain callbacks.
+  if (RayConfig::instance().enable_object_aware_drain()) {
+    cluster_resource_scheduler_.GetLocalResourceManager().SetHasPinnedObjects(
+        [this]() { return local_object_manager_.HasPinnedObjects(); });
+    cluster_resource_scheduler_.GetLocalResourceManager().SetTriggerObjectMigration(
+        [this](std::function<void()> on_complete) {
+          MigratePinnedObjectsForDrain(std::move(on_complete));
+        });
+  }
+
   periodical_runner_->RunFnPeriodically([this]() { GCWorkerFailureReason(); },
                                         RayConfig::instance().task_failure_entry_ttl_ms(),
                                         "NodeManager.GCTaskFailureReason");
@@ -2176,6 +2187,17 @@ void NodeManager::HandleDrainRaylet(rpc::DrainRayletRequest request,
                                                    work->is_selected_based_on_locality_,
                                                    work->reply_callbacks_);
     }
+
+    // Start periodic timer to drive object-aware drain progress.
+    if (RayConfig::instance().enable_object_aware_drain()) {
+      periodical_runner_->RunFnPeriodically(
+          [this]() {
+            cluster_resource_scheduler_.GetLocalResourceManager()
+                .RecheckDrainState();
+          },
+          /*period_ms=*/5000,
+          "NodeManager.ObjectDrainCheck");
+    }
   }
 }
 
@@ -3571,6 +3593,7 @@ NodeID NodeManager::SelectMigrationTarget() const {
     if (node_id == self_node_id_) {
       continue;
     }
+    // Exclude nodes that are draining.
     if (node.GetLocalView().is_draining) {
       continue;
     }

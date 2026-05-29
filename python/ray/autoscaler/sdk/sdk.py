@@ -380,6 +380,34 @@ def register_callback_handler(
 
 
 @DeveloperAPI
+def request_node_drain(
+    node_id: bytes,
+    reason: str = "",
+    deadline_remaining_seconds: Optional[int] = None,
+) -> bool:
+    """Request the autoscaler to drain a node.
+
+    Sends an IDLE_TERMINATION drain request to the GCS for the specified node.
+    The request is advisory -- the Raylet will only accept the drain if the
+    node is currently idle (no active workers). If rejected, the caller can
+    rely on the Autoscaler's native idle detection as a fallback.
+
+    This is the scale-down counterpart to ``request_resources()`` (scale-up).
+
+    Args:
+        node_id: The Ray node ID (bytes) to drain.
+        reason: Human-readable reason for the drain request.
+        deadline_remaining_seconds: Optional deadline in seconds. If None,
+            no deadline is set (node drains gracefully).
+
+    Returns:
+        True if the drain request was accepted by the GCS, False if rejected
+        (e.g. because the node still has active workers).
+    """
+    return commands.request_node_drain(node_id, reason, deadline_remaining_seconds)
+
+
+@DeveloperAPI
 def get_docker_host_mount_location(cluster_name: str) -> str:
     """Return host path that Docker mounts attach to."""
     docker_mount_prefix = "/tmp/ray_tmp_mount/{cluster_name}"

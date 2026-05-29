@@ -225,6 +225,7 @@ class StreamingExecutor(Executor, threading.Thread):
             self._topology,
             self._resource_manager,
             config=self._data_context.autoscaling_config,
+            gpu_drain_manager=self._get_gpu_drain_manager(),
         )
 
         # Initialize operator configuration synchronization if enabled
@@ -351,6 +352,15 @@ class StreamingExecutor(Executor, threading.Thread):
             self._data_context.set_dataset_logger_id(
                 unregister_dataset_logger(self._dataset_id)
             )
+
+    def _get_gpu_drain_manager(self):
+        """Create a GPUNodeDrainManager if proactive drain is enabled."""
+        if not self._data_context.gpu_node_proactive_drain_enabled:
+            return None
+        from ray.data._internal.execution.gpu_node_drain_manager import (
+            GPUNodeDrainManager,
+        )
+        return GPUNodeDrainManager(enabled=True)
 
     def _initialize_operator_config_sync(self) -> None:
         """Initialize operator configuration synchronization if enabled."""

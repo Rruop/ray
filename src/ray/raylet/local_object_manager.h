@@ -204,6 +204,18 @@ class LocalObjectManager : public LocalObjectManagerInterface {
   /// bytes used by objects currently being spilled.
   int64_t GetPrimaryBytes() const override;
 
+  /// Returns true if there are any pinned objects on this node.
+  bool HasPinnedObjects() const override { return !pinned_objects_.empty(); }
+
+  /// Migrate all pinned objects to other nodes during drain.
+  /// \param select_target Callback to select a migration target node.
+  /// \param push_object Callback to push an object to a target node.
+  /// \param on_complete Callback invoked when all migrations are initiated.
+  void MigrateAllPinnedObjects(
+      std::function<NodeID()> select_target,
+      std::function<void(const ObjectID &, const NodeID &)> push_object,
+      std::function<void()> on_complete) override;
+
   /// Returns true if we have objects spilled to the local
   /// filesystem.
   bool HasLocallySpilledObjects() const override;

@@ -737,6 +737,9 @@ class _ActorState:
     # Is Actor state restarting or alive
     is_restarting: bool
 
+    # Whether this actor is being drained (no new tasks should be dispatched)
+    is_draining: bool = False
+
 
 class _ActorTaskSelector(abc.ABC):
     def __init__(self, actor_pool: "_ActorPool"):
@@ -1288,7 +1291,9 @@ class _ActorPool(AutoscalingActorPool):
 
     def on_task_completed(self, actor: ray.actor.ActorHandle):
         """Called when a task completes. Returns the provided actor to the pool."""
-        assert actor in self._running_actors
+        # Actor may have been force-released during drain; skip if already removed.
+        if actor not in self._running_actors:
+            return
         assert self._running_actors[actor].num_tasks_in_flight > 0
         self._running_actors[actor].num_tasks_in_flight -= 1
         self._total_num_tasks_in_flight -= 1
@@ -1342,7 +1347,7 @@ class _ActorPool(AutoscalingActorPool):
         proceed even when max_tasks_in_flight_per_actor > 1.
 
         The actors to exclude are selected based on lowest task count (will
-        become idle soonest).
+        become idle soonest). Actors marked as draining are always excluded.
         """
         if self._pending_scale_down_count <= 0:
             return self._running_actors
@@ -1364,7 +1369,7 @@ class _ActorPool(AutoscalingActorPool):
         return {
             actor: state
             for actor, state in self._running_actors.items()
-            if actor not in actors_to_exclude
+            if actor not in actors_to_exclude and not state.is_draining
         }
 
     def _remove_inactive_actor(self) -> bool:
@@ -1478,6 +1483,37 @@ class _ActorPool(AutoscalingActorPool):
         del self._actor_to_logical_id[actor]
 
         return ref
+
+    def force_release_actors_on_node(
+        self,
+        node_id: str,
+    ) -> List[ray.actor.ActorHandle]:
+        """Force release all actors on a node for drain.
+
+        Marks actors as draining to block new task dispatch, then immediately
+        kills them with ray.kill(no_restart=True). This is non-blocking
+        and safe to call from the scheduling loop.
+
+        Args:
+            node_id: The node ID whose actors should be released.
+
+        Returns:
+            List of actor handles that were killed.
+        """
+        killed = []
+        for actor, state in list(self._running_actors.items()):
+            if state.actor_location == node_id:
+                ray.kill(actor, no_restart=True)
+                self._total_num_tasks_in_flight -= state.num_tasks_in_flight
+                if state.num_tasks_in_flight > 0:
+                    self._num_active_actors -= 1
+                if state.is_restarting:
+                    self._num_restarting_actors -= 1
+                del self._running_actors[actor]
+                del self._actor_to_logical_id[actor]
+                killed.append(actor)
+
+        return killed
 
     def get_actor_info(self) -> _ActorPoolInfo:
         """Returns current snapshot of actors' being used in the pool"""

@@ -355,6 +355,14 @@ class NodeManager : public rpc::NodeManagerServiceHandler,
   /// Returns NodeID::Nil() if no stable node is available.
   NodeID SelectStableNode() const;
 
+  /// Select a random non-draining node as migration target during drain.
+  /// Returns NodeID::Nil() if no target is available.
+  NodeID SelectMigrationTarget() const;
+
+  /// Migrate pinned objects to other nodes when draining.
+  /// \param on_complete Callback invoked when all migrations are initiated.
+  void MigratePinnedObjectsForDrain(std::function<void()> on_complete);
+
   /// Handle an accepted client connection.
   void HandleAccept(const boost::system::error_code &error);
 

@@ -99,6 +99,15 @@ class FakeLocalObjectManager : public LocalObjectManagerInterface {
 
   int64_t GetPrimaryBytes() const override { return 0; }
 
+  bool HasPinnedObjects() const override { return false; }
+
+  void MigrateAllPinnedObjects(
+      std::function<NodeID()> select_target,
+      std::function<void(const ObjectID &, const NodeID &)> push_object,
+      std::function<void()> on_complete) override {
+    on_complete();
+  }
+
   bool HasLocallySpilledObjects() const override { return false; }
 
   std::string DebugString() const override { return ""; }

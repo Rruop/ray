@@ -242,6 +242,48 @@ def request_resources(
         )
 
 
+def request_node_drain(
+    node_id: bytes,
+    reason: str = "",
+    deadline_remaining_seconds: Optional[int] = None,
+) -> bool:
+    """Request the GCS to drain a node via IDLE_TERMINATION.
+
+    Args:
+        node_id: The Ray node ID (bytes) to drain.
+        reason: Human-readable reason for the drain request.
+        deadline_remaining_seconds: Optional deadline in seconds.
+
+    Returns:
+        True if the drain request was accepted, False if rejected.
+    """
+    if not ray.is_initialized():
+        raise RuntimeError("Ray is not initialized yet")
+    import ray._private.worker
+    import ray._raylet
+    from ray.core.generated import autoscaler_pb2
+
+    gcs_client = ray._raylet.GcsClient(
+        address=ray._private.worker.global_worker.gcs_client.address
+    )
+    deadline_timestamp_ms = 0
+    if deadline_remaining_seconds is not None:
+        import time as _time
+
+        deadline_timestamp_ms = int(
+            (_time.time() + deadline_remaining_seconds) * 1000
+        )
+    is_accepted, rejection_msg = gcs_client.drain_node(
+        node_id,
+        autoscaler_pb2.DrainNodeReason.Value(
+            "DRAIN_NODE_REASON_IDLE_TERMINATION"
+        ),
+        reason.encode() if isinstance(reason, str) else reason,
+        deadline_timestamp_ms,
+    )
+    return is_accepted
+
+
 def create_or_update_cluster(
     config_file: str,
     override_min_workers: Optional[int],

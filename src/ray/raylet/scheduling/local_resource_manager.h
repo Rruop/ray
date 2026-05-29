@@ -178,6 +178,22 @@ class LocalResourceManager : public syncer::ReporterInterface {
   /// Generate node death info from existing drain request.
   rpc::NodeDeathInfo DeathInfoFromDrainRequest();
 
+  /// Set the callback to query whether there are pinned objects on this node.
+  void SetHasPinnedObjects(std::function<bool(void)> has_pinned_objects) {
+    has_pinned_objects_ = std::move(has_pinned_objects);
+  }
+
+  /// Set the callback to trigger object migration during drain.
+  /// The callback takes an on_complete function that should be called
+  /// when migration is finished.
+  void SetTriggerObjectMigration(
+      std::function<void(std::function<void()>)> trigger_object_migration) {
+    trigger_object_migration_ = std::move(trigger_object_migration);
+  }
+
+  /// Re-check drain state, called periodically during object-aware drain.
+  void RecheckDrainState() { OnResourceOrStateChanged(); }
+
  private:
   struct ResourceUsage {
     double avail;
@@ -259,6 +275,21 @@ class LocalResourceManager : public syncer::ReporterInterface {
   std::optional<rpc::DrainRayletRequest> drain_request_;
 
   ray::observability::MetricInterface &resource_usage_gauge_;
+
+  /// Callback to query whether there are pinned objects on this node.
+  /// Used for object-aware drain to delay shutdown until objects are migrated.
+  std::function<bool(void)> has_pinned_objects_;
+
+  /// Callback to trigger object migration during drain.
+  /// Called when the drain timeout expires and there are still pinned objects.
+  std::function<void(std::function<void()>)> trigger_object_migration_;
+
+  /// The time when drain was accepted and the node became idle.
+  /// Used to compute the object drain timeout.
+  std::optional<absl::Time> drain_accepted_time_;
+
+  /// Whether object migration has been triggered during drain (prevents re-entry).
+  bool drain_migration_triggered_ = false;
 
   FRIEND_TEST(ClusterResourceSchedulerTest, SchedulingUpdateTotalResourcesTest);
   FRIEND_TEST(ClusterResourceSchedulerTest, AvailableResourceInstancesOpsTest);

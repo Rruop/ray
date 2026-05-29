@@ -446,9 +446,46 @@ std::optional<syncer::RaySyncMessage> LocalResourceManager::CreateSyncMessage(
 
 void LocalResourceManager::OnResourceOrStateChanged() {
   if (IsLocalNodeDraining() && IsLocalNodeIdle()) {
-    RAY_LOG(INFO) << "The node is drained, continue to shut down raylet...";
-    rpc::NodeDeathInfo node_death_info = DeathInfoFromDrainRequest();
-    shutdown_raylet_gracefully_(std::move(node_death_info));
+    bool ready_to_shutdown = true;
+
+    // Object-aware drain: delay shutdown if there are pinned objects.
+    if (RayConfig::instance().enable_object_aware_drain() && has_pinned_objects_ &&
+        has_pinned_objects_()) {
+      ready_to_shutdown = false;
+
+      if (!drain_accepted_time_.has_value()) {
+        drain_accepted_time_ = now_fn_();
+        RAY_LOG(INFO) << "Node is idle and draining but has pinned objects. "
+                      << "Waiting for objects to be consumed or migrated.";
+      }
+
+      auto elapsed = now_fn_() - *drain_accepted_time_;
+      int64_t timeout_ms =
+          RayConfig::instance().gpu_node_object_drain_timeout_ms();
+
+      if (elapsed >= absl::Milliseconds(timeout_ms)) {
+        // Timeout expired, trigger active migration if not yet triggered.
+        if (!drain_migration_triggered_ && trigger_object_migration_) {
+          drain_migration_triggered_ = true;
+          RAY_LOG(INFO) << "Object drain timeout expired. Triggering object migration.";
+          trigger_object_migration_([this]() {
+            // Migration initiated callback: re-check state.
+            OnResourceOrStateChanged();
+          });
+        }
+      }
+
+      // Check if all objects have been drained (consumed or migrated).
+      if (!has_pinned_objects_()) {
+        ready_to_shutdown = true;
+      }
+    }
+
+    if (ready_to_shutdown) {
+      RAY_LOG(INFO) << "The node is drained, continue to shut down raylet...";
+      rpc::NodeDeathInfo node_death_info = DeathInfoFromDrainRequest();
+      shutdown_raylet_gracefully_(std::move(node_death_info));
+    }
   }
 
   ++version_;
