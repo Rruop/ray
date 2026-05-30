@@ -1,7 +1,9 @@
+import heapq
 import logging
 import time
 import uuid
 import warnings
+from dataclasses import replace
 from collections import defaultdict
 from dataclasses import dataclass
 from typing import (
@@ -13,6 +15,7 @@ from typing import (
     Iterator,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -806,10 +809,10 @@ class _ActorPool(AutoscalingActorPool):
         self._num_restarting_actors: int = 0
         self._num_active_actors: int = 0
         self._total_num_tasks_in_flight: int = 0
-        # Pending scale down count: tracks actors that need to be removed
-        # when they become idle (used when scale down is requested but
-        # all actors are currently busy)
-        self._pending_scale_down_count: int = 0
+        # Actors marked to be drained: they no longer receive new tasks and
+        # are released as soon as they become idle. Rebuilt on each scale()
+        # call; self-heals via _release_running_actor.
+        self._draining_actors: Set[ActorHandle] = set()
 
         # ALIVE Actor on ACTIVE node -> _ActorRank(num_tasks_in_flight)
         # heap gives highest rank (lowest comparable value) first.
@@ -858,14 +861,10 @@ class _ActorPool(AutoscalingActorPool):
     def scale(self, req: ActorPoolScalingRequest) -> Optional[int]:
         """Scale the actor pool up or down.
 
-        For scale up: creates new actors and resets pending scale down.
-        For scale down: removes idle/pending actors immediately, and sets
-        _pending_scale_down_count for busy actors to be removed when they
-        become idle.
-
-        Note: Each scale call resets _pending_scale_down_count rather than
-        accumulating, as the caller (autoscaler) recalculates the target
-        on each invocation.
+        On scale down, idle/pending actors are removed first; if more must
+        go than are idle, the soonest-to-be-idle running actors are added
+        to ``self._draining_actors`` and released as they become idle.
+        Scale up clears the drain set.
         """
         # Verify request could be applied
         if not self._can_apply_request(req):
@@ -874,13 +873,8 @@ class _ActorPool(AutoscalingActorPool):
         map_worker_cls_name = self.map_worker_cls_name
 
         if req.delta > 0:
-            # Scale up: reset pending scale down count since we need more actors
-            if self._pending_scale_down_count > 0:
-                logger.debug(
-                    f"Scale up requested, resetting pending scale down count "
-                    f"from {self._pending_scale_down_count} to 0."
-                )
-                self._pending_scale_down_count = 0
+            # Scale up invalidates any prior drain decision.
+            self._draining_actors.clear()
             target_num_actors = req.delta
 
             logger.debug(
@@ -905,15 +899,15 @@ class _ActorPool(AutoscalingActorPool):
                 if self._remove_inactive_actor():
                     num_released += 1
 
-            # Set (not accumulate) pending count for busy actors
-            # The autoscaler recalculates target on each call, so we reset
+            # Rebuild the drain set; pick the actors that will become idle
+            # soonest to minimize time-to-release.
             num_deferred = target_num_actors - num_released
-            self._pending_scale_down_count = num_deferred
+            self._draining_actors = self._select_drain_candidates(num_deferred)
 
-            if num_deferred > 0:
+            if self._draining_actors:
                 logger.debug(
-                    f"Deferred scale down of {num_deferred} actors "
-                    f"(all actors busy, will remove when idle)."
+                    f"Deferred scale down of {len(self._draining_actors)} actor(s) "
+                    f"(all running actors busy, will release on idle)."
                 )
 
             if num_released > 0:
@@ -969,14 +963,13 @@ class _ActorPool(AutoscalingActorPool):
             return
 
         # Update bounds if changed
-        if self._min_size != min_size or self._max_size != max_size:
+        if self._config.min_size != min_size or self._config.max_size != max_size:
             logger.info(
                 f"Updating actor pool bounds from "
-                f"(min={self._min_size}, max={self._max_size}) "
+                f"(min={self._config.min_size}, max={self._config.max_size}) "
                 f"to (min={min_size}, max={max_size})."
             )
-            self._min_size = min_size
-            self._max_size = max_size
+            self._config = replace(self._config, min_size=min_size, max_size=max_size)
 
         # Scale to target if needed
         current_size = self.current_size()
@@ -1099,43 +1092,30 @@ class _ActorPool(AutoscalingActorPool):
         if not self._alive_actors_to_in_flight_tasks_heap:
             return None
 
-        _, least_busy_rank = self._alive_actors_to_in_flight_tasks_heap.peekitem()
-        if least_busy_rank >= self.max_tasks_in_flight_per_actor():
+        peek_actor, peek_rank = self._alive_actors_to_in_flight_tasks_heap.peekitem()
+        max_in_flight = self.max_tasks_in_flight_per_actor()
+        if peek_rank >= max_in_flight:
             return None
 
-        # When there are pending scale downs, exclude draining actors
-        # so new tasks are not dispatched to actors that should be released.
-        actors_to_exclude = self._get_draining_actors()
-
+        # O(1) membership checks per dispatch.
+        draining = self._draining_actors
         target_actor: Optional[ActorHandle] = None
 
         if bundle is not None and actor_locality_enabled:
-            target_actor = self._find_actor_with_locality(bundle)
-            if target_actor in actors_to_exclude:
-                target_actor = None
+            # Drain-aware locality so we don't silently fall back and lose locality.
+            target_actor = self._find_actor_with_locality(
+                bundle, actors_to_exclude=draining
+            )
 
         if target_actor is None:
-            if not actors_to_exclude:
-                # Fast path: no draining actors, use heap peek directly
-                target_actor, _ = self._alive_actors_to_in_flight_tasks_heap.peekitem()
+            if peek_actor not in draining:
+                target_actor = peek_actor
             else:
-                # Find the least busy actor that is not draining.
-                # The heap's internal array is NOT fully sorted (only
-                # heap[0] is guaranteed to be the minimum), so we must
-                # scan all entries to find the true minimum among
-                # non-excluded actors.
-                max_in_flight = self.max_tasks_in_flight_per_actor()
-                min_rank = self._alive_actors_to_in_flight_tasks_heap.heap[0][0]
-                best_rank = None
-                for value, key, _ in self._alive_actors_to_in_flight_tasks_heap.heap:
-                    if value >= max_in_flight:
-                        continue
-                    if key not in actors_to_exclude:
-                        if best_rank is None or value < best_rank:
-                            best_rank = value
-                            target_actor = key
-                            if best_rank == min_rank:
-                                break
+                target_actor = self._scan_heap_for_min(
+                    self._alive_actors_to_in_flight_tasks_heap,
+                    max_in_flight,
+                    draining,
+                )
 
         return target_actor
 
@@ -1146,16 +1126,17 @@ class _ActorPool(AutoscalingActorPool):
         assert state.num_tasks_in_flight > 0
         state.num_tasks_in_flight -= 1
         self._total_num_tasks_in_flight -= 1
+
         if not state.num_tasks_in_flight:
             self._num_active_actors -= 1
-            # If there's a pending scale down, remove this actor directly
-            # instead of searching for an idle actor
-            if self._pending_scale_down_count > 0:
+            # Honor the deferred scale-down: release as soon as the actor
+            # is idle. _release_running_actor handles all bookkeeping
+            # (heap removal, draining set discard).
+            if actor in self._draining_actors:
                 self._release_running_actor(actor)
-                self._pending_scale_down_count -= 1
                 logger.debug(
-                    f"Executed deferred scale down on actor that just became idle. "
-                    f"Remaining pending: {self._pending_scale_down_count}"
+                    f"Released draining actor on idle. "
+                    f"Remaining draining: {len(self._draining_actors)}."
                 )
 
         if actor in self._alive_actors_to_in_flight_tasks_heap:
@@ -1281,25 +1262,44 @@ class _ActorPool(AutoscalingActorPool):
 
     def pending_scale_down_count(self) -> int:
         """Return the number of actors pending scale down."""
-        return self._pending_scale_down_count
+        return len(self._draining_actors)
 
-    def _get_draining_actors(self) -> Set[ray.actor.ActorHandle]:
-        """Return actors that are draining and should not receive new tasks.
+    def _select_drain_candidates(self, num_to_drain: int) -> Set[ActorHandle]:
+        """Pick the ``num_to_drain`` running actors that will become idle soonest.
 
-        When there's a pending scale down, returns the set of actors with
-        the lowest task count (will become idle soonest). These actors
-        should not receive new tasks so they can drain and be released.
+        Snapshot at scale() time; not re-evaluated as in-flight counts shift.
         """
-        if self._pending_scale_down_count <= 0:
+        if num_to_drain <= 0:
             return set()
 
-        sorted_actors = sorted(
+        candidates = heapq.nsmallest(
+            num_to_drain,
             self._running_actors.items(),
-            key=lambda x: x[1].num_tasks_in_flight,
+            key=lambda item: item[1].num_tasks_in_flight,
         )
-        num_to_exclude = min(self._pending_scale_down_count,
-                             len(sorted_actors))
-        return {actor for actor, _ in sorted_actors[:num_to_exclude]}
+        return {actor for actor, _ in candidates}
+
+    @staticmethod
+    def _scan_heap_for_min(
+        heap: heapdict,
+        max_in_flight: "_ActorRank",
+        excluded: Set[ActorHandle],
+    ) -> Optional[ActorHandle]:
+        """Least-busy actor under ``max_in_flight`` not in ``excluded``.
+
+        Heap-ordered storage is only sorted at the root, so we may scan all
+        entries; bail out early if we match the root rank.
+        """
+        min_rank = heap.heap[0][0]
+        best: Optional[Tuple[_ActorRank, ActorHandle]] = None
+        for value, key, _ in heap.heap:
+            if value >= max_in_flight or key in excluded:
+                continue
+            if best is None or value < best[0]:
+                best = (value, key)
+                if value == min_rank:
+                    break
+        return best[1] if best else None
 
     def _remove_inactive_actor(self) -> bool:
         """Kills a single pending or idle actor, if any actors are pending/idle.
@@ -1389,20 +1389,25 @@ class _ActorPool(AutoscalingActorPool):
         if node_heap is not None and actor in node_heap:
             del node_heap[actor]
 
+        # Self-heal the draining set on any release path (deferred scale-down,
+        # actor death, etc.) so no stale quota survives.
+        self._draining_actors.discard(actor)
+
         del self._running_actors[actor]
         del self._actor_to_logical_id[actor]
 
-    def _find_actor_with_locality(self, bundle: RefBundle) -> Optional[ActorHandle]:
+    def _find_actor_with_locality(
+        self,
+        bundle: RefBundle,
+        actors_to_exclude: Set[ActorHandle],
+    ) -> Optional[ActorHandle]:
         """Find the least-busy alive actor on the preferred node with the most data.
 
         Preferred nodes are visited in descending order of bytes on-node.
-        For each node, the per-node heap gives the least-busy actor in O(1).
-
-        Args:
-            bundle: The bundle to find an actor for.
-
-        Returns:
-            The best locality-aware actor, or None if none are available.
+        With no exclusions, peeking the per-node heap is O(1). When excluding
+        is required (e.g. during a deferred scale-down), we scan the per-node
+        heap so locality is preserved instead of falling back to the global
+        heap.
         """
         preferred_locs = bundle.get_preferred_object_locations()
         if not preferred_locs:
@@ -1416,8 +1421,15 @@ class _ActorPool(AutoscalingActorPool):
             node_heap = self._alive_node_to_actor_heap.get(node_id)
             if not node_heap:
                 continue
-            actor, rank = node_heap.peekitem()
-            if rank < max_tasks:
+
+            if not actors_to_exclude:
+                actor, rank = node_heap.peekitem()
+                if rank < max_tasks:
+                    return actor
+                continue
+
+            actor = self._scan_heap_for_min(node_heap, max_tasks, actors_to_exclude)
+            if actor is not None:
                 return actor
 
         return None

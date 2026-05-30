@@ -149,15 +149,19 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
 
         This ensures runtime config changes (e.g. via apply_parallelism_config)
         are reflected in the backpressure policy without requiring a restart.
+
+        NOTE: Only TaskPoolMapOperator has a concurrency cap; other operator
+        types are skipped.  A future optimisation could switch to a push model
+        where apply_parallelism_config notifies the policy directly, instead of
+        polling on every can_add_input call.
         """
-        if isinstance(op, TaskPoolMapOperator):
-            limit = op.get_max_concurrency_limit()
-            new_cap = limit if limit is not None else float("inf")
-        else:
-            new_cap = float("inf")
+        if not isinstance(op, TaskPoolMapOperator):
+            return
+        limit = op.get_max_concurrency_limit()
+        new_cap = limit if limit is not None else float("inf")
         old_cap = self._concurrency_caps.get(op, float("inf"))
         if new_cap != old_cap:
-            logger.info(
+            logger.debug(
                 f"ConcurrencyCapBackpressurePolicy: updated cap for {op.name} "
                 f"from {old_cap} to {new_cap}"
             )

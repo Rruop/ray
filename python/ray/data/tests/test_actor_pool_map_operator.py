@@ -276,7 +276,7 @@ class TestActorPool(unittest.TestCase):
             # No actors were immediately removed
             assert result == 0
             # But we have a pending scale down (reset, not accumulated)
-            assert pool._pending_scale_down_count == 1
+            assert pool.pending_scale_down_count() == 1
             # Pool size is still 2
             assert pool.current_size() == 2
 
@@ -284,7 +284,7 @@ class TestActorPool(unittest.TestCase):
         pool.on_task_completed(actor1)
 
         # The deferred scale down should have been executed
-        assert pool._pending_scale_down_count == 0
+        assert pool.pending_scale_down_count() == 0
         # One actor should have been removed
         assert pool.current_size() == 1
 
@@ -307,16 +307,16 @@ class TestActorPool(unittest.TestCase):
 
             # First scale down request: defer 1
             pool.scale(ActorPoolScalingRequest(delta=-1, reason="first scale down"))
-            assert pool._pending_scale_down_count == 1
+            assert pool.pending_scale_down_count() == 1
 
             # Second scale down request with delta=-2: should reset to 2, not add
             pool.scale(ActorPoolScalingRequest(delta=-2, reason="second scale down"))
             # Reset to 2 (not 1 + 2 = 3)
-            assert pool._pending_scale_down_count == 2
+            assert pool.pending_scale_down_count() == 2
 
             # Third scale down request with delta=-1: should reset to 1
             pool.scale(ActorPoolScalingRequest(delta=-1, reason="third scale down"))
-            assert pool._pending_scale_down_count == 1
+            assert pool.pending_scale_down_count() == 1
 
     def test_scale_up_resets_pending_scale_down(self):
         """Test that scale up resets pending scale down to 0."""
@@ -337,12 +337,12 @@ class TestActorPool(unittest.TestCase):
 
             # Request scale down by 2 (both deferred)
             pool.scale(ActorPoolScalingRequest(delta=-2, reason="scale down"))
-            assert pool._pending_scale_down_count == 2
+            assert pool.pending_scale_down_count() == 2
 
             # Now request scale up - should reset pending scale down to 0
             result = pool.scale(ActorPoolScalingRequest(delta=1, reason="scale up"))
             assert result == 1  # 1 actor was created
-            assert pool._pending_scale_down_count == 0  # Reset to 0
+            assert pool.pending_scale_down_count() == 0  # Reset to 0
             assert pool.current_size() == 3  # New actor was added
 
     def test_partial_immediate_and_deferred_scale_down(self):
@@ -375,7 +375,7 @@ class TestActorPool(unittest.TestCase):
             # One actor was immediately removed (the idle one)
             assert result == -1
             # One is pending
-            assert pool._pending_scale_down_count == 1
+            assert pool.pending_scale_down_count() == 1
             assert pool.current_size() == 2
 
     def test_draining_actors_excluded_from_dispatch(self):
@@ -413,10 +413,10 @@ class TestActorPool(unittest.TestCase):
             # Request scale down by 2 - all actors are busy, so 2 are deferred
             result = pool.scale(ActorPoolScalingRequest(delta=-2, reason="scale down"))
             assert result == 0  # No immediate removal
-            assert pool._pending_scale_down_count == 2
+            assert pool.pending_scale_down_count() == 2
 
-            # Now verify that _get_draining_actors excludes draining actors
-            draining = pool._get_draining_actors()
+            # Now verify that the draining set excludes draining actors
+            draining = pool._draining_actors
 
             # Should exclude 2 actors (those with lowest task count)
             # Since all have 1 task, it will exclude 2 based on dict ordering
@@ -451,7 +451,7 @@ class TestActorPool(unittest.TestCase):
 
             # Request scale down by 1
             pool.scale(ActorPoolScalingRequest(delta=-1, reason="scale down"))
-            assert pool._pending_scale_down_count == 1
+            assert pool.pending_scale_down_count() == 1
             assert pool.current_size() == 2
 
             # Complete all tasks on actor1 (the draining one)
@@ -460,9 +460,77 @@ class TestActorPool(unittest.TestCase):
 
             pool.on_task_completed(actor1)  # 1 -> 0, now idle
             # Actor should be released now
-            assert pool._pending_scale_down_count == 0
+            assert pool.pending_scale_down_count() == 0
             assert pool.current_size() == 1
             assert actor1 not in pool._running_actors
+
+    def test_release_running_actor_clears_drain_set(self):
+        """An actor removed by any means must self-heal the draining set.
+
+        Otherwise, an actor crash routed through ``_release_running_actor``
+        outside the deferred-scale-down code path would leave a stale entry
+        in ``_draining_actors``, eventually shrinking the live pool more than
+        intended.
+        """
+        pool = self._create_actor_pool(min_size=1, max_size=4, max_tasks_in_flight=4)
+
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        self._assign_actor(pool)
+        self._assign_actor(pool)
+
+        with freeze_time() as f:
+            f.tick(
+                datetime.timedelta(
+                    seconds=_ActorPool._ACTOR_POOL_SCALE_DOWN_DEBOUNCE_PERIOD_S + 1
+                )
+            )
+            pool.scale(ActorPoolScalingRequest(delta=-1, reason="scale down"))
+            assert pool.pending_scale_down_count() == 1
+
+            # Pick whichever actor was placed into the drain set and
+            # release it through the generic path (simulates actor death).
+            (drained,) = list(pool._draining_actors)
+            pool._release_running_actor(drained)
+
+            # The drain set must shrink in lockstep so that no "ghost"
+            # quota survives the actor's removal.
+            assert pool.pending_scale_down_count() == 0
+            assert drained not in pool._running_actors
+            assert drained not in pool._draining_actors
+
+    def test_non_draining_idle_actor_is_not_released(self):
+        """``on_task_completed`` must release ONLY actors in the drain set.
+
+        Previously the code keyed off a counter, so any actor going idle
+        while ``_pending_scale_down_count > 0`` would be released — even
+        if it wasn't the one selected to drain. The set-based design must
+        not regress on this.
+        """
+        pool = self._create_actor_pool(min_size=1, max_size=4, max_tasks_in_flight=4)
+
+        actor1 = self._add_ready_actor(pool)
+        actor2 = self._add_ready_actor(pool)
+        self._assign_actor(pool)
+        self._assign_actor(pool)
+
+        with freeze_time() as f:
+            f.tick(
+                datetime.timedelta(
+                    seconds=_ActorPool._ACTOR_POOL_SCALE_DOWN_DEBOUNCE_PERIOD_S + 1
+                )
+            )
+            pool.scale(ActorPoolScalingRequest(delta=-1, reason="scale down"))
+            assert pool.pending_scale_down_count() == 1
+
+            (drained,) = list(pool._draining_actors)
+            non_drained = actor1 if drained is actor2 else actor2
+
+            # Completing the non-draining actor must not release it,
+            # nor decrement the drain quota.
+            pool.on_task_completed(non_drained)
+            assert non_drained in pool._running_actors
+            assert pool.pending_scale_down_count() == 1
 
     def test_add_pending(self):
         # Test that pending actor is added in the correct state.

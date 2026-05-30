@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import List, Optional
 
 from ray import ObjectRef
@@ -209,7 +209,7 @@ class AutoscalingActorPool(ABC):
         return self._LOGICAL_ACTOR_ID_LABEL_KEY
 
     def get_actor_info(self) -> ActorPoolInfo:
-        """Returns current snapshot of actors' being used in the pool"""
+        """Returns current snapshot of actors being used in the pool."""
         return ActorPoolInfo(
             running=self.num_alive_actors(),
             pending=self.num_pending_actors(),
