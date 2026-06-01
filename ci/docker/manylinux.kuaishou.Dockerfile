@@ -32,7 +32,7 @@ EOF
 COPY ci/build/build-manylinux-kuaishou.sh /tmp/build-manylinux-kuaishou.sh
 COPY ci/build/bazel-6.5.0-installer-linux-x86_64.sh /tmp/bazel-6.5.0-installer-linux-x86_64.sh
 
-RUN ./tmp/build-manylinux-kuaishou.sh
+RUN ./tmp/build-manylinux-kuaishou-bazel-6.5.0.sh
 
 USER forge
 ENV HOME=/home/forge
