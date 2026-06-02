@@ -181,6 +181,15 @@ def main(args: argparse.Namespace):
 
 
 if __name__ == "__main__":
-    ray.init(runtime_env={"py_modules": benchmark_py_modules()})
+    # ``Profiling.start()`` spawns ``_UDFPySpyProfiler`` actors on worker
+    # nodes. To deserialize that actor class, the worker has to import
+    # ``profiling.pyspy`` — which lives at this script's ``profiling/``
+    # sibling and isn't on the worker's Python path by default. Ship the
+    # directory alongside ``benchmark.py`` so workers can resolve the
+    # import.
+    import profiling as _profiling_pkg
+
+    _profiling_dir = os.path.dirname(os.path.abspath(_profiling_pkg.__file__))
+    ray.init(runtime_env={"py_modules": benchmark_py_modules() + [_profiling_dir]})
     args = parse_args()
     main(args)
