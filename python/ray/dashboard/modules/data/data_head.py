@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -126,8 +127,12 @@ class DataHead(SubprocessModule):
                                 datasets[dataset]["operators"][operator][metric][
                                     query_name
                                 ] = value
-            except aiohttp.client_exceptions.ClientConnectorError:
-                # Prometheus server may not be running,
+            except (
+                aiohttp.client_exceptions.ClientConnectorError,
+                aiohttp.client_exceptions.ConnectionTimeoutError,
+                asyncio.TimeoutError,
+            ):
+                # Prometheus server may not be running or not reachable,
                 # leave these values blank and return other data
                 logging.exception(
                     "Exception occurred while querying Prometheus. "
