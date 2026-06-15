@@ -76,6 +76,8 @@ from ray.data.block import (
 )
 from ray.data.context import DataContext
 
+from ray.data._internal.execution import perf_metrics as _pm
+
 logger = logging.getLogger(__name__)
 
 
@@ -771,58 +773,83 @@ def _map_task(
         # the same schema)
         yielded_schema: bool = False
 
-        with MemoryProfiler(data_context.memory_usage_poll_interval_s) as profiler:
-            for block in map_transformer.apply_transform(blocks_iter, ctx):
-                block_meta = BlockAccessor.for_block(block).get_metadata()
-                block_schema = BlockAccessor.for_block(block).schema()
+    
+        # 打点：统计输入行数（blocks 是 tuple，可以安全多次访问）
+        # 注意：ReadTask 等 datasource operator 传入的不是 Block，需要跳过
+        _input_rows = 0
+        for b in blocks:
+            try:
+                _input_rows += BlockAccessor.for_block(b).num_rows()
+            except (TypeError, Exception):
+                pass
+        _perf_ctx = _pm.PerfContext.from_runtime()
+        _submission_id = _perf_ctx.submission_id
+        _node_id = _pm.get_node_id()
 
-                # For Write operators, use actual written rows/bytes from context
-                # instead of the stats DataFrame's 1 row.
-                # NOTE: Write operators always produce exactly one output block per task,
-                # so we can safely pop these values (they won't be needed again).
-                if "_write_stats_num_rows" in ctx.kwargs:
-                    block_meta = replace(
-                        block_meta,
-                        num_rows=ctx.kwargs.pop("_write_stats_num_rows"),
-                        size_bytes=ctx.kwargs.pop("_write_stats_size_bytes"),
+        # 注册 task 到实时 CPU 采样线程
+        _pm.register_task(_perf_ctx, ctx.op_name, _node_id)
+
+        _output_rows = 0
+        with _pm.TaskTimer() as _timer:
+            with MemoryProfiler(data_context.memory_usage_poll_interval_s) as profiler:
+                for block in map_transformer.apply_transform(blocks_iter, ctx):
+                    block_meta = BlockAccessor.for_block(block).get_metadata()
+                    block_schema = BlockAccessor.for_block(block).schema()
+
+                    # For Write operators, use actual written rows/bytes from context
+                    # instead of the stats DataFrame's 1 row.
+                    # NOTE: Write operators always produce exactly one output block per task,
+                    # so we can safely pop these values (they won't be needed again).
+                    if "_write_stats_num_rows" in ctx.kwargs:
+                        block_meta = replace(
+                            block_meta,
+                            num_rows=ctx.kwargs.pop("_write_stats_num_rows"),
+                            size_bytes=ctx.kwargs.pop("_write_stats_size_bytes"),
+                        )
+
+                    # Finish processing before yielding the block!
+                    blk_exec_stats_builder.finish()
+
+                    # Yield block and retrieve its Ray object serialization timing
+                    gen_stats: StreamingGeneratorStats = yield block
+
+                    exec_stats = blk_exec_stats_builder.build(
+                        block_ser_time_s=(
+                            gen_stats.object_creation_dur_s if gen_stats else None
+                        ),
+                        udf_time_s=map_transformer.udf_time_s(reset=True),
+                        task_idx=ctx.task_idx,
+                        max_uss_bytes=profiler.estimate_max_uss(),
                     )
 
-                # Finish processing before yielding the block!
-                blk_exec_stats_builder.finish()
+                    # NOTE: This tracks task duration up to this point, though we're primarily
+                    #       interested in task total duration
+                    # TODO figure out a better way to track task total duration
+                    task_dur_s = time.perf_counter() - task_start_s
 
-                # Yield block and retrieve its Ray object serialization timing
-                gen_stats: StreamingGeneratorStats = yield block
-
-                exec_stats = blk_exec_stats_builder.build(
-                    block_ser_time_s=(
-                        gen_stats.object_creation_dur_s if gen_stats else None
-                    ),
-                    udf_time_s=map_transformer.udf_time_s(reset=True),
-                    task_idx=ctx.task_idx,
-                    max_uss_bytes=profiler.estimate_max_uss(),
-                )
-
-                # NOTE: This tracks task duration up to this point, though we're primarily
-                #       interested in task total duration
-                # TODO figure out a better way to track task total duration
-                task_dur_s = time.perf_counter() - task_start_s
-
-                bm = BlockMetadataWithSchema.from_metadata(
-                    replace(
-                        block_meta,
-                        exec_stats=exec_stats,
-                        task_exec_stats=TaskExecWorkerStats(
-                            task_wall_time_s=task_dur_s
+                    bm = BlockMetadataWithSchema.from_metadata(
+                        replace(
+                            block_meta,
+                            exec_stats=exec_stats,
+                            task_exec_stats=TaskExecWorkerStats(
+                                task_wall_time_s=task_dur_s
+                            ),
                         ),
-                    ),
-                    schema=block_schema if not yielded_schema else None,
-                )
-                yield pickle.dumps(bm)
+                        schema=block_schema if not yielded_schema else None,
+                    )
+                    yield pickle.dumps(bm)
 
-                # Reset trackers
-                yielded_schema = True
-                blk_exec_stats_builder = BlockExecStats.builder()
-                profiler.reset()
+                    # Reset trackers
+                    yielded_schema = True
+                    blk_exec_stats_builder = BlockExecStats.builder()
+                    profiler.reset()
+        _pm.emit_task_completion(
+            _perf_ctx, ctx.op_name, _node_id,
+            timer=_timer, input_rows=_input_rows, output_rows=_output_rows,
+        )
+
+        # 注销 task，停止该 op 的实时 CPU 采样
+        _pm.unregister_task(ctx.op_name)
 
 
 class BlockRefBundler(BaseRefBundler):

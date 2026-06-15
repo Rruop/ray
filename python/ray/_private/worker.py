@@ -2081,6 +2081,34 @@ def init(
 _post_init_hooks = []
 
 
+def _perflog_job_resources_hook():
+    """ray.init() 完成后，为当前 Job 启动资源申请量定时上报线程。"""
+    try:
+        import ray
+        _ctx = ray.get_runtime_context()
+        # 只在 Driver 进程（SCRIPT_MODE）中触发，worker 进程无需上报
+        if _ctx.worker.mode != SCRIPT_MODE:
+            return
+        _session_name = (
+            os.environ.get("_RAY_DASHBOARD_SESSION_NAME")
+            or os.environ.get("RAY_SESSION_NAME")
+            or ""
+        )
+        _job_id_hex = _ctx.get_job_id() or ""
+        if not _job_id_hex:
+            return
+        from ray.data._internal.execution.perf_metrics import _report_job_resources_on_init
+        _report_job_resources_on_init(session_name=_session_name, job_id=_job_id_hex)
+    except Exception as e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "[RayPerfLogger] _perflog_job_resources_hook error: %s", e
+        )
+
+
+_post_init_hooks.append(_perflog_job_resources_hook)
+
+
 @PublicAPI
 @client_mode_hook
 @with_connect_or_shutdown_lock

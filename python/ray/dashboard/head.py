@@ -478,6 +478,30 @@ class DashboardHead:
             namespace=ray_constants.KV_NAMESPACE_DASHBOARD,
         )
 
+        # Dashboard 初始化完成，触发集群资源总量打点（在独立线程中执行，不阻塞事件循环）
+        try:
+            import threading as _threading
+            from ray.data._internal.execution.perf_metrics import (
+                _report_cluster_totals_on_dashboard_init,
+            )
+            import os as _os
+            _os.environ.setdefault("_RAY_DASHBOARD_SESSION_NAME", self.session_name)
+            _os.environ.setdefault("RAY_GCS_SERVER_ADDRESS", self.gcs_address)
+            # 注：import perf_metrics 会触发 perf_logger 的模块级 warmup（主线程
+            # 完成 signal 注册），此处子线程内的 create_perf_context 不再触发
+            # signal.signal() 调用。
+            _t = _threading.Thread(
+                target=_report_cluster_totals_on_dashboard_init,
+                kwargs=dict(session_name=self.session_name),
+                name="RayPerfLogger-DashboardInit",
+                daemon=True,
+            )
+            _t.start()
+        except Exception as _e:
+            logger.warning(
+                "[RayPerfLogger] failed to start cluster totals reporter: %s", _e,
+            )
+
         concurrent_tasks = [
             self._gcs_check_alive(),
         ]

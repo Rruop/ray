@@ -103,9 +103,19 @@ def plan_read_op(
 
     inputs = InputDataBuffer(data_context, input_data_factory=get_input_data)
 
-    def do_read(blocks: Iterable[ReadTask], _: TaskContext) -> Iterable[Block]:
+    def do_read(blocks: Iterable[ReadTask], ctx: TaskContext) -> Iterable[Block]:
+        import time as _time
+        from ray.data._internal.execution import perf_metrics as _pm
+        _perf_ctx = _pm.PerfContext.from_runtime()
+        _op_name = ctx.op_name if ctx else "Read"
         for read_task in blocks:
-            yield from read_task()
+            _t0 = _time.monotonic()
+            for block in read_task():
+                _block_read_us = int((_time.monotonic() - _t0) * 1_000_000)
+                _pm.emit_op_read_latency(_perf_ctx, _op_name,
+                                         micros=_block_read_us)
+                yield block
+                _t0 = _time.monotonic()
 
     # Create a MapTransformer for a read operator
     map_transformer = MapTransformer(

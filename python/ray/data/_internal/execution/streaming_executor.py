@@ -60,6 +60,8 @@ from ray.data.context import OK_PREFIX, WARN_PREFIX, DataContext
 from ray.util.debug import log_once
 from ray.util.metrics import Gauge
 
+from ray.data._internal.execution import perf_metrics as _pm
+
 if typing.TYPE_CHECKING:
     from ray.data._internal.progress.base_progress import BaseExecutionProgressManager
     from ray.data.block import Schema
@@ -483,6 +485,15 @@ class StreamingExecutor(Executor, threading.Thread):
 
         Results are returned via the output node's outqueue.
         """
+        # Perflog 采样器：所有数据获取/累加/上下文构建都封装在内部
+        _sampler = _pm.PerfSampler(
+            submission_id_provider=self._get_job_submission_id_or_job_id,
+        )
+        # 采样调度参数（保留在业务文件，便于按场景调节）
+        _mem_sample_interval = 10   # 实时采样：每 10 轮一次
+        _mem_loop_counter = 0
+        _task_sample_interval = 5   # task 指标采样：每 5 轮一次
+        _task_loop_counter = 0
         exc: Optional[Exception] = None
         try:
             # Run scheduling loop until complete.
@@ -495,6 +506,16 @@ class StreamingExecutor(Executor, threading.Thread):
                 sched_loop_duration = time.perf_counter() - t_start
 
                 self.update_metrics(sched_loop_duration)
+                # 实时采样（cluster + job + operator）
+                _mem_loop_counter += 1
+                if _mem_loop_counter % _mem_sample_interval == 0:
+                    _sampler.sample_realtime(self._topology)
+
+                # 算子 task 耗时 & 失败计数采样
+                _task_loop_counter += 1
+                if _task_loop_counter % _task_sample_interval == 0:
+                    _sampler.sample_task_metrics(self._topology)
+
                 if self._initial_stats:
                     self._initial_stats.streaming_exec_schedule_s.add(
                         sched_loop_duration
@@ -508,6 +529,8 @@ class StreamingExecutor(Executor, threading.Thread):
             # Propagate it to the result iterator.
             exc = e
         finally:
+            # 汇总打点（mem / gpu / queue / op task）
+            _sampler.flush(self._topology)
             # Mark state of outputting operator as finished
             _, state = self._output_node
             state.mark_finished(exc)
@@ -579,6 +602,14 @@ class StreamingExecutor(Executor, threading.Thread):
 
         # Update executor-level errored blocks count
         total_errored = sum(errored_blocks_per_op.values())
+        if total_errored > 0:
+            # 打点：本轮调度中各 op 的失败 block 数
+            _block_err_ctx = _pm.PerfContext.from_runtime()
+            for op_state, num_errors in errored_blocks_per_op.items():
+                if num_errors > 0:
+                    # perf 打点：失败 block 数
+                    _pm.emit_op_block_error(_block_err_ctx, op_state.op.name,
+                                            count=num_errors)
         if self._max_errored_blocks > 0:
             self._max_errored_blocks -= total_errored
         self._num_errored_blocks += total_errored

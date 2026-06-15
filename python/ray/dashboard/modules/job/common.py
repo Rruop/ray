@@ -1,11 +1,15 @@
 import asyncio
 import json
 import logging
+import os
 import time
+
 from dataclasses import asdict, dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union
+
+from ray.data._internal.execution import perf_metrics as _pm
 
 from ray._private import ray_constants
 from ray._private.event.export_event_logger import (
@@ -383,7 +387,37 @@ class JobInfoStorageClient:
         if status.is_terminal():
             new_info.end_time = int(time.time() * 1000)
 
+            # Attach session_id to metadata if available
+        try:
+            import ray
+            session_id = ray.get_runtime_context().get_session_name()
+        except Exception:
+            session_id = os.environ.get("RAY_CLUSTER_NAME", "unknown")
+        if session_id:
+            if new_info.metadata is None:
+                new_info.metadata = {}
+            new_info.metadata["session_id"] = session_id
+
         await self.put_info(job_id, new_info, timeout=timeout)
+        if status.is_terminal():
+            try:
+                _start_time = old_info.start_time if old_info and old_info.start_time else None
+                _end_time = new_info.end_time
+                _duration_ms = (_end_time - _start_time) if (_start_time and _end_time and _end_time > _start_time) else 0
+                logger.warning(
+                    "[perflog] Reporting: job_id=%s status=%s duration_ms=%d",
+                    job_id, status, _duration_ms,
+                )
+                _ctx = _pm.PerfContext(
+                    session=session_id or "unknown",
+                    submission_id=job_id,
+                    owner=os.environ.get("KML_CREATOR", ""),
+                )
+                _pm.emit_job_status(_ctx, status=str(status))
+                _pm.emit_job_duration(_ctx, status=str(status), duration_ms=_duration_ms)
+            except Exception:
+                logger.warning("Failed to report job status to perflog.", exc_info=True)
+
 
     async def get_status(self, job_id: str, timeout: int = 30) -> Optional[JobStatus]:
         job_info = await self.get_info(job_id, timeout)
