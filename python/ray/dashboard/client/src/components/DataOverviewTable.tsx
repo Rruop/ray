@@ -42,10 +42,12 @@ const columns = [
   {
     label: "Rows Input",
     helpInfo: <Typography>Rows inputted by input operator.</Typography>,
+    align: "center",
   },
   {
     label: "Blocks Input",
     helpInfo: <Typography>Total blocks inputted by operator.</Typography>,
+    align: "center",
   },
   {
     label: "Queued Blocks",
@@ -54,10 +56,12 @@ const columns = [
         Number of blocks waiting in an input queue to be processed.
       </Typography>
     ),
+    align: "center",
   },
   {
     label: "Rows Outputted",
     helpInfo: <Typography>Rows outputted by output operator.</Typography>,
+    align: "center",
   },
   {
     label: "Memory Usage (current / max)",
@@ -88,6 +92,15 @@ const columns = [
   },
   { label: "Start Time", align: "center" },
   { label: "End Time", align: "center" },
+  {
+    label: "Kconf Full Key",
+    helpInfo: (
+      <Typography>
+        Full kconf key path for the dataset&apos;s execution config store.
+      </Typography>
+    ),
+    align: "start",
+  },
 ];
 
 const DataOverviewTable = ({
@@ -246,13 +259,10 @@ const DataRow = ({
           0
         )}
       </TableCell>
-      <TableCell align="right">{data.input_rows}</TableCell>
-      <TableCell align="right">{data.input_blocks}</TableCell>
-      <TableCell align="right">{data.queued_blocks}</TableCell>
-      <TableCell align="right">{data.output_rows}</TableCell>
-      <TableCell align="right">
-        {isOperatorRow ? operatorMetrics.queued_blocks : ""}
-      </TableCell>
+      <TableCell align="center">{data.input_rows}</TableCell>
+      <TableCell align="center">{data.input_blocks}</TableCell>
+      <TableCell align="center">{data.queued_blocks}</TableCell>
+      <TableCell align="center">{data.output_rows}</TableCell>
       <TableCell align="right">
         {memoryConverter(Number(data.ray_data_current_bytes.value))}/
         {memoryConverter(Number(data.ray_data_current_bytes.max))}
@@ -275,6 +285,9 @@ const DataRow = ({
         {isDatasetRow &&
           datasetMetrics.end_time &&
           formatDateFromTimeMs(datasetMetrics.end_time * 1000)}
+      </TableCell>
+      <TableCell align="left">
+        {isDatasetRow && datasetMetrics.kconf_full_key}
       </TableCell>
     </TableRow>
   );

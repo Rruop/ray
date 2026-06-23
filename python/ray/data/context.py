@@ -314,18 +314,17 @@ DEFAULT_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE: bool = env_bool(
     "RAY_DATA_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE", False
 )
 
-DEFAULT_ENABLE_DYNAMIC_EXECUTION_CONFIG_SYNC: bool = env_bool(
-    "RAY_DATA_ENABLE_DYNAMIC_EXECUTION_CONFIG_SYNC", False
-)
-
 # Execution config store settings
 # Store type: "gcs" (default), "memory", or "kconf"
 DEFAULT_EXECUTION_CONFIG_STORE_TYPE: Optional[str] = env_string(
     "RAY_DATA_EXECUTION_CONFIG_STORE_TYPE", "gcs"
 )
 # Kconf settings (only used when store_type is "kconf")
-DEFAULT_EXECUTION_CONFIG_KCONF_KEY: Optional[str] = env_string(
-    "RAY_DATA_EXECUTION_CONFIG_KCONF_KEY", "KAIWorks.rayExecutionConfig"
+DEFAULT_EXECUTION_CONFIG_KCONF_KEY_PREFIX: Optional[str] = env_string(
+    "RAY_DATA_EXECUTION_CONFIG_KCONF_KEY_PREFIX", "KAIWorks.rayExecutionConfig"
+)
+DEFAULT_EXECUTION_CONFIG_KCONF_KEY_SUFFIX: Optional[str] = env_string(
+    "RAY_DATA_EXECUTION_CONFIG_KCONF_KEY_SUFFIX", None
 )
 DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN: Optional[str] = env_string(
     "RAY_DATA_EXECUTION_CONFIG_KCONF_TOKEN", "kconf_flemiaczh7l9uelx696col56fo"
@@ -839,13 +838,13 @@ class DataContext:
         default_factory=list
     )
 
-    enable_dynamic_execution_config_sync: bool = DEFAULT_ENABLE_DYNAMIC_EXECUTION_CONFIG_SYNC
-
     # Execution config store settings for dynamic operator parallelism
     # Store type: "gcs" (default), "memory", or "kconf"
     execution_config_store_type: Optional[str] = DEFAULT_EXECUTION_CONFIG_STORE_TYPE
-    # Kconf key prefix (only used when store_type is "kconf")
-    execution_config_kconf_key: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_KEY
+    # Kconf key prefix (only used when kconf is enabled via Dataset.enable_kconf)
+    execution_config_kconf_key_prefix: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_KEY_PREFIX
+    # Kconf key suffix (fallback when Dataset.enable_kconf() is called without suffix)
+    execution_config_kconf_key_suffix: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_KEY_SUFFIX
     # Kconf token (only used when store_type is "kconf")
     execution_config_kconf_token: Optional[str] = DEFAULT_EXECUTION_CONFIG_KCONF_TOKEN
     # Whether to delete execution config from store when dataset execution completes

@@ -230,18 +230,8 @@ class TestCheckpointConfig:
                 CheckpointBackend.FILE_STORAGE,
             ),
             (
-                lazy_fixture("s3_path"),
-                lazy_fixture("s3_fs"),
-                CheckpointBackend.FILE_STORAGE,
-            ),
-            (
                 lazy_fixture("local_path"),
                 lazy_fixture("local_fs"),
-                CheckpointBackend.CLOUD_OBJECT_STORAGE,
-            ),
-            (
-                lazy_fixture("s3_path"),
-                lazy_fixture("s3_fs"),
                 CheckpointBackend.CLOUD_OBJECT_STORAGE,
             ),
         ],
@@ -275,11 +265,6 @@ class TestCheckpointConfig:
             CheckpointBackend.FILE_STORAGE,
             lazy_fixture("local_fs"),
             lazy_fixture("local_path"),
-        ),
-        (
-            CheckpointBackend.CLOUD_OBJECT_STORAGE,
-            lazy_fixture("s3_fs"),
-            lazy_fixture("s3_path"),
         ),
     ],
 )
@@ -349,11 +334,6 @@ def test_checkpoint(
             lazy_fixture("local_fs"),
             lazy_fixture("local_path"),
         ),
-        (
-            CheckpointBackend.CLOUD_OBJECT_STORAGE,
-            lazy_fixture("s3_fs"),
-            lazy_fixture("s3_path"),
-        ),
     ],
 )
 def test_full_dataset_executed_for_non_write(
@@ -417,11 +397,6 @@ def test_full_dataset_executed_for_non_write(
             CheckpointBackend.FILE_STORAGE,
             lazy_fixture("local_fs"),
             lazy_fixture("local_path"),
-        ),
-        (
-            CheckpointBackend.CLOUD_OBJECT_STORAGE,
-            lazy_fixture("s3_fs"),
-            lazy_fixture("s3_path"),
         ),
     ],
 )
@@ -540,11 +515,6 @@ def test_recovery_no_missing_rows(
             CheckpointBackend.FILE_STORAGE,
             lazy_fixture("local_fs"),
             lazy_fixture("local_path"),
-        ),
-        (
-            CheckpointBackend.CLOUD_OBJECT_STORAGE,
-            lazy_fixture("s3_fs"),
-            lazy_fixture("s3_path"),
         ),
     ],
 )

@@ -319,15 +319,15 @@ class TestCreateExecutionConfigStore:
         mock_context.execution_config_kconf_key = None
         mock_context.execution_config_kconf_token = None
 
-        store = create_execution_config_store(mock_context)
-        assert store is None
+        with pytest.raises(ValueError, match="kconf_full_key"):
+            create_execution_config_store(mock_context)
 
     def test_create_unknown_store_type(self):
         mock_context = MagicMock()
         mock_context.execution_config_store_type = "unknown"
 
-        store = create_execution_config_store(mock_context)
-        assert isinstance(store, MemoryExecutionConfigStore)
+        with pytest.raises(ValueError, match="Unknown store type"):
+            create_execution_config_store(mock_context)
 
 
 class TestExecutionConfigDatasetId:
@@ -579,7 +579,21 @@ class TestConfigCleanup:
     """Tests for config cleanup on executor shutdown."""
 
     def test_delete_calls_store(self):
-        """Verify _maybe_delete_execution_config triggers config store deletion."""
+        """Verify _maybe_delete_execution_config triggers config store deletion when no exception."""
+        from ray.data._internal.execution.streaming_executor import StreamingExecutor
+
+        executor = MagicMock(spec=StreamingExecutor)
+        executor._data_context = MagicMock()
+        executor._data_context.delete_execution_config_on_completion = True
+        store_mock = MagicMock()
+        executor._config_store = store_mock
+        executor._dataset_id = "test_dataset"
+
+        StreamingExecutor._maybe_delete_execution_config(executor)
+        store_mock.delete.assert_called_once()
+
+    def test_delete_skips_on_exception(self):
+        """Verify deletion is skipped when an exception occurred."""
         from ray.data._internal.execution.streaming_executor import StreamingExecutor
 
         executor = MagicMock(spec=StreamingExecutor)
@@ -588,8 +602,8 @@ class TestConfigCleanup:
         executor._config_store = MagicMock()
         executor._dataset_id = "test_dataset"
 
-        StreamingExecutor._maybe_delete_execution_config(executor)
-        executor._config_store.delete.assert_called_once()
+        StreamingExecutor._maybe_delete_execution_config(executor, exception=RuntimeError("fail"))
+        executor._config_store.delete.assert_not_called()
 
     def test_delete_skips_when_disabled(self):
         """Verify deletion respects delete_execution_config_on_completion=False."""
@@ -612,7 +626,6 @@ class TestConfigCleanup:
         executor._data_context.delete_execution_config_on_completion = True
         executor._config_store = None
 
-        # Should not raise
         StreamingExecutor._maybe_delete_execution_config(executor)
 
     def test_delete_is_idempotent(self):
@@ -622,15 +635,14 @@ class TestConfigCleanup:
         executor = MagicMock(spec=StreamingExecutor)
         executor._data_context = MagicMock()
         executor._data_context.delete_execution_config_on_completion = True
-        executor._config_store = MagicMock()
+        store_mock = MagicMock()
+        executor._config_store = store_mock
         executor._dataset_id = "test_dataset"
 
-        # First call: deletes and nullifies _config_store
         StreamingExecutor._maybe_delete_execution_config(executor)
-        executor._config_store.delete.assert_called_once()
+        store_mock.delete.assert_called_once()
         assert executor._config_store is None
 
-        # Second call: _config_store is None, should be a no-op
         StreamingExecutor._maybe_delete_execution_config(executor)
 
     def test_delete_safe_on_exception(self):
@@ -643,8 +655,170 @@ class TestConfigCleanup:
         )
         executor._config_store = MagicMock()
 
-        # Should not raise -- exception is caught internally
         StreamingExecutor._maybe_delete_execution_config(executor)
+
+
+class TestCreateExecutionConfigStoreWithKconfKey:
+    """Tests for create_execution_config_store with custom kconf_key parameter."""
+
+    def _make_kconf_context(self):
+        ctx = MagicMock()
+        ctx.execution_config_store_type = "kconf"
+        ctx.execution_config_kconf_key = "KAIWorks.rayExecutionConfig"
+        ctx.execution_config_kconf_token = "kconf_test_token"
+        return ctx
+
+    def test_kconf_key_suffix_appends_prefix(self):
+        ctx = self._make_kconf_context()
+        with patch(
+            "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+        ) as MockStore:
+            mock_instance = MagicMock()
+            MockStore.return_value = mock_instance
+            store = create_execution_config_store(
+                ctx, job_id="job1", kconf_full_key="KAIWorks.rayExecutionConfig.myJob"
+            )
+            MockStore.assert_called_once_with(
+                key="KAIWorks.rayExecutionConfig.myJob", token="kconf_test_token"
+            )
+            assert store is mock_instance
+
+    def test_kconf_key_full_uses_key_directly(self):
+        ctx = self._make_kconf_context()
+        with patch(
+            "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+        ) as MockStore:
+            mock_instance = MagicMock()
+            MockStore.return_value = mock_instance
+            store = create_execution_config_store(
+                ctx,
+                job_id="job1",
+                kconf_full_key="webserver.activity.trafficCouponConfigConfigMap",
+            )
+            MockStore.assert_called_once_with(
+                key="webserver.activity.trafficCouponConfigConfigMap",
+                token="kconf_test_token",
+            )
+            assert store is mock_instance
+
+    def test_kconf_key_no_job_id_required(self):
+        ctx = self._make_kconf_context()
+        with patch(
+            "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+        ) as MockStore:
+            MockStore.return_value = MagicMock()
+            store = create_execution_config_store(
+                ctx, job_id=None, kconf_full_key="KAIWorks.rayExecutionConfig.myJob"
+            )
+            assert store is not None
+
+    def test_kconf_key_overrides_default_construction(self):
+        ctx = self._make_kconf_context()
+        with patch(
+            "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+        ) as MockStore:
+            MockStore.return_value = MagicMock()
+            store = create_execution_config_store(
+                ctx,
+                job_id="job1",
+                dataset_id="ds1",
+                kconf_full_key="KAIWorks.rayExecutionConfig.myJob",
+            )
+            MockStore.assert_called_once_with(
+                key="KAIWorks.rayExecutionConfig.myJob", token="kconf_test_token"
+            )
+
+    def test_kconf_default_key_construction(self):
+        from ray.data._internal.execution.config.store import _build_default_kconf_key
+        key = _build_default_kconf_key(
+            prefix="KAIWorks.rayExecutionConfig",
+            job_id="job1",
+            dataset_id="ds1",
+        )
+        assert key == "KAIWorks.rayExecutionConfig.job_job1__dataset_ds1"
+
+    def test_kconf_default_key_without_dataset(self):
+        from ray.data._internal.execution.config.store import _build_default_kconf_key
+        key = _build_default_kconf_key(
+            prefix="KAIWorks.rayExecutionConfig",
+            job_id="job1",
+        )
+        assert key == "KAIWorks.rayExecutionConfig.job_job1"
+
+    def test_kconf_default_key_requires_prefix(self):
+        from ray.data._internal.execution.config.store import _build_default_kconf_key
+        with pytest.raises(ValueError, match="prefix is required"):
+            _build_default_kconf_key(
+                prefix="",
+                job_id="job1",
+            )
+
+    def test_kconf_full_key_missing_raises(self):
+        ctx = self._make_kconf_context()
+        with pytest.raises(ValueError, match="kconf_full_key"):
+            create_execution_config_store(ctx, job_id="job1")
+
+    def test_gcs_store_ignores_kconf_key(self):
+        ctx = MagicMock()
+        ctx.execution_config_store_type = "gcs"
+        mock_gcs_client = MagicMock()
+        with patch("ray._private.worker.global_worker") as mock_worker:
+            mock_worker.gcs_client = mock_gcs_client
+            store = create_execution_config_store(
+                ctx, job_id="job1", kconf_full_key="KAIWorks.rayExecutionConfig.myJob"
+            )
+            assert isinstance(store, GcsExecutionConfigStore)
+
+    def test_memory_store_ignores_kconf_key(self):
+        ctx = MagicMock()
+        ctx.execution_config_store_type = "memory"
+        store = create_execution_config_store(
+            ctx, kconf_full_key="KAIWorks.rayExecutionConfig.myJob"
+        )
+        assert isinstance(store, MemoryExecutionConfigStore)
+
+    def test_kconf_key_suffix_invalid_format_raises(self):
+        ctx = self._make_kconf_context()
+        for bad in ["1starts_with_digit", "has.dot", "has space", "has/slash", "_leading_underscore"]:
+            with patch(
+                "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+            ):
+                with pytest.raises(ValueError, match="suffix"):
+                    create_execution_config_store(ctx, job_id="job1", kconf_full_key=f"KAIWorks.rayExecutionConfig.{bad}")
+
+    def test_kconf_key_full_valid_three_levels(self):
+        ctx = self._make_kconf_context()
+        with patch(
+            "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+        ) as MockStore:
+            MockStore.return_value = MagicMock()
+            create_execution_config_store(
+                ctx,
+                kconf_full_key="webserver.activity.trafficCouponConfigConfigMap",
+            )
+            MockStore.assert_called_once()
+
+    def test_kconf_key_full_invalid_levels_raises(self):
+        ctx = self._make_kconf_context()
+        for bad in ["onlyone", "two.levels", "four.levels.too.many"]:
+            with patch(
+                "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+            ):
+                with pytest.raises(ValueError, match="3-level"):
+                    create_execution_config_store(
+                        ctx, kconf_full_key=bad
+                    )
+
+    def test_kconf_key_full_invalid_segment_raises(self):
+        ctx = self._make_kconf_context()
+        for bad in ["1bad.system.config", "biz.2sys.config", "biz.sys.has space"]:
+            with patch(
+                "ray.data._internal.execution.config.store.KconfExecutionConfigStore"
+            ):
+                with pytest.raises(ValueError, match="segment"):
+                    create_execution_config_store(
+                        ctx, kconf_full_key=bad
+                    )
 
 
 if __name__ == "__main__":

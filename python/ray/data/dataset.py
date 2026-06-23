@@ -487,6 +487,66 @@ class Dataset:
         """Returns the user-defined dataset name"""
         return self._plan._dataset_name
 
+    def enable_kconf(self, key: Optional[str] = None, full: bool = False):
+        """Enable kconf-based dynamic execution config synchronization.
+
+        When called, this dataset will use kconf store for operator
+        configuration sync.
+
+        The ``key`` argument determines how the full kconf key is formed:
+
+        - **suffix mode** (``full=False``, default): ``key`` is appended to
+          the DataContext prefix to form the full kconf key.
+
+          Example::
+
+              ds.enable_kconf("myJob")
+              # full key: "KAIWorks.rayExecutionConfig.myJob"
+
+        - **full mode** (``full=True``): ``key`` is used as the complete
+          kconf key directly.
+
+          Example::
+
+              ds.enable_kconf("webserver.activity.trafficCouponConfigConfigMap", full=True)
+
+        If ``key`` is not provided, it falls back to
+        ``DataContext.execution_config_kconf_key_suffix`` (env var
+        ``RAY_DATA_EXECUTION_CONFIG_KCONF_KEY_SUFFIX``). If that is
+        also not set, the full key is built from the job_id/dataset_id.
+
+        Prefix, token and delete_on_completion are read from DataContext
+        (env vars ``RAY_DATA_EXECUTION_CONFIG_KCONF_KEY_PREFIX``,
+        ``RAY_DATA_EXECUTION_CONFIG_KCONF_TOKEN``, and
+        ``RAY_DATA_DELETE_EXECUTION_CONFIG_ON_COMPLETION``).
+
+        Args:
+            key: Kconf key or suffix. In suffix mode (default), must be
+                a single segment starting with a letter, containing only
+                letters, digits, underscores and hyphens. In full mode,
+                must be a 3-level dot-separated path. If None, falls back
+                to ``execution_config_kconf_key_suffix`` from DataContext.
+            full: If True, use ``key`` as the full kconf key directly.
+                If False (default), ``key`` is treated as a suffix appended
+                to the DataContext prefix.
+        """
+        if key is None:
+            key = self._plan._context.execution_config_kconf_key_suffix
+        spec = self._plan._kconf_spec
+        spec.enabled = True
+        spec.key = key
+        spec.key_is_full = full
+
+    @property
+    def kconf_key(self) -> Optional[str]:
+        """Returns the user-defined kconf key, or None if not set."""
+        return self._plan._kconf_spec.key
+
+    @property
+    def is_kconf_key_full(self) -> bool:
+        """Returns whether kconf_key is a full key (True) or suffix (False)."""
+        return self._plan._kconf_spec.key_is_full
+
     def get_dataset_id(self) -> str:
         """Unique ID of the dataset, including the dataset name,
         UUID, and current execution index.

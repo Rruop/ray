@@ -93,6 +93,7 @@ class StreamingExecutor(Executor, threading.Thread):
         self,
         data_context: DataContext,
         dataset_id: str = "unknown_dataset",
+        kconf_spec: Optional["_KconfSpec"] = None,
     ):
         self._data_context = data_context
         self._ranker = create_ranker()
@@ -116,6 +117,9 @@ class StreamingExecutor(Executor, threading.Thread):
         self._op_schema: Dict[PhysicalOperator, Schema] = {}
 
         self._dataset_id = dataset_id
+        from ray.data._internal.plan import _KconfSpec
+        self._kconf_spec = kconf_spec if kconf_spec is not None else _KconfSpec()
+        self._kconf_full_key: Optional[str] = None
         # Stores if an operator is completed,
         # used for marking when an op has just completed.
         self._has_op_completed: Optional[Dict[PhysicalOperator, bool]] = None
@@ -226,6 +230,7 @@ class StreamingExecutor(Executor, threading.Thread):
 
         # Initialize operator configuration synchronization if enabled
         # This sets up dynamic configuration updates during execution
+        self._kconf_full_key = self._resolve_kconf_full_key()
         self._initialize_operator_config_sync()
 
         self._has_op_completed = dict.fromkeys(self._topology, False)
@@ -240,6 +245,7 @@ class StreamingExecutor(Executor, threading.Thread):
             self._get_operator_tags(),
             TopologyMetadata.create_topology_metadata(dag, op_to_id),
             self._data_context,
+            kconf_full_key=self._kconf_full_key,
         )
         for callback in self._callbacks:
             callback.before_execution_starts(self)
@@ -292,7 +298,7 @@ class StreamingExecutor(Executor, threading.Thread):
             # This must run early because SIGKILL may arrive within 3 seconds
             # (RAY_JOB_STOP_WAIT_TIME_S) and the operations below (join, stats,
             # operator shutdown) can easily exceed that deadline.
-            self._maybe_delete_execution_config()
+            self._maybe_delete_execution_config(exception)
 
             # Give the scheduling loop some time to finish processing.
             self.join(timeout=2.0)
@@ -363,42 +369,78 @@ class StreamingExecutor(Executor, threading.Thread):
 
     def _initialize_operator_config_sync(self) -> None:
         """Initialize operator configuration synchronization if enabled."""
-        if not self._data_context.enable_dynamic_execution_config_sync:
+        if not self._kconf_spec.enabled:
             return
 
-        # Lazy import to avoid loading kconf when not needed
         from ray.data._internal.execution.config import (
             ConfigController,
             create_execution_config_store,
         )
 
         job_id = self._get_job_submission_id_or_job_id()
+
+        store = create_execution_config_store(
+            data_context=self._data_context,
+            job_id=job_id,
+            dataset_id=self._dataset_id,
+            kconf_full_key=self._kconf_full_key,
+            store_type="kconf",
+        )
+
+        store.init(self._generate_initial_operator_config(job_id))
+        self._config_store = store
+        self._config_controller = ConfigController(self._topology, store)
+        logger.info("Operator configuration synchronization initialized")
+
+    def _resolve_kconf_full_key(self) -> Optional[str]:
+        """Resolve the full kconf key for this dataset.
+
+        Returns None if kconf is not enabled. Otherwise resolves the key
+        from ``self._kconf_spec``:
+        - full mode: use the key verbatim
+        - suffix mode: prepend DataContext prefix
+        - no key: build default key from job_id/dataset_id
+        """
+        spec = self._kconf_spec
+        if not spec.enabled:
+            return None
+
+        from ray.data._internal.execution.config.store import (
+            build_default_kconf_key,
+            validate_kconf_key,
+        )
+
+        prefix = self._data_context.execution_config_kconf_key_prefix
+
+        if spec.key:
+            validate_kconf_key(spec.key, spec.key_is_full)
+            if spec.key_is_full:
+                return spec.key
+            if not prefix:
+                raise ValueError("prefix is required for kconf_key suffix")
+            return f"{prefix}.{spec.key}"
+
+        job_id = self._get_job_submission_id_or_job_id()
         if not job_id:
-            logger.debug("No job_id or job_submission_id available")
-            return
+            raise ValueError("job_id is required when kconf_key is not provided")
+        return build_default_kconf_key(
+            prefix=prefix,
+            job_id=job_id,
+            dataset_id=self._dataset_id,
+        )
 
-        try:
-            store = create_execution_config_store(
-                data_context=self._data_context,
-                job_id=job_id,
-                dataset_id=self._dataset_id,
-            )
-            if store is None:
-                return
-
-            store.init(self._generate_initial_operator_config(job_id))
-            self._config_store = store
-            self._config_controller = ConfigController(self._topology, store)
-            logger.info("Operator configuration synchronization initialized")
-        except Exception as e:
-            logger.warning(f"Failed to initialize operator config sync: {e}")
-
-    def _maybe_delete_execution_config(self) -> None:
+    def _maybe_delete_execution_config(self, exception: Optional[Exception] = None) -> None:
         """Delete execution config from store on completion if configured.
+
+        Only deletes when the job completed successfully (no exception).
+        On failure the config is preserved so that the next run with the same
+        kconf key can reuse existing values without overwriting them.
 
         This method is idempotent -- calling it multiple times is harmless.
         """
         try:
+            if exception is not None:
+                return
             if not self._data_context.delete_execution_config_on_completion:
                 return
             if self._config_store is None:

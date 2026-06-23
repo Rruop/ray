@@ -10,6 +10,7 @@ describe("DataOverview", () => {
       {
         dataset: "test_ds1",
         job_id: "test_job_id1",
+        kconf_full_key: "kray.dataset.test_job_id1.test_ds1",
         state: "RUNNING",
         progress: 50,
         total: 100,
@@ -74,6 +75,7 @@ describe("DataOverview", () => {
       {
         dataset: "test_ds2",
         job_id: "test_job_id2",
+        kconf_full_key: null,
         state: "FINISHED",
         progress: 200,
         total: 200,
@@ -145,6 +147,7 @@ describe("DataOverview", () => {
       {
         dataset: "errored_ds",
         job_id: "test_job_id",
+        kconf_full_key: null,
         state: "RUNNING",
         progress: 50,
         total: 100,

@@ -200,10 +200,15 @@ class DataHead(SubprocessModule):
                 text=str(e),
             )
 
+    # Timeout for Prometheus queries. When Prometheus is unreachable (e.g. local
+    # dev without Prometheus), we fail fast instead of blocking the entire request.
+    _PROMETHEUS_QUERY_TIMEOUT = aiohttp.ClientTimeout(total=5)
+
     async def _query_prometheus(self, query):
         async with self.http_session.get(
             f"{self.prometheus_host}/api/v1/query?query={quote(query)}",
             headers=self.prometheus_headers,
+            timeout=self._PROMETHEUS_QUERY_TIMEOUT,
         ) as resp:
             if resp.status == 200:
                 prom_data = await resp.json()

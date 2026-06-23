@@ -40,6 +40,7 @@ RESPONSE_SCHEMA = [
     "start_time",
     "end_time",
     "operators",
+    "kconf_full_key",
 ] + DATA_SCHEMA
 
 OPERATOR_SCHEMA = [

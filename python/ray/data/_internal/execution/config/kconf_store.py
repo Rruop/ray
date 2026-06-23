@@ -235,6 +235,10 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
     def init(self, config: ExecutionConfig) -> bool:
         """Initialize the configuration if it doesn't exist.
 
+        If a value already exists in kconf for this key, it will be reused
+        without overwriting. This allows a previously failed job's config to
+        persist and be picked up by the next run with the same kconf key.
+
         This method also adds the watcher after ensuring the configuration exists.
 
         Args:
@@ -242,6 +246,9 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
 
         Returns:
             True if created, False if already exists.
+
+        Raises:
+            KConfError: If kconf operation fails during initialization.
         """
         should_add_watcher = False
 
@@ -249,31 +256,24 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
             if self._initialized:
                 return False
 
-            try:
-                existing_value = self._try_get_config()
-                if existing_value is not None:
-                    self._config = ExecutionConfig.from_json(existing_value)
-                else:
-                    create_config(
-                        self._key,
-                        self._token,
-                        KConfValueType.STRING,
-                        "execution configuration",
-                    )
-                    self._config = config
-                    value = config.to_json()
-                    update_config(self._key, self._token, value)
+            existing_value = self._try_get_config()
+            if existing_value is not None:
+                self._config = ExecutionConfig.from_json(existing_value)
+            else:
+                create_config(
+                    self._key,
+                    self._token,
+                    KConfValueType.STRING,
+                    "execution configuration",
+                )
+                self._config = config
+                value = config.to_json()
+                update_config(self._key, self._token, value)
 
-                self._initialized = True
+            self._initialized = True
 
-                # Mark that we need to add watcher, but do it outside the lock
-                # to avoid deadlock if add_watcher triggers a synchronous callback
-                if not self._watcher_added:
-                    should_add_watcher = True
-
-            except KConfError as e:
-                logger.error(f"Failed to initialize kconf configuration: {e}")
-                return False
+            if not self._watcher_added:
+                should_add_watcher = True
 
         # Add watcher outside the lock to prevent deadlock
         if should_add_watcher:

@@ -1,6 +1,7 @@
 import copy
 import itertools
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Iterator, Optional, Tuple
 
 import ray
@@ -32,6 +33,18 @@ INHERITABLE_REMOTE_ARGS = ["scheduling_strategy"]
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _KconfSpec:
+    """User-supplied kconf configuration for dynamic execution config sync."""
+
+    enabled: bool = False
+    key: Optional[str] = None
+    key_is_full: bool = False
+
+    def copy(self) -> "_KconfSpec":
+        return _KconfSpec(self.enabled, self.key, self.key_is_full)
 
 
 class ExecutionPlan:
@@ -70,6 +83,7 @@ class ExecutionPlan:
         self._run_index = -1
 
         self._dataset_name = None
+        self._kconf_spec = _KconfSpec()
 
         self._has_started_execution = False
 
@@ -100,7 +114,11 @@ class ExecutionPlan:
         from ray.data._internal.execution.streaming_executor import StreamingExecutor
 
         self._run_index += 1
-        executor = StreamingExecutor(self._context, self.get_dataset_id())
+        executor = StreamingExecutor(
+            self._context,
+            self.get_dataset_id(),
+            kconf_spec=self._kconf_spec,
+        )
         return executor
 
     def __repr__(self) -> str:
@@ -345,6 +363,7 @@ class ExecutionPlan:
         )
         plan_copy._cache = self._cache.copy()
         plan_copy._dataset_name = self._dataset_name
+        plan_copy._kconf_spec = self._kconf_spec.copy()
         return plan_copy
 
     def deep_copy(self) -> "ExecutionPlan":
@@ -359,6 +378,7 @@ class ExecutionPlan:
         )
         plan_copy._cache = self._cache.deep_copy()
         plan_copy._dataset_name = self._dataset_name
+        plan_copy._kconf_spec = self._kconf_spec.copy()
         return plan_copy
 
     def initial_num_blocks(self) -> Optional[int]:

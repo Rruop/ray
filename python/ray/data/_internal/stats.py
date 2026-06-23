@@ -669,6 +669,7 @@ class _StatsActor:
         operator_tags: List[str],
         topology: Topology,
         data_context: DataContextMetadata,
+        kconf_full_key: Optional[str] = None,
     ):
         start_time = time.time()
         self.datasets[dataset_tag] = {
@@ -684,6 +685,7 @@ class _StatsActor:
             "start_time": start_time,
             "end_time": None,
             "num_errored_blocks": 0,
+            "kconf_full_key": kconf_full_key,
             "operators": {
                 operator: {
                     "state": DatasetState.PENDING.name,
@@ -973,6 +975,7 @@ class _StatsManager:
         operator_tags: List[str],
         topology: Topology,
         data_context: DataContext,
+        kconf_full_key: Optional[str] = None,
     ):
         """Register a dataset with the stats actor.
 
@@ -981,6 +984,7 @@ class _StatsManager:
             operator_tags: List of operator tags
             topology: Optional Topology representing the DAG structure to export
             data_context: The DataContext attached to the dataset
+            kconf_full_key: Optional full kconf key path for execution config storage
         """
         # Convert DataContext to DataContextMetadata before serialization to avoid
         # module dependency issues during Ray's cloudpickle serialization.
@@ -992,6 +996,7 @@ class _StatsManager:
             operator_tags,
             topology,
             data_context,
+            kconf_full_key,
         )
 
     @staticmethod
