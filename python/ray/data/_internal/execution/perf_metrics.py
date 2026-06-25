@@ -416,6 +416,9 @@ class OpStatsAccumulator:
         self.rows_last: Dict[str, int] = {}
 
 
+_HAS_RUSAGE_THREAD = hasattr(_resource, "RUSAGE_THREAD")
+
+
 class TaskTimer:
     """task 级 CPU/elapsed/线程数计时上下文管理器。
 
@@ -435,7 +438,8 @@ class TaskTimer:
 
     def __enter__(self) -> "TaskTimer":
         self.start_us = int(_time.monotonic() * 1_000_000)
-        self._ru_before = _resource.getrusage(_resource.RUSAGE_THREAD)
+        if _HAS_RUSAGE_THREAD:
+            self._ru_before = _resource.getrusage(_resource.RUSAGE_THREAD)
         self.threads_before = _threading.active_count()
         return self
 
