@@ -69,7 +69,7 @@ if typing.TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Interval for logging execution progress updates and operator metrics.
-DEBUG_LOG_INTERVAL_SECONDS = 300
+DEBUG_LOG_INTERVAL_SECONDS = 60
 
 # Maximum string/sequence length for DataContext logging. Set high to avoid truncation
 # while still protecting against pathological cases.

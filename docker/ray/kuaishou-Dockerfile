@@ -32,6 +32,7 @@ RUN $HOME/anaconda3/bin/pip install -U "pip<=25.2" setuptools_scm "wheel<=0.45.0
 RUN $HOME/anaconda3/bin/pip --no-cache-dir install -c /tmp/requirements_compiled.txt \
     "${FIND_LINKS_PATH}/${WHEEL_PATH}[data,train,serve]" \
     --find-links $FIND_LINKS_PATH && \
-    $HOME/anaconda3/bin/pip install ffmpeg-python kafka-python
+    # kafka-python-ng is included in ray[data] extras \
+    $HOME/anaconda3/bin/pip install ffmpeg-python
 
 RUN $HOME/anaconda3/bin/pip freeze > ${HOME}/pip-freeze.txt
