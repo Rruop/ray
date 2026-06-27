@@ -165,6 +165,9 @@ hf-internal-testing/
 # Vscode
 .vscode/
 
+# Local clangd config (persists across branches, not committed)
+.clangd
+
 *.iml
 
 # Java
@@ -250,6 +253,9 @@ tag-mapping.json
 
 # Claude files
 /.claude/
+
+# CodeFlicker
+/.codeflicker/
 
 # Worktrees
 .worktrees/
