@@ -60,11 +60,11 @@ class AutoscalingActorConfig:
     per_actor_resource_usage: ExecutionResources
 
     def __post_init__(self):
-        assert self.min_size >= 1
-        assert self.max_size >= self.min_size
-        assert self.initial_size <= self.max_size
-        assert self.initial_size >= self.min_size
-        assert self.max_tasks_in_flight_per_actor >= 1
+        assert self.min_size >= 1, f"min_size must be >= 1, got {self.min_size}"
+        assert self.max_size >= self.min_size, f"max_size must be >= min_size, got max_size={self.max_size}, min_size={self.min_size}"
+        assert self.initial_size <= self.max_size, f"initial_size must be <= max_size, got initial_size={self.initial_size}, max_size={self.max_size}"
+        assert self.initial_size >= self.min_size, f"initial_size must be >= min_size, got initial_size={self.initial_size}, min_size={self.min_size}"
+        assert self.max_tasks_in_flight_per_actor >= 1, f"max_tasks_in_flight_per_actor must be >= 1, got {self.max_tasks_in_flight_per_actor}"
 
 
 @dataclass(frozen=True)

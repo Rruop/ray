@@ -953,10 +953,17 @@ class _ActorPool(AutoscalingActorPool):
             return
 
         # Validate size constraints
-        if min_size < 0 or max_size < 0 or target_size < 0:
+        if min_size < 1 or max_size < 1 or target_size < 1:
             logger.warning(
-                f"Invalid config: sizes must be non-negative. "
+                f"Invalid config: sizes must be >= 1. "
                 f"Got min={min_size}, max={max_size}, target={target_size}. Ignoring."
+            )
+            return
+
+        if min_size > max_size:
+            logger.warning(
+                f"Invalid config: min_size must be <= max_size. "
+                f"Got min={min_size}, max={max_size}. Ignoring."
             )
             return
 
@@ -974,7 +981,7 @@ class _ActorPool(AutoscalingActorPool):
                 f"(min={self._config.min_size}, max={self._config.max_size}) "
                 f"to (min={min_size}, max={max_size})."
             )
-            self._config = replace(self._config, min_size=min_size, max_size=max_size)
+            self._config = replace(self._config, min_size=min_size, max_size=max_size, initial_size=max(min_size, min(self._config.initial_size, max_size)))
 
         # Scale to target if needed
         current_size = self.current_size()
