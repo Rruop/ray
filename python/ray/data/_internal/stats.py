@@ -1102,6 +1102,9 @@ class DatasetStats:
         # backend has bounded memory, so p50/p90 tracking is always on
         # — no opt-in needed.
         self.streaming_exec_schedule_s: Timer = Timer()
+        self.streaming_exec_ray_wait_s: Timer = Timer()
+        self.streaming_exec_on_data_ready_s: Timer = Timer()
+        self.streaming_exec_dispatch_s: Timer = Timer()
 
         # Iteration stats, filled out if the user iterates over the dataset.
         self.iter_wait_s: Timer = Timer()
@@ -1230,6 +1233,18 @@ class DatasetStats:
         streaming_exec_schedule_max_s = schedule_timer.max()
         streaming_exec_schedule_p50_s = schedule_timer.percentile(0.5)
         streaming_exec_schedule_p90_s = schedule_timer.percentile(0.9)
+        ray_wait_timer = self.streaming_exec_ray_wait_s
+        streaming_exec_ray_wait_s = ray_wait_timer.get()
+        streaming_exec_ray_wait_avg_s = ray_wait_timer.avg()
+        streaming_exec_ray_wait_max_s = ray_wait_timer.max()
+        on_data_ready_timer = self.streaming_exec_on_data_ready_s
+        streaming_exec_on_data_ready_s = on_data_ready_timer.get()
+        streaming_exec_on_data_ready_avg_s = on_data_ready_timer.avg()
+        streaming_exec_on_data_ready_max_s = on_data_ready_timer.max()
+        dispatch_timer = self.streaming_exec_dispatch_s
+        streaming_exec_dispatch_s = dispatch_timer.get()
+        streaming_exec_dispatch_avg_s = dispatch_timer.avg()
+        streaming_exec_dispatch_max_s = dispatch_timer.max()
         return DatasetStatsSummary(
             operators_stats,
             iter_stats,
@@ -1247,6 +1262,15 @@ class DatasetStats:
             streaming_exec_schedule_max_s,
             streaming_exec_schedule_p50_s,
             streaming_exec_schedule_p90_s,
+            streaming_exec_ray_wait_s,
+            streaming_exec_ray_wait_avg_s,
+            streaming_exec_ray_wait_max_s,
+            streaming_exec_on_data_ready_s,
+            streaming_exec_on_data_ready_avg_s,
+            streaming_exec_on_data_ready_max_s,
+            streaming_exec_dispatch_s,
+            streaming_exec_dispatch_avg_s,
+            streaming_exec_dispatch_max_s,
         )
 
     def runtime_metrics(self) -> str:
@@ -1280,6 +1304,15 @@ class DatasetStatsSummary:
     # ``datasketches`` dependency is unavailable.
     streaming_exec_schedule_p50_s: float
     streaming_exec_schedule_p90_s: float
+    streaming_exec_ray_wait_s: float
+    streaming_exec_ray_wait_avg_s: float
+    streaming_exec_ray_wait_max_s: float
+    streaming_exec_on_data_ready_s: float
+    streaming_exec_on_data_ready_avg_s: float
+    streaming_exec_on_data_ready_max_s: float
+    streaming_exec_dispatch_s: float
+    streaming_exec_dispatch_avg_s: float
+    streaming_exec_dispatch_max_s: float
 
     def to_string(
         self,

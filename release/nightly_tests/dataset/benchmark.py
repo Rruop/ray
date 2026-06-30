@@ -38,6 +38,15 @@ def collect_dataset_stats(ds: "ray.data.Dataset") -> Dict[str, Any]:
         "max_scheduling_loop_duration_s": summary.streaming_exec_schedule_max_s,
         "p50_scheduling_loop_duration_s": summary.streaming_exec_schedule_p50_s,
         "p90_scheduling_loop_duration_s": summary.streaming_exec_schedule_p90_s,
+        "total_ray_wait_runtime": summary.streaming_exec_ray_wait_s,
+        "avg_ray_wait_duration_s": summary.streaming_exec_ray_wait_avg_s,
+        "max_ray_wait_duration_s": summary.streaming_exec_ray_wait_max_s,
+        "total_on_data_ready_runtime": summary.streaming_exec_on_data_ready_s,
+        "avg_on_data_ready_duration_s": summary.streaming_exec_on_data_ready_avg_s,
+        "max_on_data_ready_duration_s": summary.streaming_exec_on_data_ready_max_s,
+        "total_dispatch_runtime": summary.streaming_exec_dispatch_s,
+        "avg_dispatch_duration_s": summary.streaming_exec_dispatch_avg_s,
+        "max_dispatch_duration_s": summary.streaming_exec_dispatch_max_s,
         "operators": [
             {
                 "operator_name": op.operator_name,

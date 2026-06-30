@@ -1116,6 +1116,96 @@ SCHEDULING_LOOP_DURATION_PANEL = Panel(
     stack=False,
 )
 
+RAY_WAIT_DURATION_PANEL = Panel(
+    id=126,
+    title="Ray Wait Duration",
+    description="Duration (in seconds) spent in ray.wait() within the scheduling loop. This measures the I/O blocking time waiting for Ray tasks to complete. High values indicate the scheduler is idle waiting for tasks, while values close to the 100ms timeout suggest no tasks completed during the wait window.",
+    unit="s",
+    targets=[
+        Target(
+            expr="sum(ray_data_ray_wait_duration_s{{{global_filters}}}) by (dataset)",
+            legend="Ray Wait Duration: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
+ON_DATA_READY_DURATION_PANEL = Panel(
+    id=127,
+    title="On Data Ready Duration",
+    description="Duration (in seconds) spent processing on_data_ready for completed tasks within the scheduling loop. This includes pulling task outputs into operator outqueues with backpressure budget enforcement. Spikes may occur when many tasks complete simultaneously in a single ray.wait() call.",
+    unit="s",
+    targets=[
+        Target(
+            expr="sum(ray_data_on_data_ready_duration_s{{{global_filters}}}) by (dataset)",
+            legend="On Data Ready Duration: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
+NUM_READY_TASKS_PANEL = Panel(
+    id=128,
+    title="Ready Tasks Per Step",
+    description="Number of tasks returned as ready by ray.wait() in each scheduling loop step. Large values indicate many tasks completing simultaneously, which can cause on_data_ready processing spikes.",
+    unit="tasks",
+    targets=[
+        Target(
+            expr="sum(ray_data_num_ready_tasks{{{global_filters}}}) by (dataset)",
+            legend="Ready Tasks: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
+DISPATCH_DURATION_PANEL = Panel(
+    id=129,
+    title="Dispatch Duration",
+    description="Duration (in seconds) spent in the dispatch loop (operator selection + task dispatch) within the scheduling loop. This measures the pure scheduling overhead excluding ray.wait() I/O time. High values may indicate expensive operator selection or resource contention.",
+    unit="s",
+    targets=[
+        Target(
+            expr="sum(ray_data_dispatch_duration_s{{{global_filters}}}) by (dataset)",
+            legend="Dispatch Duration: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
+NUM_TASKS_DISPATCHED_PANEL = Panel(
+    id=130,
+    title="Tasks Dispatched Per Step",
+    description="Number of tasks dispatched in each scheduling loop step. Low values may indicate backpressure or resource constraints limiting parallelism.",
+    unit="tasks",
+    targets=[
+        Target(
+            expr="sum(ray_data_num_tasks_dispatched{{{global_filters}}}) by (dataset)",
+            legend="Tasks Dispatched: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
+PER_TASK_DISPATCH_DURATION_PANEL = Panel(
+    id=131,
+    title="Per-Task Dispatch Duration",
+    description="Average duration (in seconds) to dispatch a single task (select operator + submit task). This isolates per-task scheduling overhead from batch effects. High values suggest expensive operator selection or task submission logic.",
+    unit="s",
+    targets=[
+        Target(
+            expr="sum(ray_data_per_task_dispatch_duration_s{{{global_filters}}}) by (dataset)",
+            legend="Per-Task Dispatch Duration: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
 MAX_BYTES_TO_READ_PANEL = Panel(
     id=55,
     title="Max Bytes to Read",
@@ -1511,6 +1601,12 @@ DATA_GRAFANA_ROWS = [
         id=106,
         panels=[
             SCHEDULING_LOOP_DURATION_PANEL,
+            RAY_WAIT_DURATION_PANEL,
+            ON_DATA_READY_DURATION_PANEL,
+            NUM_READY_TASKS_PANEL,
+            DISPATCH_DURATION_PANEL,
+            NUM_TASKS_DISPATCHED_PANEL,
+            PER_TASK_DISPATCH_DURATION_PANEL,
         ],
         collapsed=True,
     ),
@@ -1571,9 +1667,9 @@ for row in DATA_GRAFANA_ROWS:
 
 all_panel_ids.sort()
 
-assert len(all_panel_ids) == len(
-    set(all_panel_ids)
-), f"Duplicated id found. Use unique id for each panel. {all_panel_ids}"
+assert len(all_panel_ids) == len(set(all_panel_ids)), (
+    f"Duplicated id found. Use unique id for each panel. {all_panel_ids}"
+)
 
 data_dashboard_config = DashboardConfig(
     name="DATA",

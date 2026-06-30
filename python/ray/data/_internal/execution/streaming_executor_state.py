@@ -7,7 +7,7 @@ import logging
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, NamedTuple, Optional, Tuple
 
 import ray
 from ray.data._internal.actor_autoscaler.autoscaling_actor_pool import ActorPoolInfo
@@ -391,11 +391,19 @@ def build_streaming_topology(
     return topology
 
 
+class ProcessCompletedTasksResult(NamedTuple):
+    num_errored_blocks: int
+    ray_wait_duration_s: float
+    on_data_ready_duration_s: float
+    num_ready_tasks: int
+    errored_blocks_per_op: Dict["OpState", int]
+
+
 def process_completed_tasks(
     topology: Topology,
     backpressure_policies: List[BackpressurePolicy],
     max_errored_blocks: int,
-) -> Dict["OpState", int]:
+) -> ProcessCompletedTasksResult:
     """Process any newly completed tasks. To update operator
     states, call `update_operator_states()` afterwards.
 
@@ -405,7 +413,10 @@ def process_completed_tasks(
         max_errored_blocks: Max number of errored blocks to allow,
             unlimited if negative.
     Returns:
-        A dict mapping OpState to the number of errored blocks for that operator.
+        A ProcessCompletedTasksResult named tuple containing the number of
+        errored blocks, the duration in seconds spent in ray.wait(), the
+        duration in seconds spent processing on_data_ready for completed
+        tasks, and the number of ready tasks returned by ray.wait().
     """
 
     # All active tasks, keyed by their waitables.
@@ -431,9 +442,9 @@ def process_completed_tasks(
                 else:
                     max_bytes_to_read = min(max_bytes_to_read, policy_limit)
 
-        assert (
-            max_bytes_to_read is None or max_bytes_to_read >= 0
-        ), f"Max bytes to read must either be null or >= 0 (got {max_bytes_to_read})"
+        assert max_bytes_to_read is None or max_bytes_to_read >= 0, (
+            f"Max bytes to read must either be null or >= 0 (got {max_bytes_to_read})"
+        )
 
         # If no policy provides a limit, there's no limit
         op.notify_in_task_output_backpressure(max_bytes_to_read == 0, limiting_policy)
@@ -444,13 +455,18 @@ def process_completed_tasks(
     # Process completed Ray tasks and notify operators.
     errored_blocks_per_op: Dict["OpState", int] = defaultdict(int)
     num_errored_blocks = 0
+    ray_wait_duration_s = 0.0
+    on_data_ready_duration_s = 0.0
+    num_ready_tasks = 0
     if active_tasks:
+        ray_wait_t_start = time.perf_counter()
         ready, _ = ray.wait(
             list(active_tasks.keys()),
             num_returns=len(active_tasks),
             fetch_local=False,
             timeout=0.1,
         )
+        ray_wait_duration_s = time.perf_counter() - ray_wait_t_start
 
         # Organize tasks by the operator they belong to, and sort them by task index.
         # So that we'll process them in a deterministic order.
@@ -462,6 +478,8 @@ def process_completed_tasks(
             state, task = active_tasks[ref]
             ready_tasks_by_op[state].append(task)
 
+        num_ready_tasks = len(ready)
+        on_data_ready_t_start = time.perf_counter()
         for state, ready_tasks in ready_tasks_by_op.items():
             # TODO elaborate why sorting (helps preserve_order case)
             ready_tasks = sorted(ready_tasks, key=lambda t: t.task_index())
@@ -511,12 +529,20 @@ def process_completed_tasks(
                     assert isinstance(task, MetadataOpTask)
                     task.on_task_finished()
 
+        on_data_ready_duration_s = time.perf_counter() - on_data_ready_t_start
+
     # Pull any operator outputs into the streaming op state.
     for op, op_state in topology.items():
         while op.has_next():
             op_state.add_output(op.get_next())
 
-    return dict(errored_blocks_per_op)
+    return ProcessCompletedTasksResult(
+        num_errored_blocks=num_errored_blocks,
+        ray_wait_duration_s=ray_wait_duration_s,
+        on_data_ready_duration_s=on_data_ready_duration_s,
+        num_ready_tasks=num_ready_tasks,
+        errored_blocks_per_op=dict(errored_blocks_per_op),
+    )
 
 
 def update_operator_states(topology: Topology) -> None:
@@ -524,7 +550,6 @@ def update_operator_states(topology: Topology) -> None:
     Should be called after `process_completed_tasks()`."""
 
     for op, op_state in topology.items():
-
         # Call inputs_done() on ops where no more inputs are coming.
         if op_state.inputs_done_called:
             continue
@@ -545,7 +570,6 @@ def update_operator_states(topology: Topology) -> None:
     # For each op, if all of its downstream operators have completed.
     # call mark_execution_finished() to also complete this op.
     for op, op_state in reversed(list(topology.items())):
-
         dependents_completed = len(op.output_dependencies) > 0 and all(
             dep.has_completed() for dep in op.output_dependencies
         )

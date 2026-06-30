@@ -3,6 +3,7 @@ import os
 import threading
 import time
 import typing
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import ray
@@ -78,6 +79,29 @@ DATA_CONTEXT_LOG_TRUNCATE_LENGTH = 10000
 # Visible for testing.
 _num_shutdown = 0
 
+@dataclass
+class SchedulingLoopMetrics:
+    """Metrics collected during a single scheduling loop step.
+
+    Note: sched_loop_duration_s is the total wall time of the entire
+    scheduling loop step (measured outside _scheduling_loop_step). It
+    is strictly greater than the sum of the sub-phase durations below
+    because it also includes resource manager updates, error handling,
+    autoscaling, schema export, and operator completion checks.
+    """
+
+    sched_loop_duration_s: float = 0.0
+    ray_wait_duration_s: float = 0.0
+    on_data_ready_duration_s: float = 0.0
+    num_ready_tasks: int = 0
+    dispatch_duration_s: float = 0.0
+    num_tasks_dispatched: int = 0
+
+    @property
+    def per_task_dispatch_duration_s(self) -> float:
+        if self.num_tasks_dispatched > 0:
+            return self.dispatch_duration_s / self.num_tasks_dispatched
+        return 0.0
 
 class StreamingExecutor(Executor, threading.Thread):
     """A streaming Dataset executor.
@@ -144,6 +168,36 @@ class StreamingExecutor(Executor, threading.Thread):
         self._sched_loop_duration_s = Gauge(
             "data_sched_loop_duration_s",
             description="Duration of the scheduling loop in seconds",
+            tag_keys=("dataset",),
+        )
+        self._ray_wait_duration_s = Gauge(
+            "data_ray_wait_duration_s",
+            description="Duration of ray.wait() in the scheduling loop in seconds",
+            tag_keys=("dataset",),
+        )
+        self._on_data_ready_duration_s = Gauge(
+            "data_on_data_ready_duration_s",
+            description="Duration of processing on_data_ready for completed tasks in seconds",
+            tag_keys=("dataset",),
+        )
+        self._num_ready_tasks = Gauge(
+            "data_num_ready_tasks",
+            description="Number of tasks that became ready in a scheduling loop step",
+            tag_keys=("dataset",),
+        )
+        self._dispatch_duration_s = Gauge(
+            "data_dispatch_duration_s",
+            description="Duration of the dispatch loop (operator selection + task dispatch) in seconds",
+            tag_keys=("dataset",),
+        )
+        self._num_tasks_dispatched = Gauge(
+            "data_num_tasks_dispatched",
+            description="Number of tasks dispatched in a scheduling loop step",
+            tag_keys=("dataset",),
+        )
+        self._per_task_dispatch_duration_s = Gauge(
+            "data_per_task_dispatch_duration_s",
+            description="Average duration of dispatching a single task in seconds",
             tag_keys=("dataset",),
         )
 
@@ -315,7 +369,7 @@ class StreamingExecutor(Executor, threading.Thread):
             )
             # Reset the scheduling loop duration gauge + resource manager budgets/usages.
             self._resource_manager.update_usages()
-            self.update_metrics(0)
+            self.update_metrics(SchedulingLoopMetrics())
             if self._data_context.enable_auto_log_stats:
                 logger.info(stats_summary_string)
             # Close the progress manager with a finishing message.
@@ -543,24 +597,33 @@ class StreamingExecutor(Executor, threading.Thread):
                 # Use `perf_counter` rather than `process_time` to ensure we include
                 # time spent on IO, like RPCs to Ray Core.
                 t_start = time.perf_counter()
-                continue_sched = self._scheduling_loop_step(self._topology)
+                continue_sched, loop_metrics = self._scheduling_loop_step(
+                    self._topology
+                )
 
-                sched_loop_duration = time.perf_counter() - t_start
+                loop_metrics.sched_loop_duration_s = time.perf_counter() - t_start
 
-                self.update_metrics(sched_loop_duration)
-                # 实时采样（cluster + job + operator）
+                self.update_metrics(loop_metrics)
                 _mem_loop_counter += 1
                 if _mem_loop_counter % _mem_sample_interval == 0:
                     _sampler.sample_realtime(self._topology)
 
-                # 算子 task 耗时 & 失败计数采样
                 _task_loop_counter += 1
                 if _task_loop_counter % _task_sample_interval == 0:
                     _sampler.sample_task_metrics(self._topology)
 
                 if self._initial_stats:
                     self._initial_stats.streaming_exec_schedule_s.add(
-                        sched_loop_duration
+                        loop_metrics.sched_loop_duration_s
+                    )
+                    self._initial_stats.streaming_exec_ray_wait_s.add(
+                        loop_metrics.ray_wait_duration_s
+                    )
+                    self._initial_stats.streaming_exec_on_data_ready_s.add(
+                        loop_metrics.on_data_ready_duration_s
+                    )
+                    self._initial_stats.streaming_exec_dispatch_s.add(
+                        loop_metrics.dispatch_duration_s
                     )
 
                 for callback in self._callbacks:
@@ -577,9 +640,16 @@ class StreamingExecutor(Executor, threading.Thread):
             _, state = self._output_node
             state.mark_finished(exc)
 
-    def update_metrics(self, sched_loop_duration: int):
-        self._sched_loop_duration_s.set(
-            sched_loop_duration, tags={"dataset": self._dataset_id}
+    def update_metrics(self, metrics: SchedulingLoopMetrics):
+        tags = {"dataset": self._dataset_id}
+        self._sched_loop_duration_s.set(metrics.sched_loop_duration_s, tags=tags)
+        self._ray_wait_duration_s.set(metrics.ray_wait_duration_s, tags=tags)
+        self._on_data_ready_duration_s.set(metrics.on_data_ready_duration_s, tags=tags)
+        self._num_ready_tasks.set(metrics.num_ready_tasks, tags=tags)
+        self._dispatch_duration_s.set(metrics.dispatch_duration_s, tags=tags)
+        self._num_tasks_dispatched.set(metrics.num_tasks_dispatched, tags=tags)
+        self._per_task_dispatch_duration_s.set(
+            metrics.per_task_dispatch_duration_s, tags=tags
         )
 
     def get_stats(self):
@@ -618,9 +688,26 @@ class StreamingExecutor(Executor, threading.Thread):
             if self._initial_stats
             else Timer()
         )
+        stats.streaming_exec_ray_wait_s = (
+            self._initial_stats.streaming_exec_ray_wait_s
+            if self._initial_stats
+            else Timer()
+        )
+        stats.streaming_exec_on_data_ready_s = (
+            self._initial_stats.streaming_exec_on_data_ready_s
+            if self._initial_stats
+            else Timer()
+        )
+        stats.streaming_exec_dispatch_s = (
+            self._initial_stats.streaming_exec_dispatch_s
+            if self._initial_stats
+            else Timer()
+        )
         return stats
 
-    def _scheduling_loop_step(self, topology: Topology) -> bool:
+    def _scheduling_loop_step(
+        self, topology: Topology
+    ) -> Tuple[bool, SchedulingLoopMetrics]:
         """Run one step of the scheduling loop.
 
         This runs a few general phases:
@@ -629,43 +716,39 @@ class StreamingExecutor(Executor, threading.Thread):
             3. Selecting and dispatching new inputs to operators.
 
         Returns:
-            True if we should continue running the scheduling loop.
+            A tuple of (True if we should continue running the scheduling loop,
+            a SchedulingLoopMetrics with per-step metrics).
         """
         self._resource_manager.update_usages()
         # Note: calling process_completed_tasks() is expensive since it incurs
         # ray.wait() overhead, so make sure to allow multiple dispatch per call for
         # greater parallelism.
-        errored_blocks_per_op = process_completed_tasks(
+        completed = process_completed_tasks(
             topology,
             self._backpressure_policies,
             self._max_errored_blocks,
         )
 
-        # Update per-operator errored blocks metrics
-        for op_state, num_errors in errored_blocks_per_op.items():
-            if num_errors > 0:
-                for _ in range(num_errors):
-                    op_state.op.metrics.on_block_errored()
-
-        # Update executor-level errored blocks count
-        total_errored = sum(errored_blocks_per_op.values())
-        if total_errored > 0:
-            # 打点：本轮调度中各 op 的失败 block 数
+        # Update per-operator errored blocks metrics & emit perf metrics
+        if completed.num_errored_blocks > 0:
             _block_err_ctx = _pm.PerfContext.from_runtime()
-            for op_state, num_errors in errored_blocks_per_op.items():
+            for op_state, num_errors in completed.errored_blocks_per_op.items():
                 if num_errors > 0:
-                    # perf 打点：失败 block 数
-                    _pm.emit_op_block_error(_block_err_ctx, op_state.op.name,
-                                            count=num_errors)
+                    for _ in range(num_errors):
+                        op_state.op.metrics.on_block_errored()
+                    _pm.emit_op_block_error(
+                        _block_err_ctx, op_state.op.name, count=num_errors
+                    )
         if self._max_errored_blocks > 0:
-            self._max_errored_blocks -= total_errored
-        self._num_errored_blocks += total_errored
+            self._max_errored_blocks -= completed.num_errored_blocks
+        self._num_errored_blocks += completed.num_errored_blocks
 
         self._resource_manager.update_usages()
         # Dispatch as many operators as we can for completed tasks.
         self._report_current_usage()
 
         i = 0
+        dispatch_t_start = time.perf_counter()
         while True:
             op = select_operator_to_run(
                 topology,
@@ -687,6 +770,8 @@ class StreamingExecutor(Executor, threading.Thread):
             i += 1
             if i % self._progress_manager.TOTAL_PROGRESS_REFRESH_EVERY_N_STEPS == 0:
                 self._refresh_progress_manager(topology)
+
+        dispatch_duration_s = time.perf_counter() - dispatch_t_start
 
         # Trigger autoscaling
         self._cluster_autoscaler.try_trigger_scaling()
@@ -727,7 +812,14 @@ class StreamingExecutor(Executor, threading.Thread):
                 self._validate_operator_queues_empty(op, state)
 
         # Keep going until all operators run to completion.
-        return not all(op.has_completed() for op in topology)
+        loop_metrics = SchedulingLoopMetrics(
+            ray_wait_duration_s=completed.ray_wait_duration_s,
+            on_data_ready_duration_s=completed.on_data_ready_duration_s,
+            num_ready_tasks=completed.num_ready_tasks,
+            dispatch_duration_s=dispatch_duration_s,
+            num_tasks_dispatched=i,
+        )
+        return not all(op.has_completed() for op in topology), loop_metrics
 
     def _refresh_progress_manager(self, topology: Topology):
         # Update the progress manager to reflect scheduling decisions.
