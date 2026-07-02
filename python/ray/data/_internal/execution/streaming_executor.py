@@ -582,14 +582,14 @@ class StreamingExecutor(Executor, threading.Thread):
         Results are returned via the output node's outqueue.
         """
         # Perflog 采样器：所有数据获取/累加/上下文构建都封装在内部
-        _sampler = _pm.PerfSampler(
+        data_ctx = DataContext.get_current()
+        perf_enabled = data_ctx.enable_perf_metrics
+        loop_counter = 0
+        sampler = _pm.PerfSampler(
             submission_id_provider=self._get_job_submission_id_or_job_id,
         )
-        # 采样调度参数（保留在业务文件，便于按场景调节）
-        _mem_sample_interval = 10   # 实时采样：每 10 轮一次
-        _mem_loop_counter = 0
-        _task_sample_interval = 5   # task 指标采样：每 5 轮一次
-        _task_loop_counter = 0
+        mem_sample_interval = data_ctx.perf_realtime_sample_interval
+        task_sample_interval = data_ctx.perf_task_metrics_sample_interval
         exc: Optional[Exception] = None
         try:
             # Run scheduling loop until complete.
@@ -604,13 +604,13 @@ class StreamingExecutor(Executor, threading.Thread):
                 loop_metrics.sched_loop_duration_s = time.perf_counter() - t_start
 
                 self.update_metrics(loop_metrics)
-                _mem_loop_counter += 1
-                if _mem_loop_counter % _mem_sample_interval == 0:
-                    _sampler.sample_realtime(self._topology)
 
-                _task_loop_counter += 1
-                if _task_loop_counter % _task_sample_interval == 0:
-                    _sampler.sample_task_metrics(self._topology)
+                if perf_enabled:
+                    loop_counter += 1
+                    if loop_counter % mem_sample_interval == 0:
+                        sampler.sample_realtime(self._topology)
+                    if loop_counter % task_sample_interval == 0:
+                        sampler.sample_task_metrics(self._topology)
 
                 if self._initial_stats:
                     self._initial_stats.streaming_exec_schedule_s.add(
@@ -634,8 +634,8 @@ class StreamingExecutor(Executor, threading.Thread):
             # Propagate it to the result iterator.
             exc = e
         finally:
-            # 汇总打点（mem / gpu / queue / op task）
-            _sampler.flush(self._topology)
+            if perf_enabled:
+                sampler.flush(self._topology)
             # Mark state of outputting operator as finished
             _, state = self._output_node
             state.mark_finished(exc)

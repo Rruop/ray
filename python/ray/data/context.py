@@ -281,6 +281,15 @@ DEFAULT_ENABLE_PER_NODE_METRICS = bool(
     int(os.environ.get("RAY_DATA_PER_NODE_METRICS", "0"))
 )
 
+# Enable perf metrics sampling in streaming executor.
+DEFAULT_ENABLE_PERF_METRICS = env_bool("RAY_DATA_ENABLE_PERF_METRICS", True)
+DEFAULT_PERF_REALTIME_SAMPLE_INTERVAL = env_integer(
+    "RAY_DATA_PERF_REALTIME_SAMPLE_INTERVAL", 10
+)
+DEFAULT_PERF_TASK_METRICS_SAMPLE_INTERVAL = env_integer(
+    "RAY_DATA_PERF_TASK_METRICS_SAMPLE_INTERVAL", 5
+)
+
 DEFAULT_MIN_HASH_SHUFFLE_AGGREGATOR_WAIT_TIME_IN_S = env_integer(
     "RAY_DATA_MIN_HASH_SHUFFLE_AGGREGATOR_WAIT_TIME_IN_S", 300
 )
@@ -643,6 +652,13 @@ class DataContext:
         use_polars_sort: Whether to use Polars for tabular dataset sorting operations.
         enable_per_node_metrics: Enable per node metrics reporting for Ray Data,
             disabled by default.
+        enable_perf_metrics: Whether to enable perf metrics sampling in the
+            streaming executor. When disabled, all PerfSampler calls (sample_realtime,
+            sample_task_metrics, flush) are skipped.
+        perf_realtime_sample_interval: Number of scheduling loop iterations between
+            realtime samples (memory, GPU, operator stats). Default 10.
+        perf_task_metrics_sample_interval: Number of scheduling loop iterations between
+            task metrics samples. Default 5.
         override_object_store_memory_limit_fraction: Override the fraction of object
             store memory limit. If `None`, uses Ray's default.
         memory_usage_poll_interval_s: The interval to poll the USS of map tasks. If `None`,
@@ -812,6 +828,9 @@ class DataContext:
     lance_config: LanceConfig = field(default_factory=LanceConfig)
     iceberg_config: IcebergConfig = field(default_factory=IcebergConfig)
     enable_per_node_metrics: bool = DEFAULT_ENABLE_PER_NODE_METRICS
+    enable_perf_metrics: bool = DEFAULT_ENABLE_PERF_METRICS
+    perf_realtime_sample_interval: int = DEFAULT_PERF_REALTIME_SAMPLE_INTERVAL
+    perf_task_metrics_sample_interval: int = DEFAULT_PERF_TASK_METRICS_SAMPLE_INTERVAL
     override_object_store_memory_limit_fraction: float = None
     memory_usage_poll_interval_s: Optional[float] = 1
     dataset_logger_id: Optional[str] = None
