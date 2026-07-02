@@ -126,7 +126,7 @@ class StreamingExecutor(Executor, threading.Thread):
         kconf_spec: Optional["_KconfSpec"] = None,
     ):
         self._data_context = data_context
-        self._ranker = create_ranker()
+        self._ranker = create_ranker(data_context)
         self._start_time: Optional[float] = None
         self._initial_stats: Optional[DatasetStats] = None
         self._final_stats: Optional[DatasetStats] = None

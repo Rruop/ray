@@ -3,7 +3,7 @@ import logging
 import os
 from typing import TYPE_CHECKING, Optional
 
-from .ranker import DefaultRanker, Ranker
+from .ranker import DefaultRanker, GPUAwareRanker, Ranker
 
 if TYPE_CHECKING:
     from ... import DataContext
@@ -52,6 +52,8 @@ def create_resource_allocator(
         )
 
 
-def create_ranker() -> Ranker:
-    """Create a ranker instance based on environment and configuration."""
+def create_ranker(data_context: "DataContext") -> Ranker:
+    """Return ``GPUAwareRanker`` when opt-in via ``DataContext``, else default."""
+    if data_context.gpu_aware_scheduling:
+        return GPUAwareRanker()
     return DefaultRanker()

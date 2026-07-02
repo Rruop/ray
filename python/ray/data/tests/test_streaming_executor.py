@@ -642,6 +642,87 @@ def test_rank_operators(ray_start_regular_shared):
     assert [(1, 1024), (1, 2048), (1, 4096), (0, 8092)] == ranks
 
 
+def test_gpu_aware_ranker_prefers_gpu_ops(ray_start_regular_shared):
+    """``GPUAwareRanker`` must rank ops by:
+    (throttling_disabled, gpu_priority, obj_store_mem).
+
+    Pass-through ops (throttling-disabled InputDataBuffer / Limit / etc.)
+    must run before GPU ops, otherwise the upstream pipeline would starve
+    and the GPU op would eventually idle. Among real-work ops, GPU wins
+    over CPU even with higher memory usage. Same-class ops break ties on
+    obj_store_memory like ``DefaultRanker``.
+    """
+    from ray.data._internal.execution.ranker import GPUAwareRanker
+
+    inputs = make_ref_bundles([[x] for x in range(1)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: block), o1, DataContext.get_current()
+    )
+    o3 = MapOperator.create(
+        make_map_transformer(lambda block: block), o2, DataContext.get_current()
+    )
+
+    # Mark o2 as a GPU op via ``incremental_resource_usage``.
+    o2.incremental_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=0, gpu=1)
+    )
+    # o3 is CPU-only and uses LESS memory than o2 — under DefaultRanker o3
+    # would beat o2; under GPUAwareRanker o2 must still win among
+    # real-work ops because it consumes GPU.
+    o3.incremental_resource_usage = MagicMock(
+        return_value=ExecutionResources(cpu=1, gpu=0)
+    )
+
+    resource_manager = mock_resource_manager()
+
+    def _usage(op):
+        return ExecutionResources(
+            object_store_memory={o1: 1024, o2: 4096, o3: 2048}.get(op, 0)
+        )
+
+    resource_manager.get_op_usage.side_effect = _usage
+
+    ranker = GPUAwareRanker()
+    ranks = ranker.rank_operators([o1, o2, o3], {}, resource_manager)
+
+    # (throttling_disabled, gpu_priority, obj_store_mem)
+    assert ranks == [
+        (0, 1, 1024),  # o1 InputDataBuffer: throttling-disabled wins outright
+        (1, 0, 4096),  # o2 GPU op: real work, GPU-priority over CPU
+        (1, 1, 2048),  # o3 CPU op: real work, no GPU
+    ]
+    # InputDataBuffer must rank best to keep the pipeline fed.
+    assert min(zip([o1, o2, o3], ranks), key=lambda p: p[1])[0] is o1
+    # Among real-work ops, GPU op (o2) must beat CPU op (o3) despite
+    # higher memory usage.
+    real_work = [(o2, ranks[1]), (o3, ranks[2])]
+    assert min(real_work, key=lambda p: p[1])[0] is o2
+
+
+def test_create_ranker_switches_on_data_context(ray_start_regular_shared):
+    """``create_ranker`` returns ``GPUAwareRanker`` only when the
+    ``DataContext.gpu_aware_scheduling`` flag is True; defaults to
+    ``DefaultRanker`` otherwise.
+    """
+    from dataclasses import replace as dc_replace
+
+    from ray.data._internal.execution import create_ranker
+    from ray.data._internal.execution.ranker import (
+        DefaultRanker,
+        GPUAwareRanker,
+    )
+
+    base = DataContext.get_current()
+    off = dc_replace(base, gpu_aware_scheduling=False)
+    on = dc_replace(base, gpu_aware_scheduling=True)
+
+    assert isinstance(create_ranker(off), DefaultRanker)
+    assert isinstance(create_ranker(on), GPUAwareRanker)
+    # ``None`` falls back to default for backward compat.
+    assert isinstance(create_ranker(None), DefaultRanker)
+
+
 def test_select_ops_to_run(ray_start_regular_shared):
     opts = ExecutionOptions()
 

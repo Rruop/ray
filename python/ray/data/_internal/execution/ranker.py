@@ -122,3 +122,30 @@ class DefaultRanker(Ranker[Tuple[int, int]]):
         )
 
         return rank
+
+
+class GPUAwareRanker(Ranker[Tuple[int, int, int]]):
+    """Ranker that prefers GPU-consuming ops within the throttleable tier.
+
+    Ranking dimensions (lower = higher priority):
+        1. throttling_disabled (0/1) — pass-through ops first so the pipeline
+           never starves. ``throttling_disabled`` MUST outrank ``gpu_priority``;
+           otherwise GPU ops can starve their upstream feeders.
+        2. gpu_priority (0/1) — among real-work ops, prefer GPU ops to keep
+           scarce GPUs busy.
+        3. object_store_memory — tie-breaker, same as ``DefaultRanker``.
+
+    Opt-in via ``DataContext.gpu_aware_scheduling``; intended for mixed
+    CPU/GPU pipelines where GPUs are scarce relative to CPUs.
+    """
+
+    def rank_operator(
+        self,
+        op: PhysicalOperator,
+        topology: "Topology",
+        resource_manager: "ResourceManager",
+    ) -> Tuple[int, int, int]:
+        throttling_disabled = 0 if op.throttling_disabled() else 1
+        gpu_priority = 0 if op.incremental_resource_usage().gpu > 0 else 1
+        obj_store_mem = resource_manager.get_op_usage(op).object_store_memory
+        return (throttling_disabled, gpu_priority, obj_store_mem)

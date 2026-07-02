@@ -110,6 +110,12 @@ DEFAULT_MAX_COMPLETIONS_PER_SCHEDULING_STEP = env_integer(
     "RAY_DATA_MAX_COMPLETIONS_PER_STEP", 512
 )
 
+DEFAULT_BATCH_RESOURCE_CHECK_INTERVAL = env_integer(
+    "RAY_DATA_BATCH_RESOURCE_CHECK_INTERVAL", 16
+)
+
+DEFAULT_GPU_AWARE_SCHEDULING = env_bool("RAY_DATA_GPU_AWARE_SCHEDULING", False)
+
 # This default enables locality-based scheduling in Ray for tasks where arg data
 # transfer is a bottleneck.
 DEFAULT_SCHEDULING_STRATEGY_LARGE_ARGS = "DEFAULT"
@@ -857,6 +863,10 @@ class DataContext:
     max_completions_per_scheduling_step: int = (
         DEFAULT_MAX_COMPLETIONS_PER_SCHEDULING_STEP
     )
+
+    batch_resource_check_interval: int = DEFAULT_BATCH_RESOURCE_CHECK_INTERVAL
+
+    gpu_aware_scheduling: bool = DEFAULT_GPU_AWARE_SCHEDULING
 
     enable_dynamic_output_queue_size_backpressure: bool = (
         DEFAULT_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE
