@@ -88,6 +88,10 @@ class SchedulingLoopMetrics:
     is strictly greater than the sum of the sub-phase durations below
     because it also includes resource manager updates, error handling,
     autoscaling, schema export, and operator completion checks.
+
+    inter_step_duration_s measures the wall time between the end of the
+    previous _scheduling_loop_step and the start of the current one —
+    i.e. the overhead of update_metrics, sampling, callbacks, etc.
     """
 
     sched_loop_duration_s: float = 0.0
@@ -96,6 +100,7 @@ class SchedulingLoopMetrics:
     num_ready_tasks: int = 0
     dispatch_duration_s: float = 0.0
     num_tasks_dispatched: int = 0
+    inter_step_duration_s: float = 0.0
 
     @property
     def per_task_dispatch_duration_s(self) -> float:
@@ -198,6 +203,11 @@ class StreamingExecutor(Executor, threading.Thread):
         self._per_task_dispatch_duration_s = Gauge(
             "data_per_task_dispatch_duration_s",
             description="Average duration of dispatching a single task in seconds",
+            tag_keys=("dataset",),
+        )
+        self._inter_step_duration_s = Gauge(
+            "data_inter_step_duration_s",
+            description="Wall time between consecutive scheduling loop steps in seconds",
             tag_keys=("dataset",),
         )
 
@@ -581,7 +591,7 @@ class StreamingExecutor(Executor, threading.Thread):
 
         Results are returned via the output node's outqueue.
         """
-        # Perflog 采样器：所有数据获取/累加/上下文构建都封装在内部
+        # Perf sampler: all data acquisition / accumulation / context building is encapsulated inside
         data_ctx = DataContext.get_current()
         perf_enabled = data_ctx.enable_perf_metrics
         loop_counter = 0
@@ -591,17 +601,24 @@ class StreamingExecutor(Executor, threading.Thread):
         mem_sample_interval = data_ctx.perf_realtime_sample_interval
         task_sample_interval = data_ctx.perf_task_metrics_sample_interval
         exc: Optional[Exception] = None
+        prev_step_end = None
         try:
             # Run scheduling loop until complete.
             while True:
                 # Use `perf_counter` rather than `process_time` to ensure we include
                 # time spent on IO, like RPCs to Ray Core.
                 t_start = time.perf_counter()
+                inter_step_duration = (
+                    t_start - prev_step_end if prev_step_end is not None else 0.0
+                )
                 continue_sched, loop_metrics = self._scheduling_loop_step(
                     self._topology
                 )
 
-                loop_metrics.sched_loop_duration_s = time.perf_counter() - t_start
+                now = time.perf_counter()
+                loop_metrics.sched_loop_duration_s = now - t_start
+                loop_metrics.inter_step_duration_s = inter_step_duration
+                prev_step_end = now
 
                 self.update_metrics(loop_metrics)
 
@@ -624,6 +641,9 @@ class StreamingExecutor(Executor, threading.Thread):
                     )
                     self._initial_stats.streaming_exec_dispatch_s.add(
                         loop_metrics.dispatch_duration_s
+                    )
+                    self._initial_stats.streaming_exec_inter_step_s.add(
+                        loop_metrics.inter_step_duration_s
                     )
 
                 for callback in self._callbacks:
@@ -651,6 +671,7 @@ class StreamingExecutor(Executor, threading.Thread):
         self._per_task_dispatch_duration_s.set(
             metrics.per_task_dispatch_duration_s, tags=tags
         )
+        self._inter_step_duration_s.set(metrics.inter_step_duration_s, tags=tags)
 
     def get_stats(self):
         """Return the stats object for the streaming execution.
@@ -700,6 +721,11 @@ class StreamingExecutor(Executor, threading.Thread):
         )
         stats.streaming_exec_dispatch_s = (
             self._initial_stats.streaming_exec_dispatch_s
+            if self._initial_stats
+            else Timer()
+        )
+        stats.streaming_exec_inter_step_s = (
+            self._initial_stats.streaming_exec_inter_step_s
             if self._initial_stats
             else Timer()
         )

@@ -1206,6 +1206,21 @@ PER_TASK_DISPATCH_DURATION_PANEL = Panel(
     stack=False,
 )
 
+INTER_STEP_DURATION_PANEL = Panel(
+    id=132,
+    title="Inter-Step Duration",
+    description="Wall time (in seconds) between consecutive scheduling loop steps — the overhead of update_metrics, sampling, callbacks, etc. High values indicate the loop is spending significant time outside the core scheduling work.",
+    unit="s",
+    targets=[
+        Target(
+            expr="sum(ray_data_inter_step_duration_s{{{global_filters}}}) by (dataset)",
+            legend="Inter-Step Duration: {{dataset}}",
+        )
+    ],
+    fill=0,
+    stack=False,
+)
+
 MAX_BYTES_TO_READ_PANEL = Panel(
     id=55,
     title="Max Bytes to Read",
@@ -1607,6 +1622,7 @@ DATA_GRAFANA_ROWS = [
             DISPATCH_DURATION_PANEL,
             NUM_TASKS_DISPATCHED_PANEL,
             PER_TASK_DISPATCH_DURATION_PANEL,
+            INTER_STEP_DURATION_PANEL,
         ],
         collapsed=True,
     ),

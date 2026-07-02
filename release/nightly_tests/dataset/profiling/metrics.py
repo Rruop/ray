@@ -56,6 +56,10 @@ def extract_pipeline_metrics(ds, num_gpus=0, outdir=None):
     if dispatch_s:
         metrics["dispatch_s"] = round(dispatch_s, 2)
 
+    inter_step_s = summary.streaming_exec_inter_step_s
+    if inter_step_s:
+        metrics["inter_step_s"] = round(inter_step_s, 2)
+
     # Phase timings: each operator's end time relative to pipeline start
     _add_phase_timings(summary, metrics)
 

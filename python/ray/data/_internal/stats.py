@@ -1105,6 +1105,7 @@ class DatasetStats:
         self.streaming_exec_ray_wait_s: Timer = Timer()
         self.streaming_exec_on_data_ready_s: Timer = Timer()
         self.streaming_exec_dispatch_s: Timer = Timer()
+        self.streaming_exec_inter_step_s: Timer = Timer()
 
         # Iteration stats, filled out if the user iterates over the dataset.
         self.iter_wait_s: Timer = Timer()
@@ -1245,6 +1246,10 @@ class DatasetStats:
         streaming_exec_dispatch_s = dispatch_timer.get()
         streaming_exec_dispatch_avg_s = dispatch_timer.avg()
         streaming_exec_dispatch_max_s = dispatch_timer.max()
+        inter_step_timer = self.streaming_exec_inter_step_s
+        streaming_exec_inter_step_s = inter_step_timer.get()
+        streaming_exec_inter_step_avg_s = inter_step_timer.avg()
+        streaming_exec_inter_step_max_s = inter_step_timer.max()
         return DatasetStatsSummary(
             operators_stats,
             iter_stats,
@@ -1271,6 +1276,9 @@ class DatasetStats:
             streaming_exec_dispatch_s,
             streaming_exec_dispatch_avg_s,
             streaming_exec_dispatch_max_s,
+            streaming_exec_inter_step_s,
+            streaming_exec_inter_step_avg_s,
+            streaming_exec_inter_step_max_s,
         )
 
     def runtime_metrics(self) -> str:
@@ -1313,6 +1321,9 @@ class DatasetStatsSummary:
     streaming_exec_dispatch_s: float
     streaming_exec_dispatch_avg_s: float
     streaming_exec_dispatch_max_s: float
+    streaming_exec_inter_step_s: float
+    streaming_exec_inter_step_avg_s: float
+    streaming_exec_inter_step_max_s: float
 
     def to_string(
         self,

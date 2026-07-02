@@ -47,6 +47,9 @@ def collect_dataset_stats(ds: "ray.data.Dataset") -> Dict[str, Any]:
         "total_dispatch_runtime": summary.streaming_exec_dispatch_s,
         "avg_dispatch_duration_s": summary.streaming_exec_dispatch_avg_s,
         "max_dispatch_duration_s": summary.streaming_exec_dispatch_max_s,
+        "total_inter_step_runtime": summary.streaming_exec_inter_step_s,
+        "avg_inter_step_duration_s": summary.streaming_exec_inter_step_avg_s,
+        "max_inter_step_duration_s": summary.streaming_exec_inter_step_max_s,
         "operators": [
             {
                 "operator_name": op.operator_name,
