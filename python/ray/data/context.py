@@ -101,6 +101,15 @@ DEFAULT_MAX_HASH_SHUFFLE_AGGREGATORS = env_integer(
 
 DEFAULT_SCHEDULING_STRATEGY = "SPREAD"
 
+# Cap on DataOpTask completions handled per ``process_completed_tasks`` call.
+# Combined with the dynamic ``ray.wait`` timeout this realizes interleaved
+# dispatch under large completion bursts: instead of stalling all actors while
+# the scheduler drains 16K+ ready tasks at once, we drain this many at a time
+# and dispatch in between. Remaining completions roll over to the next step.
+DEFAULT_MAX_COMPLETIONS_PER_SCHEDULING_STEP = env_integer(
+    "RAY_DATA_MAX_COMPLETIONS_PER_STEP", 512
+)
+
 # This default enables locality-based scheduling in Ray for tasks where arg data
 # transfer is a bottleneck.
 DEFAULT_SCHEDULING_STRATEGY_LARGE_ARGS = "DEFAULT"
@@ -842,6 +851,12 @@ class DataContext:
     downstream_capacity_backpressure_ratio: Optional[
         float
     ] = DEFAULT_DOWNSTREAM_CAPACITY_BACKPRESSURE_RATIO
+
+    # Cap on DataOpTask completions handled per ``process_completed_tasks``
+    # call. See ``DEFAULT_MAX_COMPLETIONS_PER_SCHEDULING_STEP`` for context.
+    max_completions_per_scheduling_step: int = (
+        DEFAULT_MAX_COMPLETIONS_PER_SCHEDULING_STEP
+    )
 
     enable_dynamic_output_queue_size_backpressure: bool = (
         DEFAULT_ENABLE_DYNAMIC_OUTPUT_QUEUE_SIZE_BACKPRESSURE

@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 # operator to tracked streaming exec state.
 Topology = Dict[PhysicalOperator, "OpState"]
 
+# Default ``ray.wait`` timeout when there's no work pending dispatch. When the
+# scheduler has pending bundles waiting to be dispatched, this is overridden to
+# 0 so the loop returns immediately and dispatch can begin.
+DEFAULT_RAY_WAIT_TIMEOUT_S = 0.1
+
 
 class OpBufferQueue:
     """A FIFO queue to buffer RefBundles between upstream and downstream operators.
@@ -403,6 +408,9 @@ def process_completed_tasks(
     topology: Topology,
     backpressure_policies: List[BackpressurePolicy],
     max_errored_blocks: int,
+    *,
+    max_completions: int,
+    timeout: float = DEFAULT_RAY_WAIT_TIMEOUT_S,
 ) -> ProcessCompletedTasksResult:
     """Process any newly completed tasks. To update operator
     states, call `update_operator_states()` afterwards.
@@ -412,6 +420,11 @@ def process_completed_tasks(
         backpressure_policies: The backpressure policies to use.
         max_errored_blocks: Max number of errored blocks to allow,
             unlimited if negative.
+        max_completions: Cap on ``DataOpTask`` completions handled per call.
+            Remaining completions roll over to a subsequent scheduling step.
+            Sourced from ``DataContext.max_completions_per_scheduling_step``.
+        timeout: ``ray.wait`` timeout in seconds. Pass ``0.0`` when the scheduler
+            has pending bundles to dispatch so the loop yields back immediately.
     Returns:
         A ProcessCompletedTasksResult named tuple containing the number of
         errored blocks, the duration in seconds spent in ray.wait(), the
@@ -464,7 +477,7 @@ def process_completed_tasks(
             list(active_tasks.keys()),
             num_returns=len(active_tasks),
             fetch_local=False,
-            timeout=0.1,
+            timeout=timeout,
         )
         ray_wait_duration_s = time.perf_counter() - ray_wait_t_start
 
@@ -480,11 +493,16 @@ def process_completed_tasks(
 
         num_ready_tasks = len(ready)
         on_data_ready_t_start = time.perf_counter()
+        data_completions_handled = 0
         for state, ready_tasks in ready_tasks_by_op.items():
+            if data_completions_handled >= max_completions:
+                break
             # TODO elaborate why sorting (helps preserve_order case)
             ready_tasks = sorted(ready_tasks, key=lambda t: t.task_index())
             for task in ready_tasks:
                 if isinstance(task, DataOpTask):
+                    if data_completions_handled >= max_completions:
+                        break
                     try:
                         bytes_read = task.on_data_ready(
                             remaining_output_budget.get(state, None)
@@ -525,6 +543,7 @@ def process_completed_tasks(
                             )
                             logger.exception(error_message)
                             raise e from None
+                    data_completions_handled += 1
                 else:
                     assert isinstance(task, MetadataOpTask)
                     task.on_task_finished()

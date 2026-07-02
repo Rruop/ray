@@ -220,6 +220,85 @@ def test_process_completed_tasks(sleep_task_ref, ray_start_regular_shared):
     o2.mark_execution_finished.assert_called_once()
 
 
+def test_process_completed_tasks_caps_at_max_completions(ray_start_regular_shared):
+    """``process_completed_tasks`` must stop after ``max_completions`` data tasks.
+
+    The remaining tasks stay in ``ray.wait``-ready state and are picked up on
+    the next scheduling step (which uses ``timeout=0``). This is what realizes
+    interleaved dispatch on a 16K-completion burst — without the cap the
+    scheduler would block all actors while draining the entire batch.
+    """
+    inputs = make_ref_bundles([[x] for x in range(20)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: [b * -1 for b in block]),
+        o1,
+        DataContext.get_current(),
+    )
+    topo = build_streaming_topology(o2, ExecutionOptions(verbose_progress=True))
+
+    # Build five fake completed DataOpTasks; only three should be processed.
+    callbacks = [MagicMock() for _ in range(5)]
+    fake_tasks = []
+    for i, cb in enumerate(callbacks):
+        task = MagicMock(spec=DataOpTask)
+        task.get_waitable.return_value = ray.put(f"r{i}")
+        task.task_index.return_value = i
+        task.on_data_ready.side_effect = lambda budget, _cb=cb: _cb() or 0
+        fake_tasks.append(task)
+
+    o2.get_active_tasks = MagicMock(return_value=fake_tasks)
+
+    process_completed_tasks(topo, [], 0, max_completions=3)
+
+    handled = sum(1 for cb in callbacks if cb.called)
+    assert handled == 3, (
+        f"expected exactly 3 completions handled, got {handled}; "
+        "remaining must roll over to next scheduling step"
+    )
+
+
+def test_process_completed_tasks_zero_timeout_does_not_block(
+    ray_start_regular_shared,
+):
+    """When passed ``timeout=0.0``, ``ray.wait`` must not block.
+
+    This guards the dynamic-timeout fast path used when there is pending work
+    to dispatch — the scheduler must yield back from ``process_completed_tasks``
+    immediately rather than sit in a 100 ms wait.
+    """
+    inputs = make_ref_bundles([[x] for x in range(5)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: list(block)),
+        o1,
+        DataContext.get_current(),
+    )
+    topo = build_streaming_topology(o2, ExecutionOptions(verbose_progress=True))
+
+    # An ObjectRef that never becomes ready; with timeout=0.0 ray.wait returns
+    # right away with an empty ready set.
+    @ray.remote
+    def never_ready():
+        time.sleep(999)
+
+    pending_ref = never_ready.remote()
+    pending_task = MagicMock(spec=DataOpTask)
+    pending_task.get_waitable.return_value = pending_ref
+    pending_task.task_index.return_value = 0
+    pending_task.on_data_ready = MagicMock()
+    o2.get_active_tasks = MagicMock(return_value=[pending_task])
+
+    t0 = time.perf_counter()
+    process_completed_tasks(topo, [], 0, timeout=0.0)
+    elapsed = time.perf_counter() - t0
+
+    # Generous bound: timeout=0 should return in well under 100ms even on a
+    # loaded CI host. The default 0.1 s path would block the full window.
+    assert elapsed < 0.05, f"timeout=0.0 should not block, took {elapsed:.3f}s"
+    pending_task.on_data_ready.assert_not_called()
+
+
 def test_update_operator_states_drains_upstream(ray_start_regular_shared):
     """Test that update_operator_states drains upstream output queues when
     execution_finished() is called on a downstream operator.

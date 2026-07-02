@@ -34,6 +34,7 @@ from ray.data._internal.execution.resource_manager import (
     ResourceManager,
 )
 from ray.data._internal.execution.streaming_executor_state import (
+    DEFAULT_RAY_WAIT_TIMEOUT_S,
     OpState,
     Topology,
     build_streaming_topology,
@@ -746,6 +747,16 @@ class StreamingExecutor(Executor, threading.Thread):
             a SchedulingLoopMetrics with per-step metrics).
         """
         self._resource_manager.update_usages()
+
+        # When some operator already has bundles waiting to be dispatched, skip
+        # the ``ray.wait`` blocking timeout: we want to drain the work queue
+        # immediately rather than sit idle for 100ms.
+        has_pending_work = any(
+            state.has_pending_bundles() and op.can_add_input()
+            for op, state in topology.items()
+        )
+        wait_timeout = 0.0 if has_pending_work else DEFAULT_RAY_WAIT_TIMEOUT_S
+
         # Note: calling process_completed_tasks() is expensive since it incurs
         # ray.wait() overhead, so make sure to allow multiple dispatch per call for
         # greater parallelism.
@@ -753,6 +764,8 @@ class StreamingExecutor(Executor, threading.Thread):
             topology,
             self._backpressure_policies,
             self._max_errored_blocks,
+            timeout=wait_timeout,
+            max_completions=self._data_context.max_completions_per_scheduling_step,
         )
 
         # Update per-operator errored blocks metrics & emit perf metrics
