@@ -1,7 +1,7 @@
 import logging
 import math
 from collections import defaultdict
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Optional
 
 from .backpressure_policy import BackpressurePolicy
 from .downstream_capacity_backpressure_policy import (
@@ -144,35 +144,18 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
         # For visibility, store the integer center of the band
         self._queue_level_thresholds[op] = max(1, int(level))
 
-    def _refresh_cap(self, op: "PhysicalOperator") -> None:
-        """Sync the concurrency cap from the operator if it has changed.
-
-        This ensures runtime config changes (e.g. via apply_parallelism_config)
-        are reflected in the backpressure policy without requiring a restart.
-
-        NOTE: Only TaskPoolMapOperator has a concurrency cap; other operator
-        types are skipped.  A future optimisation could switch to a push model
-        where apply_parallelism_config notifies the policy directly, instead of
-        polling on every can_add_input call.
-        """
-        if not isinstance(op, TaskPoolMapOperator):
-            return
-        limit = op.get_max_concurrency_limit()
-        new_cap = limit if limit is not None else float("inf")
-        old_cap = self._concurrency_caps.get(op, float("inf"))
-        if new_cap != old_cap:
-            logger.debug(
-                f"ConcurrencyCapBackpressurePolicy: updated cap for {op.name} "
-                f"from {old_cap} to {new_cap}"
-            )
-            self._concurrency_caps[op] = new_cap
-
     def can_add_input(self, op: "PhysicalOperator") -> bool:
-        """Return whether `op` may accept another input now."""
-        # Sync cap from operator in case it was updated at runtime.
-        self._refresh_cap(op)
+        """Return whether ``op`` may accept another input now."""
+        return self.available_capacity(op) != 0
 
+    def available_capacity(self, op: "PhysicalOperator") -> Optional[int]:
+        """Return ``effective_cap - num_tasks_running`` (clamped at 0).
+
+        Returns ``None`` when the configured cap is unbounded and the dynamic
+        controller is not engaged (no count limit at all).
+        """
         num_tasks_running = op.metrics.num_tasks_running
+        cap_cfg = self._concurrency_caps[op]
 
         # Skip dynamic backpressure if:
         # - Not a MapOperator
@@ -185,7 +168,9 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
             or not self.enable_dynamic_output_queue_size_backpressure
             or self._resource_manager._is_blocking_materializing_op(op)
         ):
-            return num_tasks_running < self._concurrency_caps[op]
+            if math.isinf(cap_cfg):
+                return None
+            return max(0, int(cap_cfg) - num_tasks_running)
 
         # For this Op, if the objectstore budget (available) to total
         # ratio is above threshold, skip dynamic output queue size backpressure.
@@ -199,7 +184,9 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
             # If the objectstore budget (available) to total
             # ratio is above threshold, skip dynamic output queue size
             # backpressure, but still enforce the configured cap.
-            return num_tasks_running < self._concurrency_caps[op]
+            if math.isinf(cap_cfg):
+                return None
+            return max(0, int(cap_cfg) - num_tasks_running)
 
         # Current total queued bytes (this op + downstream)
         current_queue_size_bytes = self._resource_manager.get_mem_op_internal(
@@ -225,7 +212,7 @@ class ConcurrencyCapBackpressurePolicy(BackpressurePolicy):
             )
             self._last_effective_caps[op] = effective_cap
 
-        return num_tasks_running < effective_cap
+        return max(0, effective_cap - num_tasks_running)
 
     def _effective_cap(
         self,

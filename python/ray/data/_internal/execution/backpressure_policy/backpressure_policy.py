@@ -39,6 +39,23 @@ class BackpressurePolicy(ABC):
         self._topology = topology
         self._resource_manager = resource_manager
 
+    def available_capacity(self, op: "PhysicalOperator") -> Optional[int]:
+        """Return how many more tasks ``op`` may dispatch under this policy.
+
+        Used by the streaming executor's dispatch loop to size a batch in one
+        shot, eliminating per-dispatch policy rechecks.
+
+        Returns:
+            ``None`` — this policy imposes no count limit on ``op``.
+            ``int`` — explicit upper bound; ``0`` means blocked (equivalent to
+            ``can_add_input(op) == False``).
+
+        Default implementation derives from ``can_add_input``: returns ``0``
+        when blocked, ``None`` when not. Subclasses with a numeric notion of
+        "remaining slots" should override for tighter batching (zero slack).
+        """
+        return 0 if not self.can_add_input(op) else None
+
     def can_add_input(self, op: "PhysicalOperator") -> bool:
         """Determine if we can add a new input to the operator. If returns False, the
         operator will be backpressured and will not be able to run new tasks.

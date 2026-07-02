@@ -204,6 +204,10 @@ class DownstreamCapacityBackpressurePolicy(BackpressurePolicy):
         """
         return not self._should_apply_backpressure(op)
 
+    def available_capacity(self, op: "PhysicalOperator") -> Optional[int]:
+        """Boolean policy: blocked → 0, otherwise no count limit (``None``)."""
+        return 0 if self._should_apply_backpressure(op) else None
+
     def max_task_output_bytes_to_read(self, op: "PhysicalOperator") -> Optional[int]:
         """Return the maximum bytes of pending task outputs can be read for
         the given operator. None means no limit."""

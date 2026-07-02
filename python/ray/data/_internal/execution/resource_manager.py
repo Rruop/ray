@@ -655,6 +655,16 @@ class OpResourceAllocator(ABC):
         """Return whether the given operator can submit a new task."""
         ...
 
+    def available_task_capacity(self, op: PhysicalOperator) -> Optional[int]:
+        """Return how many more tasks ``op`` may submit under its budget.
+
+        Used by the dispatch loop to size a batch in one shot. ``None`` means
+        unbounded (no budget constraint). Default implementation derives from
+        :meth:`can_submit_new_task` (``0`` when blocked, ``None`` otherwise);
+        allocators with a numeric budget should override.
+        """
+        return 0 if not self.can_submit_new_task(op) else None
+
     @abstractmethod
     def max_task_output_bytes_to_read(self, op: PhysicalOperator) -> Optional[int]:
         """Return the maximum bytes of pending task outputs can be read for
@@ -913,6 +923,35 @@ class ReservationOpResourceAllocator(OpResourceAllocator):
             budget.object_store_memory
             >= (op.metrics.obj_store_mem_max_pending_output_per_task or 0)
         )
+
+    def available_task_capacity(self, op: PhysicalOperator) -> Optional[int]:
+        """How many more tasks ``op`` may submit under current budget.
+
+        Conservative floor: minimum across the constraining resource dimensions
+        (CPU, GPU, object-store input, object-store pending output).
+        """
+        budget = self.get_budget(op)
+        if budget is None:
+            return None
+
+        incr = op.incremental_resource_usage()
+        output_per_task = op.metrics.obj_store_mem_max_pending_output_per_task or 0
+
+        caps = []
+        if incr.cpu and incr.cpu > 0:
+            caps.append(int(budget.cpu // incr.cpu))
+        if incr.gpu and incr.gpu > 0:
+            caps.append(int(budget.gpu // incr.gpu))
+        # Object-store budget must accommodate both per-task input usage and
+        # per-task pending output buffer; the original two-check uses ``>=``
+        # against each separately, so taking the max preserves semantics.
+        obj_per_task = max(incr.object_store_memory or 0, output_per_task)
+        if obj_per_task > 0:
+            caps.append(int(budget.object_store_memory // obj_per_task))
+
+        if not caps:
+            return None
+        return max(0, min(caps))
 
     def get_budget(self, op: PhysicalOperator) -> Optional[ExecutionResources]:
         return self._op_budgets.get(op)

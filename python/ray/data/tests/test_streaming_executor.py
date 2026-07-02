@@ -817,6 +817,121 @@ def test_dispatch_next_task(ray_start_regular_shared):
     o2.add_input.assert_called_once_with(ref2, input_index=0)
 
 
+def test_dispatch_loop_batches_per_operator(ray_start_regular_shared):
+    """``_dispatch_loop`` must dispatch many tasks per ``select_operator_to_run``.
+
+    The previous implementation re-selected and re-ran ``update_usages`` after
+    every single dispatched task; with N pending bundles that's N+1 selections
+    and N updates. The batched implementation should select O(1) times per
+    operator and update_usages O(N / batch_resource_check_interval) + 1 times
+    per operator.
+    """
+    inputs = make_ref_bundles([[x] for x in range(50)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: list(block)),
+        o1,
+        DataContext.get_current(),
+    )
+
+    executor = StreamingExecutor(DataContext.get_current())
+    executor._topology = build_streaming_topology(o2, ExecutionOptions())
+    executor._backpressure_policies = []
+    executor._resource_manager = MagicMock()
+    executor._progress_manager = MagicMock(TOTAL_PROGRESS_REFRESH_EVERY_N_STEPS=1000)
+    executor._output_node = (o2, executor._topology[o2])
+
+    # Seed o2's input queue with 50 pending bundles so it has work to drain.
+    seed = [make_ref_bundle(f"x{i}") for i in range(50)]
+    for ref in seed:
+        executor._topology[o2].input_queues[0].append(ref)
+
+    o2.add_input = MagicMock()
+    o2.can_add_input = MagicMock(return_value=True)
+    # InputDataBuffer's can_add_input is False by construction (its input is
+    # already finalized), keep it that way so it isn't selected.
+
+    with patch(
+        "ray.data._internal.execution.streaming_executor.select_operator_to_run",
+        side_effect=lambda *a, **kw: (
+            o2 if executor._topology[o2].has_pending_bundles() else None
+        ),
+    ) as sel_mock:
+        dispatched = executor._dispatch_loop(executor._topology)
+
+    assert dispatched == 50
+    assert o2.add_input.call_count == 50
+    # The whole batch is one op; we should select at most twice (once to pick
+    # o2, once to confirm no more eligible op). The previous per-task design
+    # would have called select 51 times for the same workload.
+    assert sel_mock.call_count <= 2, (
+        f"select_operator_to_run was called {sel_mock.call_count} times for "
+        "50 dispatches; expected <= 2 with batched dispatch"
+    )
+
+
+def test_dispatch_loop_respects_mid_batch_backpressure(ray_start_regular_shared):
+    """A backpressure policy that flips mid-batch must stop the inner loop.
+
+    Concretely: dispatch up to ``batch_resource_check_interval``; when the
+    next periodic check sees ``can_add_input`` go False, the inner ``while``
+    must break instead of draining the entire input queue.
+    """
+    check_interval = DataContext.get_current().batch_resource_check_interval
+
+    inputs = make_ref_bundles([[x] for x in range(100)])
+    o1 = InputDataBuffer(DataContext.get_current(), inputs)
+    o2 = MapOperator.create(
+        make_map_transformer(lambda block: list(block)),
+        o1,
+        DataContext.get_current(),
+    )
+
+    executor = StreamingExecutor(DataContext.get_current())
+    executor._topology = build_streaming_topology(o2, ExecutionOptions())
+
+    # Backpressure policy that allows the first batch tick, then refuses.
+    class FlipPolicy:
+        name = "flip"
+
+        def __init__(self):
+            self.calls = 0
+
+        def can_add_input(self, op):
+            self.calls += 1
+            # Allow until after the first periodic check.
+            return self.calls <= 1
+
+        def max_task_output_bytes_to_read(self, op):
+            return None
+
+    flip = FlipPolicy()
+    executor._backpressure_policies = [flip]
+    executor._resource_manager = MagicMock()
+    executor._progress_manager = MagicMock(TOTAL_PROGRESS_REFRESH_EVERY_N_STEPS=1000)
+    executor._output_node = (o2, executor._topology[o2])
+
+    for ref in [make_ref_bundle(f"x{i}") for i in range(100)]:
+        executor._topology[o2].input_queues[0].append(ref)
+
+    o2.add_input = MagicMock()
+    o2.can_add_input = MagicMock(return_value=True)
+
+    with patch(
+        "ray.data._internal.execution.streaming_executor.select_operator_to_run",
+        side_effect=[o2, None],
+    ):
+        dispatched = executor._dispatch_loop(executor._topology)
+
+    # The inner loop dispatches one full interval, runs the periodic check,
+    # sees backpressure, and breaks. So at most one interval's worth of tasks
+    # should leave the queue.
+    assert dispatched == check_interval, (
+        f"expected {check_interval} dispatches before "
+        f"backpressure stops the batch, got {dispatched}"
+    )
+
+
 def test_debug_dump_topology(ray_start_regular_shared):
     opt = ExecutionOptions()
     inputs = make_ref_bundles([[x] for x in range(20)])

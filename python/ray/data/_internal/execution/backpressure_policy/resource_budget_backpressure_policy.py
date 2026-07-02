@@ -24,6 +24,11 @@ class ResourceBudgetBackpressurePolicy(BackpressurePolicy):
 
         return True
 
+    def available_capacity(self, op: "PhysicalOperator") -> Optional[int]:
+        if self._resource_manager._op_resource_allocator is None:
+            return None
+        return self._resource_manager._op_resource_allocator.available_task_capacity(op)
+
     def max_task_output_bytes_to_read(self, op: "PhysicalOperator") -> Optional[int]:
         """Determine maximum bytes to read based on the resource budgets.
 

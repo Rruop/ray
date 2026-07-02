@@ -1,5 +1,7 @@
 import logging
+import math
 import os
+import sys
 import threading
 import time
 import typing
@@ -154,6 +156,7 @@ class StreamingExecutor(Executor, threading.Thread):
         # used for marking when an op has just completed.
         self._has_op_completed: Optional[Dict[PhysicalOperator, bool]] = None
         self._max_errored_blocks = self._data_context.max_errored_blocks
+        self._capacity_dispatch = self._data_context.enable_capacity_based_dispatch
         self._num_errored_blocks = 0
 
         # Job configuration synchronization components (lazy initialized)
@@ -786,30 +789,8 @@ class StreamingExecutor(Executor, threading.Thread):
         # Dispatch as many operators as we can for completed tasks.
         self._report_current_usage()
 
-        i = 0
         dispatch_t_start = time.perf_counter()
-        while True:
-            op = select_operator_to_run(
-                topology,
-                self._resource_manager,
-                self._backpressure_policies,
-                # If consumer is idling (there's nothing for it to consume)
-                # enforce liveness, ie that at least a single task gets scheduled
-                ensure_liveness=self._consumer_idling(),
-                ranker=self._ranker,
-            )
-
-            if op is None:
-                break
-
-            topology[op].dispatch_next_task()
-
-            self._resource_manager.update_usages()
-
-            i += 1
-            if i % self._progress_manager.TOTAL_PROGRESS_REFRESH_EVERY_N_STEPS == 0:
-                self._refresh_progress_manager(topology)
-
+        tasks_dispatched = self._dispatch_loop(topology)
         dispatch_duration_s = time.perf_counter() - dispatch_t_start
 
         # Trigger autoscaling
@@ -856,9 +837,70 @@ class StreamingExecutor(Executor, threading.Thread):
             on_data_ready_duration_s=completed.on_data_ready_duration_s,
             num_ready_tasks=completed.num_ready_tasks,
             dispatch_duration_s=dispatch_duration_s,
-            num_tasks_dispatched=i,
+            num_tasks_dispatched=tasks_dispatched,
         )
         return not all(op.has_completed() for op in topology), loop_metrics
+
+    def _dispatch_loop(self, topology: Topology) -> int:
+        """Dispatch tasks, optionally batching per operator.
+
+        When ``enable_capacity_based_dispatch`` is True (default), each
+        selected operator is drained up to its soft capacity in a tight
+        inner loop — soft-policy slack is zero and ``update_usages`` is
+        called once per op-batch. When False, dispatches one task per
+        ``select_operator_to_run`` call (original behavior).
+
+        Returns the number of tasks dispatched this call.
+        """
+        capacity_dispatch = self._capacity_dispatch
+        i = 0
+        while True:
+            op = select_operator_to_run(
+                topology,
+                self._resource_manager,
+                self._backpressure_policies,
+                ensure_liveness=self._consumer_idling(),
+                ranker=self._ranker,
+            )
+
+            if op is None:
+                break
+
+            if capacity_dispatch:
+                soft_cap = math.inf
+                for policy in self._backpressure_policies:
+                    c = policy.available_capacity(op)
+                    if c is not None:
+                        soft_cap = min(soft_cap, c)
+                soft_cap = soft_cap if math.isfinite(soft_cap) else sys.maxsize
+
+                if soft_cap == 0:
+                    continue
+
+                op_state = topology[op]
+                n = 0
+                while (
+                    op_state.has_pending_bundles()
+                    and op.can_add_input()
+                    and n < soft_cap
+                ):
+                    op_state.dispatch_next_task()
+                    n += 1
+                    i += 1
+                    self._refresh_progress_if_needed(topology, i)
+
+                self._resource_manager.update_usages()
+            else:
+                topology[op].dispatch_next_task()
+                self._resource_manager.update_usages()
+                i += 1
+                self._refresh_progress_if_needed(topology, i)
+
+        return i
+
+    def _refresh_progress_if_needed(self, topology: Topology, count: int) -> None:
+        if count % self._progress_manager.TOTAL_PROGRESS_REFRESH_EVERY_N_STEPS == 0:
+            self._refresh_progress_manager(topology)
 
     def _refresh_progress_manager(self, topology: Topology):
         # Update the progress manager to reflect scheduling decisions.
