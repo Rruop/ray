@@ -1,7 +1,5 @@
 import logging
-import math
 import os
-import sys
 import threading
 import time
 import typing
@@ -862,39 +860,35 @@ class StreamingExecutor(Executor, threading.Thread):
                 ensure_liveness=self._consumer_idling(),
                 ranker=self._ranker,
             )
-
             if op is None:
                 break
 
-            if capacity_dispatch:
-                soft_cap = math.inf
-                for policy in self._backpressure_policies:
-                    c = policy.available_capacity(op)
-                    if c is not None:
-                        soft_cap = min(soft_cap, c)
-                soft_cap = soft_cap if math.isfinite(soft_cap) else sys.maxsize
-
-                if soft_cap == 0:
-                    continue
-
-                op_state = topology[op]
-                n = 0
-                while (
-                    op_state.has_pending_bundles()
-                    and op.can_add_input()
-                    and n < soft_cap
-                ):
-                    op_state.dispatch_next_task()
-                    n += 1
-                    i += 1
-                    self._refresh_progress_if_needed(topology, i)
-
-                self._resource_manager.update_usages()
-            else:
+            if not capacity_dispatch:
                 topology[op].dispatch_next_task()
                 self._resource_manager.update_usages()
                 i += 1
                 self._refresh_progress_if_needed(topology, i)
+                continue
+
+            soft_cap = None
+            for policy in self._backpressure_policies:
+                c = policy.available_capacity(op)
+                if c is not None:
+                    soft_cap = c if soft_cap is None else min(soft_cap, c)
+            if soft_cap == 0:
+                continue
+
+            op_state = topology[op]
+            n = 0
+            while op_state.has_pending_bundles() and op.can_add_input():
+                if soft_cap is not None and n >= soft_cap:
+                    break
+                op_state.dispatch_next_task()
+                n += 1
+                i += 1
+                self._refresh_progress_if_needed(topology, i)
+
+            self._resource_manager.update_usages()
 
         return i
 
