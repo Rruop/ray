@@ -274,6 +274,8 @@ def emit_worker_cpu(ctx: PerfContext, node_id: str, *, micros: int) -> None:
 
 def emit_worker_output_rows(ctx: PerfContext, node_id: str, *, count: int) -> None:
     """worker 节点输出行数"""
+     if count <= 0:
+        return
     _safe_log("worker_output_rows", ctx.session, ctx.submission_id, node_id,
               micros=0, count=count)
 
@@ -283,12 +285,16 @@ def emit_worker_output_rows(ctx: PerfContext, node_id: str, *, count: int) -> No
 # ─────────────────────────────────────────────────────────────────────────────
 def emit_job_input_rows_rt(ctx: PerfContext, *, delta: int) -> None:
     """Job 级输入行数增量"""
+    if delta <= 0:
+        return 
     _safe_log("job_input_rows_rt", ctx.session, ctx.submission_id, ctx.owner,
               micros=0, count=delta)
 
 
 def emit_job_output_rows_rt(ctx: PerfContext, *, delta: int) -> None:
     """Job 级输出行数增量"""
+    if delta <= 0:
+        return 
     _safe_log("job_output_rows_rt", ctx.session, ctx.submission_id, ctx.owner,
               micros=0, count=delta)
 
