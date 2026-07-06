@@ -9,6 +9,7 @@ from typing import Callable, Dict, Generic, Optional, TypeVar
 from kconf.client import update_config, create_config, remove_config, KConfValueType
 from kconf.exception import KConfError
 from kconf.get_config import get_string_config
+from kconf.stage import STAGE_PROD
 from kconf.watcher import StringWatcher, add_watcher
 from ray.data._internal.execution.config.models import ExecutionConfig
 from ray.data._internal.execution.config.store import ExecutionConfigStore
@@ -229,7 +230,7 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
         with self._lock:
             self._config = config
             value = config.to_json()
-            update_config(self._key, self._token, value)
+            update_config(self._key, self._token, value, STAGE_PROD)
             logger.debug(f"Updated configuration in kconf for key: {self._key}")
 
     def init(self, config: ExecutionConfig) -> bool:
@@ -268,7 +269,7 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
                 )
                 self._config = config
                 value = config.to_json()
-                update_config(self._key, self._token, value)
+                update_config(self._key, self._token, value, STAGE_PROD)
 
             self._initialized = True
 
@@ -330,7 +331,7 @@ class KconfExecutionConfigStore(ExecutionConfigStore):
         """
         with self._lock:
             try:
-                remove_config(self._key, self._token)
+                remove_config(self._key, self._token, STAGE_PROD)
                 self._config = None
                 logger.info(f"Deleted configuration from kconf for key: {self._key}")
                 return True
