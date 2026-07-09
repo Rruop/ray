@@ -116,6 +116,10 @@ DEFAULT_ENABLE_CAPACITY_BASED_DISPATCH = env_bool(
     "RAY_DATA_ENABLE_CAPACITY_BASED_DISPATCH", True
 )
 
+DEFAULT_RAY_WAIT_NUM_RETURNS = env_integer(
+    "RAY_DATA_RAY_WAIT_NUM_RETURNS", 1024
+)
+
 # This default enables locality-based scheduling in Ray for tasks where arg data
 # transfer is a bottleneck.
 DEFAULT_SCHEDULING_STRATEGY_LARGE_ARGS = "DEFAULT"
@@ -863,6 +867,12 @@ class DataContext:
     max_completions_per_scheduling_step: int = (
         DEFAULT_MAX_COMPLETIONS_PER_SCHEDULING_STEP
     )
+
+    # Cap on the ``num_returns`` parameter passed to ``ray.wait()`` in the
+    # scheduling loop. This limits the O(N) HasOwner loop in CoreWorker::Wait
+    # from scanning all active tasks. Set to -1 to use len(active_tasks)
+    # (original behavior, no limit).
+    ray_wait_num_returns: int = DEFAULT_RAY_WAIT_NUM_RETURNS
 
     gpu_aware_scheduling: bool = DEFAULT_GPU_AWARE_SCHEDULING
 

@@ -749,14 +749,7 @@ class StreamingExecutor(Executor, threading.Thread):
         """
         self._resource_manager.update_usages()
 
-        # When some operator already has bundles waiting to be dispatched, skip
-        # the ``ray.wait`` blocking timeout: we want to drain the work queue
-        # immediately rather than sit idle for 100ms.
-        has_pending_work = any(
-            state.has_pending_bundles() and op.can_add_input()
-            for op, state in topology.items()
-        )
-        wait_timeout = 0.0 if has_pending_work else DEFAULT_RAY_WAIT_TIMEOUT_S
+        wait_timeout = DEFAULT_RAY_WAIT_TIMEOUT_S
 
         # Note: calling process_completed_tasks() is expensive since it incurs
         # ray.wait() overhead, so make sure to allow multiple dispatch per call for
@@ -767,6 +760,7 @@ class StreamingExecutor(Executor, threading.Thread):
             self._max_errored_blocks,
             timeout=wait_timeout,
             max_completions=self._data_context.max_completions_per_scheduling_step,
+            ray_wait_num_returns=self._data_context.ray_wait_num_returns,
         )
 
         # Update per-operator errored blocks metrics & emit perf metrics

@@ -411,6 +411,7 @@ def process_completed_tasks(
     *,
     max_completions: int,
     timeout: float = DEFAULT_RAY_WAIT_TIMEOUT_S,
+    ray_wait_num_returns: int = 0,
 ) -> ProcessCompletedTasksResult:
     """Process any newly completed tasks. To update operator
     states, call `update_operator_states()` afterwards.
@@ -472,10 +473,16 @@ def process_completed_tasks(
     on_data_ready_duration_s = 0.0
     num_ready_tasks = 0
     if active_tasks:
+        if ray_wait_num_returns < 0:
+            num_returns = len(active_tasks)
+        elif ray_wait_num_returns > 0:
+            num_returns = min(ray_wait_num_returns, len(active_tasks))
+        else:
+            num_returns = min(max_completions, len(active_tasks))
         ray_wait_t_start = time.perf_counter()
         ready, _ = ray.wait(
             list(active_tasks.keys()),
-            num_returns=len(active_tasks),
+            num_returns=num_returns,
             fetch_local=False,
             timeout=timeout,
         )
@@ -495,13 +502,12 @@ def process_completed_tasks(
         on_data_ready_t_start = time.perf_counter()
         data_completions_handled = 0
         for state, ready_tasks in ready_tasks_by_op.items():
-            if data_completions_handled >= max_completions:
+            if max_completions >= 0 and data_completions_handled >= max_completions:
                 break
-            # TODO elaborate why sorting (helps preserve_order case)
             ready_tasks = sorted(ready_tasks, key=lambda t: t.task_index())
             for task in ready_tasks:
                 if isinstance(task, DataOpTask):
-                    if data_completions_handled >= max_completions:
+                    if max_completions >= 0 and data_completions_handled >= max_completions:
                         break
                     try:
                         bytes_read = task.on_data_ready(
