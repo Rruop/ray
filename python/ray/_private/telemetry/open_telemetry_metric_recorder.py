@@ -43,8 +43,8 @@ RAY_METRICS_REMOTE_WRITE_INCLUDE_METRICS = "RAY_METRICS_REMOTE_WRITE_INCLUDE_MET
 RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS = "RAY_METRICS_REMOTE_WRITE_EXCLUDE_METRICS"
 
 # Push interval limits
-MIN_PUSH_INTERVAL_MS = 60000
-DEFAULT_PUSH_INTERVAL_MS = 60000
+MIN_PUSH_INTERVAL_MS = 5000
+DEFAULT_PUSH_INTERVAL_MS = 10000
 
 # Default exclude patterns for metrics filtering (reduces storage pressure by ~60%)
 # These patterns filter out high-cardinality and non-essential metrics while
