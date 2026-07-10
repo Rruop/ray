@@ -235,29 +235,50 @@ if "num_cpus" not in ray_remote_args and "num_gpus" not in ray_remote_args:
 
 **根因**：ReadRange `num_cpus=0` 未生效，16000 个 ReadRange task 以 1 CPU 全量提交并并发执行，内存爆炸。
 
-### 3.3 遇到的核心问题汇总
+### 3.4 最终解决方案：减少 ReadRange task 数 + target_max_block_size 拆分
+
+**思路**：不修改 ReadRange 的 `num_cpus`，而是减少 ReadRange 的 task 数，靠 `DataContext.target_max_block_size` 让每个 ReadRange task 内部产出多个小 block。
+
+**原理**：`RangeDatasource.get_read_tasks` 中：
+- `parallelism` = `override_num_blocks` → 控制 **ReadRange task 数**（每个 1 CPU）
+- `target_rows_per_block` = `ctx.target_max_block_size // row_size_bytes` → 控制 **每个 ReadRange task 内部产出多少个小 block**
+- `make_blocks` 是 generator，一个 ReadRange task 内 yield 多个小 block
+
+**实现**：修改 `worker_scaling_benchmark.py`：
+```python
+# ReadRange 只用少量 task（100 个，100 CPU）
+read_tasks = min(args.num_workers // args.blocks_per_worker, 100)
+ds = ray.data.range(num_rows, override_num_blocks=read_tasks)
+
+# 设 target_max_block_size 让每个 ReadRange task 内部产出大量小 block
+DataContext.get_current().target_max_block_size = TARGET_BLOCK_SIZE_BYTES
+```
+
+**验证结果**：
+- ReadRange: 100 task, **100 CPU** ✅
+- MapBatches op1: 3599 task, 900 CPU
+- MapBatches op2: 3177 task, 794 CPU
+- MapBatches op3: 3617 task, 904 CPU
+- MapBatches op4: 5431 task, 1358 CPU
+- **总 active_tasks ≈ 16000+** ✅
+- **总 CPU ≈ 3257**（接近集群上限）✅
+- **无 OOM** ✅，object store 只用 31GB
+- 调度循环 N ≈ 16000，在 O(N) 瓶颈区域 ✅
+
+### 3.5 遇到的核心问题汇总
 
 | # | 问题 | 原因 | 尝试的解决方案 | 结果 |
 |---|------|------|---------------|------|
 | 1 | ReadRange 全量提交卡死 | 每个 ReadRange task 默认 1 CPU，200K task = 200K CPU | `concurrency` 参数限制 | ❌ 弃用，不限制 ReadRange |
 | 2 | ReadRange concurrency 无效 | Ray 2.51 弃用 `concurrency`，转 `TaskPoolStrategy` 但不影响 ReadRange 提交 | - | - |
 | 3 | Repartition 不增加 task 数 | task 数 = 输入 block 数，不 = 输出 block 数 | - | - |
-| 4 | ReadRange num_cpus=0 未生效 | 环境变量修改了 `_canonicalize_ray_remote_args`，但 ReadRange 可能不走此路径 | 需进一步排查 | ❌ 未解决 |
-| 5 | capacity_dispatch=0 时 active 上不去 | 每步只 dispatch 1 个 task + timeout=0.1s → dispatch_rate=10/s | 开 capacity_dispatch=1 | 改变测试条件 |
-| 6 | 16000 workers OOM | ReadRange 1 CPU × 16000 并发 → 内存爆炸 | 需解决 ReadRange num_cpus 问题 | ❌ 未解决 |
-| 7 | object store spill 污染指标 | 数据量超过 object store | 减小 block_size / 增大 object store | 部分缓解 |
+| 4 | ReadRange num_cpus=0 未生效 | 环境变量修改了 `_canonicalize_ray_remote_args`，但 ReadRange 实际仍占 1 CPU | 需进一步排查 | ❌ 已放弃此方案 |
+| 5 | capacity_dispatch=0 时 active 上不去 | 每步只 dispatch 1 个 task + timeout=0.1s → dispatch_rate=10/s | 实际发现 dispatch_loop 是循环的，能积累 | ✅ 最终 active 达到 16000+ |
+| 6 | 16000 workers OOM | ReadRange 1 CPU × 16000 并发 → 内存爆炸 | 减少 ReadRange task 数到 100 | ✅ 已解决 |
+| 7 | object store spill 污染指标 | 数据量超过 object store | 减小 block_size 到 2MB | ✅ 已解决 |
 | 8 | detail=True API 超时 | 1000+ 并发时 dashboard API 扛不住 | try/except 降级 | ✅ 已解决 |
-| 9 | benchmark.py 的 concurrency 弃用 | Ray 2.51 弃用 `concurrency` 参数 | 需用 `compute=TaskPoolStrategy(size=N)` | ⚠️ 未确认是否生效 |
-
-### 3.4 未解决的关键阻塞
-
-**ReadRange 的 `num_cpus` 无法设为 0**：
-
-- 修改了 `map_operator.py` 的 `_canonicalize_ray_remote_args` 加环境变量
-- 单独测试函数返回 `{'num_cpus': 0}` ✅
-- 但实际运行时 ReadRange 仍占 1 CPU per task
-- 可能原因：ReadRange 的 `ray_remote_args` 在 plan 阶段已被设了 `num_cpus=1`，绕过了 canonicalize
-- 需要进一步排查 `plan_read_op.py` → `MapOperator.create` → `MapOperator.__init__` 的完整调用链
+| 9 | benchmark.py 的 concurrency 弃用 | Ray 2.51 弃用 `concurrency` 参数 | `concurrency` → `TaskPoolStrategy(size=N)` → `max_concurrency=N` | ✅ 确认生效 |
+| 10 | ReadRange task 数 = 输出 block 数 | `override_num_blocks` 同时控制 task 数和输出 block 数 | 分离：少量 task + `target_max_block_size` 控制输出 block 大小 | ✅ 已解决 |
 
 ---
 
@@ -268,37 +289,51 @@ if "num_cpus" not in ray_remote_args and "num_gpus" not in ray_remote_args:
 | `python/ray/data/context.py` | 删除 `enable_dynamic_ray_wait_timeout`，新增 `ray_wait_num_returns` |
 | `python/ray/data/_internal/execution/streaming_executor.py` | 删除 dynamic wait 逻辑，固定 timeout=0.1s，传 `ray_wait_num_returns` |
 | `python/ray/data/_internal/execution/streaming_executor_state.py` | `ray.wait` 的 `num_returns` 支持 -1/0/>0 三种模式 |
-| `python/ray/data/_internal/execution/operators/map_operator.py` | `_canonicalize_ray_remote_args` 加 `RAY_DATA_DEFAULT_MAP_NUM_CPUS` 环境变量 |
 | `release/nightly_tests/dataset/benchmark.py` | try/except 降级 `get_stats_summary(detail=True)` |
-| `release/nightly_tests/dataset/worker_scaling_benchmark.py` | 新增 `--num-cpus`、`--disable-backpressure`、`--task-duration-s` 参数 |
+| `release/nightly_tests/dataset/worker_scaling_benchmark.py` | 新增 `--num-cpus`、`--disable-backpressure`、`--task-duration-s` 参数；ReadRange 少量 task + `target_max_block_size` 拆分 |
 | `release/nightly_tests/dataset/scheduling_benchmark_plan.md` | 更新测试方案 v2 |
+
+**已复原**：`map_operator.py` 的 `RAY_DATA_DEFAULT_MAP_NUM_CPUS` 修改已回退，恢复为原始 `num_cpus=1`。
 
 ---
 
-## 5. 后续建议
+## 5. 最终测试参数
 
-### 5.1 解决 ReadRange num_cpus 问题
+| 项 | 值 |
+|---|---|
+| num_workers | 16000 |
+| num_operators | 4 |
+| workers_per_operator | 4000 |
+| blocks_per_worker | 100 |
+| block_size | 2MB（TARGET_BLOCK_SIZE_BYTES）|
+| num_cpus | 0.25 |
+| task_duration_s | 5.0 |
+| ReadRange task 数 | 100（100 CPU）|
+| 总 MapBatches task | ~200K |
+| 总 active_tasks | ~16000 |
+| 反压策略 | 全部关闭 |
+| capacity_dispatch | 0（基线）/ 1（实验 D）|
+| 实验矩阵 | A→B→C→D→E（见 §3.2）|
 
-1. 排查 ReadRange 的 `ray_remote_args` 在 plan 阶段是否被预设 `num_cpus=1`
-2. 或在 `plan_read_op.py` 中强制设 `ray_remote_args['num_cpus'] = 0`
-3. 或不使用 `ray.data.range`，改用自定义 datasource 控制 num_cpus
+---
 
-### 5.2 测试方案调整
+## 6. 后续建议
 
-1. **先解决 ReadRange CPU 问题**，否则大规模测试无法进行
-2. ReadRange num_cpus=0 后，400K blocks 可以全量提交不占 CPU
-3. MapBatches `num_cpus=0.25` + `concurrency=4000` 控制并发
-4. `capacity_dispatch=0` 时需要确认 dispatch_loop 是否能快速积累 active_tasks
-5. 考虑 `capacity_dispatch=1` 作为基础条件
+### 6.1 测试执行
 
-### 5.3 指标选择
+1. 最终方案已验证可行（ReadRange 100 CPU, active 16000+, 无 OOM）
+2. 串行提交 5 个实验（A~E），等待结果
+3. 主指标用 per-block（ms/block），辅以 raylet 侧 scheduling_overhead
+
+### 6.2 指标选择
 
 - **主指标**：per-block（ms/block），消除步数差异
 - **不使用**：time_total（被 spill IO 干扰）、per-step avg（步数不一致时不可比）
 - **补充**：raylet 侧 scheduling_overhead（per-task 调度延迟）
 
-### 5.4 代码优化方向
+### 6.3 代码优化方向
 
 1. `RAY_DATA_RAY_WAIT_NUM_RETURNS=1024` 已实现，待大规模验证
 2. C++ 层 `at_most_num_objects=true` 可进一步优化 Step 2 锁内扫描
 3. `DYNAMIC_RAY_WAIT_TIMEOUT` 已废弃，不应恢复
+4. ReadRange 的 `num_cpus` 控制问题仍需长期解决（目前通过减少 task 数绕过）

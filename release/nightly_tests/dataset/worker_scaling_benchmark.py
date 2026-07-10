@@ -236,13 +236,20 @@ def main(args: argparse.Namespace):
     benchmark = Benchmark()
 
     def benchmark_fn():
+        # Set target_max_block_size so ReadRange splits output into small blocks
+        DataContext.get_current().target_max_block_size = TARGET_BLOCK_SIZE_BYTES
         num_blocks = args.blocks_per_worker * args.num_workers
         rows_per_block = _rows_per_block(
             args.num_scalar_cols,
             args.num_array_cols,
         )
         num_rows = num_blocks * rows_per_block
-        ds = ray.data.range(num_rows, override_num_blocks=args.num_workers)
+        # Use a small number of read tasks to avoid ReadRange exhausting CPU.
+        # Each read task internally yields many small blocks (controlled by
+        # target_max_block_size), so MapBatches still gets num_blocks blocks.
+        read_tasks = min(args.num_workers // args.blocks_per_worker, 100)
+        read_tasks = max(read_tasks, 1)
+        ds = ray.data.range(num_rows, override_num_blocks=read_tasks)
 
         # Split the total worker pool evenly across the chained operators so the
         # cluster footprint stays the same regardless of --num-operators. With
