@@ -15,6 +15,7 @@ production workloads.
 import argparse
 import os
 import pickle
+import time
 from typing import Dict, List
 
 import numpy as np
@@ -25,10 +26,11 @@ from benchmark import (
     benchmark_py_modules,
     collect_dataset_stats,
 )
+from ray.data.context import DataContext
 
 BLOCKS_PER_WORKER: int = 10
 # Cap output block size to avoid OOM under wide schemas.
-TARGET_BLOCK_SIZE_BYTES: int = 16 * 1024 * 1024  # 16 MiB
+TARGET_BLOCK_SIZE_BYTES: int = 2 * 1024 * 1024  # 2 MiB
 ARRAY_LEN: int = 32
 
 
@@ -98,6 +100,23 @@ def parse_args() -> argparse.Namespace:
             "scheduling-loop duration metric is ~invariant to this."
         ),
     )
+    parser.add_argument(
+        "--num-cpus",
+        type=float,
+        default=0.5,
+        help="Number of CPUs per map_batches task.",
+    )
+    parser.add_argument(
+        "--disable-backpressure",
+        action="store_true",
+        help="Disable all backpressure policies.",
+    )
+    parser.add_argument(
+        "--task-duration-s",
+        type=float,
+        default=0.0,
+        help="Sleep duration in seconds per task to simulate long-running work.",
+    )
     args = parser.parse_args()
     if args.num_scalar_cols + args.num_array_cols <= 0:
         parser.error(
@@ -157,6 +176,7 @@ def make_realistic_schema_udf(
     seed: int = 42,
     num_scalar_cols: int = 0,
     num_array_cols: int = 0,
+    task_duration_s: float = 0.0,
 ):
     """Functional variant of ``RealisticSchemaUDF`` for the task-based path."""
     udf = RealisticSchemaUDF(
@@ -164,7 +184,14 @@ def make_realistic_schema_udf(
         num_scalar_cols=num_scalar_cols,
         num_array_cols=num_array_cols,
     )
-    return udf.__call__
+    inner = udf.__call__
+
+    def wrapped(batch):
+        if task_duration_s > 0:
+            time.sleep(task_duration_s)
+        return inner(batch)
+
+    return wrapped
 
 
 def _disable_operator_fusion() -> None:
@@ -196,6 +223,16 @@ def main(args: argparse.Namespace):
     if args.num_operators > 1:
         _disable_operator_fusion()
 
+    if args.disable_backpressure:
+        from ray.data._internal.execution.backpressure_policy import (
+            ENABLED_BACKPRESSURE_POLICIES_CONFIG_KEY,
+        )
+        # Disable ALL backpressure policies. Concurrency is controlled by
+        # map_batches concurrency + num_cpus, not by Ray Data backpressure.
+        DataContext.get_current().set_config(
+            ENABLED_BACKPRESSURE_POLICIES_CONFIG_KEY, []
+        )
+
     benchmark = Benchmark()
 
     def benchmark_fn():
@@ -205,7 +242,7 @@ def main(args: argparse.Namespace):
             args.num_array_cols,
         )
         num_rows = num_blocks * rows_per_block
-        ds = ray.data.range(num_rows, override_num_blocks=num_blocks)
+        ds = ray.data.range(num_rows, override_num_blocks=args.num_workers)
 
         # Split the total worker pool evenly across the chained operators so the
         # cluster footprint stays the same regardless of --num-operators. With
@@ -214,7 +251,7 @@ def main(args: argparse.Namespace):
         # ops with a moderately sized pool per op.
         workers_per_operator = args.num_workers // args.num_operators
 
-        map_kwargs = {"num_cpus": 0.5}
+        map_kwargs = {"num_cpus": args.num_cpus}
         if args.worker_type == "actors":
             map_kwargs["compute"] = ray.data.ActorPoolStrategy(
                 size=workers_per_operator
@@ -232,16 +269,15 @@ def main(args: argparse.Namespace):
             # here is N_operators sharing the pool, so each gets
             # ``workers_per_operator`` task slots.
             #
-            # Only apply the cap when actually chaining operators. With a single
-            # operator there's nothing to share with, and capping would diverge
-            # from the original 1-op baseline, which left ``concurrency`` unset
-            # and used Ray Data's default unbounded ``TaskPoolStrategy``.
-            if args.num_operators > 1:
-                map_kwargs["concurrency"] = workers_per_operator
+            # Always set concurrency to cap in-flight tasks per operator,
+            # so the scheduler sees a bounded number of active tasks
+            # regardless of total block count.
+            map_kwargs["concurrency"] = workers_per_operator
             udf = make_realistic_schema_udf(
                 args.seed,
                 args.num_scalar_cols,
                 args.num_array_cols,
+                args.task_duration_s,
             )
 
         for _ in range(args.num_operators):
