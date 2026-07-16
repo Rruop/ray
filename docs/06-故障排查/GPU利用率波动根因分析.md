@@ -285,9 +285,148 @@ Actor 方法调用 (如 actor.preprocess_video.remote()):
   - 17:50 → 16 个节点死亡
   - 17:32-17:59 → SCHED_PROFILE 严重 burst
 
-### 3.6 OBJECT_UNRECONSTRUCTABLE_LINEAGE_EVICTED 错误
+### 3.6 OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED 错误（深层分析）
 
-Driver 日志中出现对象血统被驱逐的错误，说明 Object Store 内存压力大，部分对象因血统信息被清理而无法重建，导致依赖这些对象的 task 失败。
+Driver 日志中出现 `[OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED]` 错误，尽管 Ray Data 的 `cached_remote_fn` 默认设置 `max_retries=-1`（无限重试），仍然出现此错误。
+
+#### 根因：`lineage_eligibility_` 与 `submissible_tasks_` 不一致
+
+Ray 的 `reference_counter` 和 `task_manager` 在 lineage 管理上存在不一致：
+
+1. **`lineage_eligibility_`**（在 `reference_counter` 中）：标记 object 是否可重建。只在 `ReleaseLineageReferences` 中被降级为 `INELIGIBLE_LINEAGE_EVICTED`，且**条件是 `!OutOfScope()`**（object 仍 in scope 时才降级）。
+
+2. **`submissible_tasks_`**（在 `task_manager` 中）：存储 task spec（用于 reconstruction 时重新执行 task）。在 `CompletePendingTask` 中，当 `task_retryable = false`（`reconstructable_return_ids_` 为空）时，直接 `submissible_tasks_.erase(it)` 删除 task spec，**不会通知 `reference_counter` 降级 `lineage_eligibility_`**。
+
+3. **结果**：`reference_counter` 认为 lineage 还在（`ELIGIBLE`），但 `task_manager` 已把 task spec 删了 → `ResubmitTask` 返回 `MAX_ATTEMPTS_EXCEEDED`。
+
+#### 完整错误传播链路
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ 第 1 层：StreamingRepartition 的某个 output object 丢失          │
+│                                                                  │
+│ Tidal 节点死亡 → plasma 中的 object 消失                         │
+│ → ObjectRecoveryManager::RecoverObject(object_id)               │
+│ → PinOrReconstructObject() → pin 失败 → ReconstructObject()     │
+│ → GetLineageReconstructionEligibility() → ELIGIBLE               │
+│ → ResubmitTask() → submissible_tasks_ 找不到 task                │
+│ → 返回 MAX_ATTEMPTS_EXCEEDED                                    │
+│ → recovery_failure_callback_ → 写 ErrorType 到 plasma           │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第 2 层：下游 PreprocessMapper actor task 依赖解析失败            │
+│                                                                  │
+│ PreprocessMapper.submit() → DependencyResolver → ray.get()      │
+│ → 拿到 RayError → raise_if_dependency_failed(arg)               │
+│ → 抛出 ObjectReconstructionFailedError                          │
+│ → ActorTaskSubmitter::FailOrRetryPendingTask()                  │
+│   → RetryTaskIfPossible() → max_retries=-1 会重试               │
+│   → 但依赖 object 永久不可恢复 → 最终 FailPendingTask()          │
+│   → MarkTaskReturnObjectsFailed() → return objects 也标记为错误  │
+└──────────────────────────────┬──────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 第 3 层：Ray Data streaming executor 看到 task 失败              │
+│                                                                  │
+│ DataOpTask.on_data_ready() → ray.get() 拿到 RayTaskError        │
+│ → process_completed_tasks() → num_errored_blocks++              │
+│ → max_errored_blocks=0 → 直接 abort 整个 pipeline               │
+│                                                                  │
+│ 错误层层包装显示：                                                │
+│   RayTaskError(ObjectReconstructionFailedError):                 │
+│     MapWorker(QGPreprocessMapper).submit()                       │
+│       At least one of the input arguments...                     │
+│       RayTaskError: StreamingRepartition[...]                    │
+│         At least one of the input arguments...                   │
+│         ObjectReconstructionFailedError: Failed to retrieve...   │
+│         [OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED]         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键代码引用
+
+| 文件 | 行号 | 说明 |
+|------|------|------|
+| `reference_counter.cc` | 579-582 | `ReleaseLineageReferences` 降级条件：`!OutOfScope()` |
+| `task_manager.cc` | 1059-1070 | `CompletePendingTask` 中 `submissible_tasks_.erase` 不通知 reference_counter |
+| `task_manager.cc` | 1459-1490 | `RemoveLineageReference` — `reconstructable_return_ids_` 清空 → spec 删除 |
+| `task_manager.cc` | 357-358 | `ResubmitTask` — 找不到 task → `MAX_ATTEMPTS_EXCEEDED` |
+| `object_recovery_manager.cc` | 157-169 | `ReconstructObject` — eligibility 检查 → ResubmitTask |
+| `core_worker_process.cc` | 660-665 | `recovery_failure_callback_` — 写 ErrorType |
+| `_raylet.pyx` | 891-895 | `raise_if_dependency_failed` — 依赖失败抛异常 |
+| `exceptions.py` | 310-325 | Traceback 格式化：替换为友好提示 |
+| `remote_fn.py` | 37 | `cached_remote_fn` 默认 `max_retries=-1` |
+| `streaming_executor_state.py` | 481-509 | `process_completed_tasks` 错误处理 |
+
+#### Ray Data 不重试 Operator Task
+
+**注意**：Ray Data 的 streaming executor 不会重新提交失败的 operator task。`cached_remote_fn` 的 `max_retries=-1` 是 **Ray Core 层的 task 重试**（worker 死亡后自动重提交），不是 Ray Data 层的 operator task 重试。Ray Data 默认 `max_errored_blocks=0`，任何 block 重建失败直接 abort 整个 pipeline。
+
+#### Object Store 内存压力导致 Lineage 被驱逐
+
+除上述 bug 外，还存在另一种失败路径：当 lineage 总大小超过 `max_lineage_bytes`（默认 1GB）时，`EvictLineage` 会把 `lineage_eligibility_` 从 `ELIGIBLE` 降级为 `INELIGIBLE_LINEAGE_EVICTED`。此时返回的错误是 `OBJECT_UNRECONSTRUCTABLE_LINEAGE_EVICTED`（而非 `MAX_ATTEMPTS_EXCEEDED`）。
+
+在大规模 pipeline 中，大量 Tidal 节点死亡 → 大量 object 需要重建 → lineage 累积超限 → 触发 EvictLineage → 后续重建失败 → `LINEAGE_EVICTED` 错误。
+
+#### 修复建议
+
+1. **修复 `lineage_eligibility_` 降级遗漏**：在 `CompletePendingTask` 中 `submissible_tasks_.erase(it)` 之前，通知 `reference_counter` 把所有 return object 的 `lineage_eligibility_` 降级为 `INELIGIBLE_LINEAGE_EVICTED`（或引入新的 `INELIGIBLE_SPEC_DELETED` 枚举值）
+2. **增大 `max_lineage_bytes`**：对大规模 pipeline（数千 task + Tidal 节点场景），默认 1GB 远不够，建议设为 10-50GB
+3. **Ray Data 增加 operator task 级别重试**：当依赖的 object 可恢复时（如节点恢复后 object 从副本恢复），重试依赖解析而非直接 abort
+
+---
+
+### 3.7 OOM 错误与 Object Store 的关系
+
+```
+ray.exceptions.OutOfMemoryError: 1 worker(s) were killed due to the node running low on memory.
+Memory on the node (IP: 10.83.10.20, ID: 8c4ec54b...) was 957.55GB / 1006.84GB (0.951040)
+```
+
+**OOM 不是 Object Store 单独的问题**，而是**节点总内存**不够。Ray memory manager 监控的是整个节点的系统内存（`/proc/meminfo` 中的 MemTotal + Shmem），包括：
+
+| 内存消费者 | 大小 | 说明 |
+|---|---|---|
+| Object store (plasma) | ~200 GB | `/dev/shm` mmap，固定配置 |
+| Worker heap | ~500+ GB | 4000 PreprocessMapper + 600 InferMapper actor 的进程堆 |
+| Page cache / 其他 | ~100+ GB | OS 文件缓存、kess 等 |
+| **总计** | **~957 GB / 1007 GB** | 95.1%，触发 OOM kill |
+
+根因是 **actor 数量太多 + 反复重启**导致 worker heap 累积超过节点剩余内存：
+- 节点 1 TB 总内存
+- Object store 固定占 200 GB
+- 剩余 ~800 GB 给所有 worker
+- 4000 个 PreprocessMapper + 600 个 InferMapper 分散在 80 个节点
+- 每节点约 57 个 actor，每个 actor 加载数据 + 模型 → heap 膨胀
+- Tidal 节点死亡后 actor 重启、重新加载数据 → 内存持续增长
+- 最终达到 95% → memory manager 杀 worker（对应之前观察到的 72,269 次 worker eviction）
+
+**Object Store 200 GB 是固定占用，不是导致 OOM 的主因。主因是 worker heap 累积过多**——actor 不断重启、重新加载数据，旧进程的内存可能还没完全释放，新进程又开始分配。
+
+#### Object Store 为什么看起来没有释放空间
+
+即使 object 已经 spill 到磁盘，只要它的 `ref_count > 0`（还有引用），它就不会被删除，`used_memory_` 不会减少，`available` 也不会增加：
+
+```
+Spill 流程：
+  SpillIfOverPrimaryObjectsThreshold()
+    → GetPrimaryBytes() / 200GB >= 0.8
+    → SpillObjectUptoMaxThroughput() → 写到磁盘
+    → spilled_object_pending_delete_ 加入队列
+    → ProcessSpilledObjectsPendingDelete()
+      → 检查 ref_count == 0
+      → 如果可以删: HandleObjectDeleted() → used_memory_ -= data_size
+      → 如果 ref_count > 0: 不删除 → used_memory_ 不变
+```
+
+在 GPU 利用率低的场景中，所有 object 都有引用（driver 持有 block ref + dead actor 引用泄漏 + replication 副本），所以 spill 了也不释放空间，`available` 接近 0。
+
+#### 每个 Tidal 节点的 /dev/shm 是独立的
+
+每个 Tidal 节点是独立的容器/Pod，有自己的独立 `/dev/shm` tmpfs（`size=536870912k` = 512 GB），不与其他节点共享。同一 IP 上多个 NodeId 是因为 Tidal 节点反复被抢占后重新创建——前一个 Pod 死亡后，新的 Pod 在同一 IP 上重新创建，有全新的 `/dev/shm`。旧的 plasma 数据随 Pod 死亡而消失。
 
 ---
 

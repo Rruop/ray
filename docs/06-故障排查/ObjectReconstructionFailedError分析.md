@@ -114,4 +114,176 @@
     - 节点抢占 → 上游算子 @ray.remote(max_retries=N) 调大，或换稳定节点
     - lineage 驱逐 → 提高 RAY_max_lineage_bytes
   3. 保留 max_errored_blocks 较小值（如 0 或个位数）用于 fail-fast，不要靠它兜底来"绕过"系统性故障。
-  4. 若 pipeline 业务上确实能接受部分丢数据（如脏数据清洗），用 max_errored_blocks 时同时监控 num_errored_blocks 指标设告警，避免静默丢大量数据。
+  五、OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED 的深层代码链路
+
+  在 OOM Kill 场景下，此错误的根本原因并非 "max_retries 耗尽"，而是 task spec 已从 submissible_tasks_ 中被移除。
+  详细代码链路分析见：docs/05-内存与OOM/Ray-OOM-Kill-Error-Object-UNRECONSTRUCTABLE完整代码链路分析.md
+
+  5.1 三种导致 task 从 submissible_tasks_ 中移除的路径
+
+  路径 A（最常见）：FailPendingTask 直接删除
+  - 触发条件：OOM Kill 时 should_retry=false（owner group 下只有 1 个 worker）
+  - 代码：task_manager.cc:1293 submissible_tasks_.erase(it)
+  - 链路：Raylet OOM Kill → should_retry=false → fail_immediately=true
+          → FailOrRetryPendingTask 跳过 retry → FailPendingTask → erase task
+
+  路径 B：reconstructable_return_ids_ 为空
+  - 触发条件：task 完成后，所有 plasma return object 都不再被引用
+  - 代码：task_manager.cc:1063 submissible_tasks_.erase(it)
+  - 对 streaming generator：已 yield 的 block 被下游消费完后，reconstructable_return_ids_ 逐渐清空
+
+  路径 C：EvictLineage 导致
+  - 触发条件：total_lineage_footpoint_bytes_ > max_lineage_bytes_ (默认 1GB)
+  - 代码：reference_counter.cc:823 EvictLineage → ReleaseLineageReferences
+          → on_lineage_released_ 回调 → RemoveLineageReference
+          → reconstructable_return_ids_ 清空 → submissible_tasks_.erase
+
+  5.2 ResubmitTask 中检测到 task 不存在
+
+  ```cpp
+  // task_manager.cc:353-365
+  std::optional<rpc::ErrorType> TaskManager::ResubmitTask(
+      const TaskID &task_id, std::vector<ObjectID> *task_deps) {
+      auto it = submissible_tasks_.find(task_id);
+      if (it == submissible_tasks_.end()) {
+          return rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED;
+      }
+      // ...
+  }
+  ```
+
+  5.3 GroupByOwnerIdWorkerKillingPolicy 的 should_retry 判断
+
+  ```cpp
+  // worker_killing_policy_group_by_owner.cc:160-162
+  bool should_retry =
+      selected_group.GetAllWorkers().size() > 1 && selected_group.IsRetriable();
+  //                     ^^^^^^^^^^^^^^^^^^^^^^^^
+  //                     关键条件：同 owner group 下必须有 >1 个 worker
+  ```
+
+  当 ReadArrowJSON->SplitBlocks(7) 在节点上只有 1 个 worker 时：
+  - group size = 1 → should_retry = false
+  - fail_immediately = true
+  - FailPendingTask 直接删除 task → 后续 reconstruction 必定失败
+
+  5.4 INELIGIBLE_LINEAGE_EVICTED 与 OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED 的关系
+
+  两者是不同的 ErrorType，但都表示 reconstruction 永久不可行：
+
+  ```cpp
+  // reference_counter_interface.h
+  ToErrorType(LineageReconstructionEligibility):
+    INELIGIBLE_LINEAGE_EVICTED → OBJECT_UNRECONSTRUCTABLE_LINEAGE_EVICTED
+    INELIGIBLE_MAX_ATTEMPTS_EXCEEDED → OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED
+  ```
+
+  区别：
+  - LINEAGE_EVICTED：task spec 因 EvictLineage（lineage 内存超 1GB）被强制淘汰
+  - MAX_ATTEMPTS_EXCEEDED：task spec 因 FailPendingTask 或 reconstructable_return_ids_ 为空被删除，ResubmitTask 在 submissible_tasks_ 中找不到
+
+  5.5 recovery_failure_callback_ 完整代码路径
+
+  ObjectRecoveryManager 构造时传入回调（core_worker_process.cc:653-668）：
+
+  ```cpp
+  auto object_recovery_manager = std::make_unique<ObjectRecoveryManager>(
+      ...,
+      [this](const ObjectID &object_id, rpc::ErrorType reason, bool pin_object) {
+          auto core_worker = GetCoreWorker();
+          // 将 error object 写入 plasma / in_memory_store
+          core_worker->Put(RayObject(reason), {}, object_id, pin_object);
+      });
+  ```
+
+  触发点有三处（object_recovery_manager.cc）：
+  1. 第 146-150 行：lineage eligibility 不满足 → recovery_failure_callback_(object_id, error_type, true)
+  2. 第 170-178 行：task 的依赖恢复失败 → recovery_failure_callback_(dep, error, false)
+  3. 第 180-187 行：ResubmitTask 返回 error → recovery_failure_callback_(object_id, error, true)
+
+  Put 最终调用 PutInLocalPlasmaStore（core_worker.cc:992-1036），走 plasma_store_provider_->Put()：
+  - 如果 plasma 中 object 已存在且 sealed → ObjectExists → 不覆盖
+  - 如果 plasma 中 object 已丢失 → Create 成功 → error object 写入
+
+  关键结论：在 OOM Kill → FailPendingTask 路径中，OUT_OF_MEMORY error object 已先写入 plasma。
+  后续 reconstruction 失败时 recovery_failure_callback_ 试图写入 OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED error，
+  但因 plasma 写保护（ObjectExists），后者不会覆盖前者。
+  Python 端 ray.get() 读到的仍是原始的 OutOfMemoryError。
+
+  5.6 Error Block 不会跨算子直接传播
+
+  Ray Data 中 error block 不会从上游算子传递到下游算子。
+
+  流程：ReadArrowJSON OOM kill → streaming generator 提前终止
+  → on_data_ready() 中 _next_sync() 返回 StopIteration
+  → ray.get(error_block_ref) → 抛 OutOfMemoryError
+  → streaming_executor_state.py:521 except 捕获
+  → max_errored_blocks=-1 → 忽略 → 没有 RefBundle 放入 output_queue
+  → 下游算子的 add_input() 不会收到这个 block → error 就到此为止
+
+  所以 QGPreprocessMapper 的报错只可能来自 lineage reconstruction 阶段的级联恢复失败。
+
+  5.7 级联恢复的完整代码链路
+
+  触发起点：节点下线 → GCS 通知 Driver
+  → core_worker.cc:755 "Node failure. All objects pinned on that node will be lost"
+  → reference_counter->ResetObjectsOnRemovedNode(node_id)
+  → 遍历所有 pinned_at == node_id 的 object
+  → objects_to_recover_.push_back(object_id)
+
+  周期性驱动（每 100ms）：
+  → core_worker.cc:470-494 FlushObjectsToRecover → RecoverObject(object_id)
+
+  级联恢复核心（object_recovery_manager.cc:136-187）：
+  → ReconstructObject(object_id)
+     → ResubmitTask(task_id, &task_deps)  // task_deps 收集该 task 所有输入依赖
+        → 成功: for dep in task_deps: RecoverObject(dep)  // ★ 递归！
+        → 失败: recovery_failure_callback_(object_id, error, true)
+
+  本场景的级联路径：
+  1. RecoverObject(QGPreprocess 输入 block) → ReconstructObject
+     → ResubmitTask(StreamingRepartition task, &deps=[ReadArrowJSON blocks])
+     → ★ 级联: RecoverObject(ReadArrowJSON block) → ReconstructObject
+        → ResubmitTask(ReadArrowJSON task) → submissible_tasks_ 找不到
+           （FailPendingTask 已删除 task spec，因 should_retry=false, group size=1）
+        → 返回 OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED
+        → recovery_failure_callback_ 写入 error object
+  2. StreamingRepartition 重试执行时发现输入是 error → raise_if_dependency_failed
+     → QGPreprocessMapper ray.get() → 拿到 RayTaskError(OutOfMemoryError)
+
+  日志证据：
+  ```
+  Resubmitting task that produced lost plasma object, attempt #4:
+    task_name=ReadArrowJSON->SplitBlocks(7)
+  Resubmitting task that produced lost plasma object, attempt #3:
+    task_name=StreamingRepartition
+  ```
+  → StreamingRepartition #3 是恢复 QGPreprocess 输入时触发
+  → ReadArrowJSON #4 是恢复 StreamingRepartition 输入时递归触发
+
+  5.8 定位排查步骤
+
+  ```bash
+  # 1. Driver 日志 - 确认节点下线
+  grep "Node failure.*All objects pinned" /tmp/ray/session_latest/logs/python-core-driver-*.log
+
+  # 2. Driver 日志 - 确认级联恢复触发
+  grep "Resubmitting task that produced lost plasma object" /tmp/ray/session_latest/logs/python-core-driver-*.log
+
+  # 3. Driver 日志 - 确认恢复失败
+  grep "Cannot recover object\|OBJECT_UNRECONSTRUCTABLE" /tmp/ray/session_latest/logs/python-core-driver-*.log
+
+  # 4. Driver 日志 - 确认 OOM should_retry
+  grep "Fail immediately.*true\|OUT_OF_MEMORY" /tmp/ray/session_latest/logs/python-core-driver-*.log
+
+  # 5. Driver 日志 - 统计 attempt 分布
+  grep "attempt_number" /tmp/ray/session_latest/logs/python-core-driver-*.log | \
+    grep -oP "attempt_number=\d+" | sort | uniq -c | sort -rn
+
+  # 6. Worker raylet 日志 - OOM kill 决策
+  grep "Killing\|should_retry\|GroupByOwnerId" /tmp/ray/session_latest/logs/raylet.out
+  ```
+
+  ---
+
+  六、推荐做法

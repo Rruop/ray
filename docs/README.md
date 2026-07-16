@@ -1,6 +1,6 @@
 # Ray 文档索引
 
-本目录包含 Ray 分布式计算框架的深度分析、故障排查、设计方案等文档，共 121 篇，按主题分为 9 个子目录。
+本目录包含 Ray 分布式计算框架的深度分析、故障排查、设计方案等文档，共 122 篇，按主题分为 9 个子目录。
 
 ## 目录结构
 
@@ -14,7 +14,7 @@
 | [06-故障排查](06-故障排查/) | 生产环境故障排查案例 | 22 |
 | [07-设计方案](07-设计方案/) | 功能设计、优化方案、Cherry-Pick 计划 | 13 |
 | [08-视频推理](08-视频推理/) | 视频推理 Pipeline、共享 GPU | 1 |
-| [09-工具与环境](09-工具与环境/) | 开发工具、测试配置、环境集成 | 12 |
+| [09-工具与环境](09-工具与环境/) | 开发工具、测试配置、环境集成 | 13 |
 
 ## 按主题快速查找
 
@@ -71,6 +71,12 @@
 - Dashboard 指标优化 → [04-Dashboard与指标/Dashboard指标优化.md](04-Dashboard与指标/Dashboard指标优化.md)
 - Prometheus Histogram Quantile → [04-Dashboard与指标/Prometheus-Histogram-Quantile分析.md](04-Dashboard与指标/Prometheus-Histogram-Quantile分析.md)
 - Ray 指标过滤指南 → [04-Dashboard与指标/Ray指标过滤指南.md](04-Dashboard与指标/Ray指标过滤指南.md)
+
+### Ray Data 算子相关
+
+### Bazel / 构建相关
+- Bazel 构建与缓存机制 → [09-工具与环境/Bazel构建与缓存机制详解.md](09-工具与环境/Bazel构建与缓存机制详解.md)
+- 自定义 SO 库集成 → [09-工具与环境/自定义SO库集成指南.md](09-工具与环境/自定义SO库集成指南.md)
 
 ### Ray Data 算子相关
 - Ray-Data 使用指南 → [02-数据流与算子/Ray-Data使用指南.md](02-数据流与算子/Ray-Data使用指南.md)
@@ -266,3 +272,4 @@ Dashboard 显示机制、Prometheus 查询、指标体系等文档。
 | Git-Merge-Commit分析.md | Git merge commit 结构和 cherry-pick 操作指南 |
 | RemoteWrite集成测试指南.md | Ray RemoteWriteExporter 集成测试流程 |
 | Ray社区PR开发指南.md | Git 身份配置、DCO 签名和 PR 提交到 Ray 社区的流程 |
+| Bazel构建与缓存机制详解.md | Bazel CI 配置、远程缓存机制、Action Digest 计算、Python 版本缓存隔离、本地缓存配置 |
