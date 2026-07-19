@@ -67,8 +67,8 @@ from ray.data._internal.logical.operators import (
     Limit,
     MapBatches,
     MapRows,
-    Project,
-    RandomizeBlocks,
+    Priority as PriorityLogicalOperator,
+    PriorityStoppingCondition,
     RandomShuffle,
     Repartition,
     Sort,
@@ -2980,6 +2980,66 @@ class Dataset:
 
         stats = DatasetStats(
             metadata={"Union": []},
+            parent=[d._plan.stats() for d in datasets],
+        )
+        stats.time_total_s = time.perf_counter() - start_time
+        return Dataset(
+            ExecutionPlan(stats, self.context.copy()),
+            logical_plan,
+        )
+
+    @PublicAPI(stability="alpha", api_group=SMJ_API_GROUP)
+    def priority_mix(
+        self,
+        *other: "Dataset",
+        stopping_condition: PriorityStoppingCondition = PriorityStoppingCondition.DRAIN_ALL,
+    ) -> "Dataset":
+        """Mix this dataset with other datasets using strict priority ordering.
+
+        This dataset has the highest priority. Subsequent datasets have
+        decreasing priority. When the highest-priority dataset has data
+        available, it's always consumed first. When it's temporarily empty,
+        lower-priority datasets are consumed as fallback.
+
+        Unlike :meth:`~ray.data.Dataset.union`, which concatenates datasets
+        sequentially, ``priority_mix()`` guarantees priority ordering —
+        high-priority data is always output before low-priority data when
+        available. Unlike :meth:`~ray.data.Dataset.mix` (if available), which
+        guarantees proportional output ratios, ``priority_mix()`` never blocks
+        waiting for a specific input.
+
+        Examples:
+
+            >>> import ray
+            >>> ds_high = ray.data.range(10)
+            >>> ds_low = ray.data.range(5)
+            >>> # High-priority data is always consumed first
+            >>> ds_high.priority_mix(ds_low).take_all()  # doctest: +SKIP
+
+        Args:
+            *other: Lower-priority datasets, in decreasing priority order.
+            stopping_condition: When to stop the pipeline.
+                DRAIN_ALL (default): Continue until all datasets are exhausted.
+                STOP_ON_HIGHEST: Stop when the highest-priority dataset is
+                    exhausted.
+
+        Returns:
+            A new Dataset with priority-ordered output.
+        """
+        start_time = time.perf_counter()
+
+        datasets = [self] + list(other)
+        logical_plans = [
+            priority_ds._plan._logical_plan for priority_ds in datasets
+        ]
+        op = PriorityLogicalOperator(
+            *[plan.dag for plan in logical_plans],
+            stopping_condition=stopping_condition,
+        )
+        logical_plan = LogicalPlan(op, self.context)
+
+        stats = DatasetStats(
+            metadata={"Priority": []},
             parent=[d._plan.stats() for d in datasets],
         )
         stats.time_total_s = time.perf_counter() - start_time

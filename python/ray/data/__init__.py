@@ -14,6 +14,7 @@ from ray.data._internal.execution.interfaces import (
 )
 from ray.data._internal.logging import configure_logging
 from ray.data._internal.random_config import RandomSeedConfig
+from ray.data._internal.logical.operators.n_ary_operator import PriorityStoppingCondition
 from ray.data.context import DataContext, DatasetContext
 from ray.data.dataset import Dataset, Schema, SinkMode, ClickHouseTableSettings
 from ray.data.datasource import (
@@ -192,5 +193,6 @@ __all__ = [
     "read_webdataset",
     "KafkaAuthConfig",
     "Preprocessor",
+    "PriorityStoppingCondition",
     "TFXReadOptions",
 ]

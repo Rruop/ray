@@ -18,6 +18,7 @@ from ray.data._internal.execution.operators.join import JoinOperator
 from ray.data._internal.execution.operators.limit_operator import LimitOperator
 from ray.data._internal.execution.operators.output_splitter import OutputSplitter
 from ray.data._internal.execution.operators.union_operator import UnionOperator
+from ray.data._internal.execution.operators.priority_operator import PriorityOperator
 from ray.data._internal.execution.operators.zip_operator import ZipOperator
 from ray.data._internal.logical.interfaces import (
     LogicalOperator,
@@ -34,6 +35,7 @@ from ray.data._internal.logical.operators import (
     InputData,
     Join,
     Limit,
+    Priority,
     Project,
     Read,
     StreamingRepartition,
@@ -99,6 +101,15 @@ def plan_union_op(_, physical_children, data_context):
     return UnionOperator(data_context, *physical_children)
 
 
+def plan_priority_op(logical_op, physical_children, data_context):
+    assert len(physical_children) >= 1
+    return PriorityOperator(
+        data_context,
+        *physical_children,
+        stopping_condition=logical_op.stopping_condition,
+    )
+
+
 def plan_limit_op(logical_op, physical_children, data_context):
     assert len(physical_children) == 1
     return LimitOperator(logical_op.limit, physical_children[0], data_context)
@@ -162,6 +173,7 @@ class Planner:
         Filter: plan_filter_op,
         AbstractUDFMap: plan_udf_map_op,
         AbstractAllToAll: plan_all_to_all_op,
+        Priority: plan_priority_op,
         Union: plan_union_op,
         Zip: plan_zip_op,
         Limit: plan_limit_op,
