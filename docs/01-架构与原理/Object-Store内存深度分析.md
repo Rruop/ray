@@ -17,6 +17,10 @@
 9. [驱逐机制完整代码链路](#9-驱逐机制完整代码链路)
 10. [运维诊断命令](#10-运维诊断命令)
 11. [Ray Data Streaming Executor 中 Object Store 内存统计机制](#11-ray-data-streaming-executor-中-object-store-内存统计机制)
+12. [Operator 内部队列与指标转换机制](#12-operator-内部队列与指标转换机制)
+13. [上下游 Operator 数据流转机制（External Queue）](#13-上下游-operator-数据流转机制external-queue)
+14. [DataOpTask Callback 机制](#14-dataoptask-callback-机制)
+15. [OpResourceAllocator: Allocation vs Budget](#15-opresourceallocator-allocation-vs-budget)
 
 ---
 
@@ -2077,3 +2081,755 @@ if verbose:
 | `python/ray/data/block.py:286-335` | `BlockMetadata` / `BlockStats` — `size_bytes` 字段定义 |
 | `python/ray/data/block.py:511-535` | `BlockAccessor.size_bytes()` / `get_metadata()` — 元数据生成入口 |
 | `python/ray/data/_internal/arrow_block.py:329-330` | `ArrowBlockAccessor.size_bytes()` — `pyarrow.Table.nbytes` |
+
+---
+
+## 12. Operator 内部队列与指标转换机制
+
+### 12.1 四个内部队列
+
+每个 Operator 的 `OpRuntimeMetrics` 维护 **4 个内部队列**，数据在它们之间按序流转：
+
+```python
+# op_runtime_metrics.py:536-540
+num_inputs = max(len(op.input_dependencies), 1)
+self._internal_inqueues = [create_bundle_queue() for _ in range(num_inputs)]
+self._internal_outqueue = create_bundle_queue()
+self._pending_task_inputs = create_bundle_queue()
+```
+
+| 队列 | 类型 | 数据含义 | 个数 |
+|------|------|----------|------|
+| `_internal_inqueues[i]` | `List[BundleQueue]` | 第 i 个上游来源的输入数据排队 | `len(input_dependencies)` |
+| `_pending_task_inputs` | `BundleQueue` | 已提交 task 但 task 尚未完成的输入 | 1 |
+| `_internal_outqueue` | `BundleQueue` | task 产出、排队等下游取走的输出 | 1 |
+
+加上估算指标（非队列）`pending_task_outputs`（运行中 task 的 streaming generator buffer 中的待 yield 输出），共 **4 个统计维度**。
+
+### 12.2 队列间数据流转全图
+
+```
+上游 Op _internal_outqueue
+     │
+     │  executor dispatch_next_task()
+     │  → op.add_input(ref, input_index=i)
+     │  → _add_input_inner()
+     ▼
+下游 Op _internal_inqueues[i]          ← on_input_queued() 入队
+     │                                   指标: obj_store_mem_internal_inqueue_for_input(i)
+     │
+     │  operator 内部 dequeue + bundle
+     │  on_input_dequeued() 出队
+     ▼
+下游 Op _pending_task_inputs           ← on_task_submitted() 入队
+     │                                   指标: obj_store_mem_pending_task_inputs
+     │
+     │  task 在远端 worker 执行中
+     │  streaming generator 逐步 yield 输出
+     │  (估算) 指标: obj_store_mem_pending_task_outputs
+     │
+     │  on_task_finished() 完成
+     ▼
+下游 Op _internal_outqueue             ← on_output_queued() 入队
+     │                                   指标: obj_store_mem_internal_outqueue
+     │
+     │  executor get_output_blocking()
+     │  on_output_dequeued() 出队
+     ▼
+更下游 Op _internal_inqueues[j]       ← 循环重复
+```
+
+### 12.3 队列与指标的对应关系
+
+| 队列 | 入队回调 | 出队回调 | 对应指标 | 指标计算方式 |
+|------|----------|----------|----------|-------------|
+| `_internal_inqueues[i]` | `on_input_queued(input, input_index=i)` | `on_input_dequeued(input, input_index=i)` | `obj_store_mem_internal_inqueue` / `obj_store_mem_internal_inqueue_for_input(i)` | `sum(q.estimate_size_bytes() for q in _internal_inqueues)` / `_internal_inqueues[i].estimate_size_bytes()` |
+| `_pending_task_inputs` | `on_task_submitted(task_index, inputs, ...)` | `on_task_finished(task_index, ...)` | `obj_store_mem_pending_task_inputs` | `_pending_task_inputs.estimate_size_bytes()` |
+| `_internal_outqueue` | `on_output_queued(output)` | `on_output_dequeued(output)` | `obj_store_mem_internal_outqueue` | `_internal_outqueue.estimate_size_bytes()` |
+
+注意：`pending_task_outputs` **不是基于队列的**，而是估算值 = `num_tasks_running × avg_bytes_per_output × min(max_buffer_blocks, avg_outputs_per_task)`，因为 task 输出在远端 worker 的 generator buffer 中，driver 无法精确追踪。
+
+### 12.4 各回调的代码逻辑
+
+#### on_input_queued
+
+`op_runtime_metrics.py:874-877`：
+
+```python
+def on_input_queued(self, input: RefBundle, *, input_index: int):
+    self.obj_store_mem_internal_inqueue_blocks += len(input.blocks)
+    self._internal_inqueues[input_index].add(input)
+```
+
+#### on_input_dequeued
+
+`op_runtime_metrics.py:879-888`：
+
+```python
+def on_input_dequeued(self, input: RefBundle, *, input_index: int):
+    self.obj_store_mem_internal_inqueue_blocks -= len(input.blocks)
+    input_size = input.size_bytes()
+    self._internal_inqueues[input_index].remove(input)
+    assert self.obj_store_mem_internal_inqueue >= 0, (...)
+```
+
+#### on_task_submitted
+
+`op_runtime_metrics.py:934-953`：
+
+```python
+def on_task_submitted(self, task_index: int, inputs: RefBundle, task_id=None):
+    self.num_tasks_submitted += 1
+    self.num_tasks_running += 1
+    self.bytes_inputs_of_submitted_tasks += inputs.size_bytes()
+    self.rows_inputs_of_submitted_tasks += inputs.num_rows() or 0
+    self._pending_task_inputs.add(inputs)          # ← 入队
+    self._running_tasks[task_index] = RunningTaskInfo(inputs=inputs, ...)
+```
+
+#### on_task_finished
+
+`op_runtime_metrics.py:1085-1101`：
+
+```python
+def on_task_finished(self, task_index, exception, task_exec_stats, task_exec_driver_stats):
+    ...
+    inputs = self._running_tasks[task_index].inputs
+    self.num_task_inputs_processed += len(inputs)
+    total_input_size = inputs.size_bytes()
+    self.bytes_task_inputs_processed += total_input_size
+    self._pending_task_inputs.remove(inputs)       # ← 出队
+    assert self.obj_store_mem_pending_task_inputs >= 0, (...)
+    ...
+    self.obj_store_mem_freed += total_input_size   # ← 记录释放
+    inputs.destroy_if_owned()                       # ← 释放引用
+    del self._running_tasks[task_index]
+```
+
+#### on_output_queued
+
+`op_runtime_metrics.py:890-893`：
+
+```python
+def on_output_queued(self, output: RefBundle):
+    self.obj_store_mem_internal_outqueue_blocks += len(output.blocks)
+    self._internal_outqueue.add(output)
+```
+
+#### on_output_dequeued
+
+`op_runtime_metrics.py:895-903`：
+
+```python
+def on_output_dequeued(self, output: RefBundle):
+    self.obj_store_mem_internal_outqueue_blocks -= len(output.blocks)
+    output_size = output.size_bytes()
+    self._internal_outqueue.remove(output)
+    assert self.obj_store_mem_internal_outqueue >= 0, (...)
+```
+
+### 12.5 pending_task_inputs 的生命周期详解
+
+`pending_task_inputs` 跟踪的是**已提交给 task 但 task 还没完成的输入 RefBundle**：
+
+```
+on_task_submitted()  →  _pending_task_inputs.add(inputs)   # 数据从 inqueue 取出、打包提交为 task
+                        num_tasks_running += 1
+
+    [task 在远端 worker 执行中，inputs 引用的 object 仍在 object store 中]
+
+on_task_finished()   →  _pending_task_inputs.remove(inputs) # task 完成，移除输入引用
+                        obj_store_mem_freed += input_size   # 记录释放量
+                        inputs.destroy_if_owned()            # 释放 object store 引用
+                        num_tasks_running -= 1
+```
+
+**关键点：task 提交后 inputs 仍然算在 pending_task_inputs 中，直到 task 完成才算释放。** 这段时间内，inputs 引用的 object 仍然占用 object store 内存。
+
+### 12.6 _pending_task_inputs 与 obj_store_mem_pending_task_inputs 的关系
+
+```
+_pending_task_inputs          →  内部数据容器 (HashLinkedQueue)
+                                  存储 RefBundle 引用
+
+obj_store_mem_pending_task_inputs  →  只读 metric 属性
+                                     = _pending_task_inputs.estimate_size_bytes()
+```
+
+`op_runtime_metrics.py:731-735`：
+
+```python
+@metric_property(
+    description="Byte size of input blocks used by pending tasks.",
+    metrics_group=MetricsGroup.OBJECT_STORE_MEMORY,
+)
+def obj_store_mem_pending_task_inputs(self) -> int:
+    return self._pending_task_inputs.estimate_size_bytes()
+```
+
+**一个是数据容器，一个是对该容器中数据字节大小的度量值，1:1 对应关系。**
+
+### 12.7 (dequeue+bundle) 与 pending_task_inputs 的区别
+
+`(dequeue+bundle)` 是**动作**：从 inqueue 取出数据并按 bundle 大小打包。
+`pending_task_inputs` 是**状态**：已提交但未完成的 task 输入数据的容器。
+
+动作完成后的数据才进入 `pending_task_inputs`。中间有个时间差——dequeue 之后如果还没凑够 bundle 大小（在 `BlockRefBundler` 中缓冲），数据既不在 inqueue 也不在 pending_task_inputs 中。
+
+```
+on_input_queued()     →  inqueue 有数据
+on_input_dequeued()   →  inqueue 中取出，进入 bundler 缓冲
+                          (此时既不在 inqueue 也不在 pending_task_inputs)
+on_task_submitted()   →  bundler 打包完成，数据进入 pending_task_inputs
+on_task_finished()    →  task 完成，数据从 pending_task_inputs 移出
+```
+
+MapOperator 中的实际代码 `map_operator.py:496-512`：
+
+```python
+def _add_input_inner(self, refs: RefBundle, input_index: int):
+    # 1. 加入 bundler 缓冲
+    self._block_ref_bundler.add_bundle(refs)
+    self._metrics.on_input_queued(refs, input_index=0)   # inqueue 计入
+
+    if self._block_ref_bundler.has_bundle():
+        # 2. bundler 打包完成，取出原始 bundles
+        (input_refs, bundled_input) = self._block_ref_bundler.get_next_bundle()
+        for bundle in input_refs:
+            self._metrics.on_input_dequeued(bundle, input_index=0)  # inqueue 扣减
+
+        # 3. 提交 task（在 _try_schedule_task → _submit_data_task 中）
+        #    → on_task_submitted() → pending_task_inputs 计入
+```
+
+---
+
+## 13. 上下游 Operator 数据流转机制（External Queue）
+
+### 13.1 两层缓冲架构
+
+两个 Operator 之间存在 **external queue**（executor 管理的拓扑队列）和 **internal queue**（operator 内部队列）两层缓冲：
+
+```
+上游 Op                                           下游 Op
+┌─────────────────┐                          ┌─────────────────────────────┐
+│                 │  on_output_queued()       │  _internal_inqueues[i]      │
+│  _internal      │─────────────────────────► │  on_input_queued()          │
+│   _outqueue     │   [external outqueue]     │                             │
+│                 │   = executor 维护的       │  on_input_dequeued()        │
+│                 │     input_queues[i]       │         ↓                   │
+│                 │                           │  _pending_task_inputs       │
+│                 │   dispatch_next_task()    │  on_task_submitted()        │
+│                 │   → op.add_input()        │         ↓                   │
+│                 │                           │  on_task_finished()         │
+│                 │                           │         ↓                   │
+│                 │   get_output_blocking()  │  _internal_outqueue         │
+│                 │   ← on_output_dequeued()  │  on_output_queued()         │
+└─────────────────┘                          └─────────────────────────────┘
+```
+
+### 13.2 External Queue 的数据结构
+
+在 `streaming_executor_state.py` 中，每个 `OpState` 维护了与上下游的连接队列：
+
+```python
+class OpState:
+    def __init__(self, op, ...):
+        self.input_queues: List[Deque[RefBundle]]  # 按上游 index 排列
+        self.output_queue: Deque[RefBundle]        # 本算子的输出缓冲
+```
+
+**上游的 external outqueue 就是下游的 external inqueue，它们是同一个 deque 的两个视角。**
+
+### 13.3 从上游到下游：dispatch_next_task()
+
+`streaming_executor_state.py:296-312`：
+
+```python
+def dispatch_next_task(self) -> None:
+    """Move a bundle from the operator inqueue to the operator itself."""
+    for i, inqueue in enumerate(self.input_queues):
+        ref = inqueue.pop()
+        if ref is not None:
+            # 1. 调用下游 op.add_input() → _add_input_inner() → on_input_queued()
+            self.op.add_input(ref, input_index=i)
+
+            # 2. 更新 external queue 指标
+            self.op.metrics.num_external_inqueue_bytes -= ref.size_bytes()
+            self.op.metrics.num_external_inqueue_blocks -= len(ref.blocks)
+            input_op = self.op.input_dependencies[i]
+            input_op.metrics.num_external_outqueue_blocks -= len(ref.blocks)
+            input_op.metrics.num_external_outqueue_bytes -= ref.size_bytes()
+            return
+```
+
+### 13.4 on_input_queued 的触发时机
+
+`on_input_queued` 在 `op.add_input()` → `_add_input_inner()` 中被调用。不同算子的调用位置：
+
+| 算子 | 调用位置 | 代码 |
+|------|---------|------|
+| MapOperator | `_add_input_inner()` | `map_operator.py:501` |
+| BasePhysicalOperator (AllToAll) | `_add_input_inner()` | `base_physical_operator.py:160` |
+| ActorPoolMapOperator | `_add_input_inner()` | `actor_pool_map_operator.py:357` |
+| UnionOperator | `_add_input_inner()` | `union_operator.py:104` |
+| ZipOperator | `_add_input_inner()` | `zip_operator.py:113` |
+| OutputSplitter | `_add_input_inner()` | `output_splitter.py:144` |
+
+### 13.5 op.add_input() 的完整调用链
+
+```python
+# physical_operator.py:735-757
+def add_input(self, refs: RefBundle, input_index: int) -> None:
+    """Called when an upstream result is available."""
+    assert 0 <= input_index < len(self._input_dependencies)
+    self._metrics.on_input_received(refs)    # ← 全局输入计数
+    self._add_input_inner(refs, input_index) # ← 子类实现，内部会调 on_input_queued
+
+def _add_input_inner(self, refs: RefBundle, input_index: int) -> None:
+    """Subclasses should override this method."""
+    raise NotImplementedError
+```
+
+`on_input_received` vs `on_input_queued` 的区别：
+
+| 回调 | 含义 | 作用 |
+|------|------|------|
+| `on_input_received` | 收到上游的输入 | 累加全局计数器（`num_inputs_received`, `bytes_inputs_received`） |
+| `on_input_queued` | 输入入队到 internal inqueue | 更新 `_internal_inqueues[i]` 队列大小和 `obj_store_mem_internal_inqueue` 指标 |
+
+### 13.6 从上游取走输出：get_output_blocking()
+
+`streaming_executor_state.py:316-360`：
+
+当 executor 需要将上游算子的输出传递给下游时，调用 `get_output_blocking()` 从上游的 `output_queue` 取数据。取走后，上游的 `on_output_dequeued()` 会被调用（在 `op._get_next_inner()` 中），扣减 `obj_store_mem_internal_outqueue`。
+
+MapOperator 中的实际代码 `map_operator.py:668-679`：
+
+```python
+def _get_next_inner(self) -> RefBundle:
+    bundle = self._output_queue.get_next()
+    self._metrics.on_output_dequeued(bundle)    # ← outqueue 扣减
+    self._output_blocks_stats.extend(to_stats(bundle.metadata))
+    return bundle
+```
+
+### 13.7 上游产出到下游入队的完整调用链
+
+```
+1. 上游 task 完成 → DataOpTask._output_ready_callback
+   → self._output_queue.add(output, key=task_index)
+   → self._metrics.on_output_queued(output)           # 上游 outqueue 计入
+   → OpState.output_queue.append(ref)                 # 加入 external outqueue
+
+2. executor 在 step 循环中检测到上游有输出
+   → dispatch_next_task()
+   → inqueue.pop()                                    # 从 external inqueue 取出
+   → op.add_input(ref, input_index=i)                # 推给下游
+   → _add_input_inner() → on_input_queued()           # 下游 inqueue 计入
+
+3. 下游 operator 内部消费
+   → on_input_dequeued()                              # 下游 inqueue 扣减
+   → on_task_submitted()                               # pending_task_inputs 计入
+
+4. 下游 task 完成
+   → on_output_queued()                                # 下游 outqueue 计入
+   → on_task_finished()                               # pending_task_inputs 扣减
+
+5. executor 取走下游输出
+   → get_output_blocking() → op._get_next_inner()
+   → on_output_dequeued()                              # 下游 outqueue 扣减
+```
+
+### 13.8 External Queue 指标
+
+除了 internal 指标外，还有 external queue 相关的计数器用于诊断：
+
+```python
+# streaming_executor_state.py:288-293 — 上游产出时更新
+for next_op in self.op.output_dependencies:
+    next_op.metrics.num_external_inqueue_blocks += len(ref.blocks)
+    next_op.metrics.num_external_inqueue_bytes += ref.size_bytes()
+self.op.metrics.num_external_outqueue_blocks += len(ref.blocks)
+self.op.metrics.num_external_outqueue_bytes += ref.size_bytes()
+```
+
+| 指标 | 含义 | 更新时机 |
+|------|------|----------|
+| `num_external_inqueue_blocks/bytes` | executor 外部输入队列中的 block 数/字节 | 上游产出时 +，dispatch 时 - |
+| `num_external_outqueue_blocks/bytes` | executor 外部输出队列中的 block 数/字节 | 上游产出时 +，被下游取走时 - |
+
+---
+
+## 14. DataOpTask Callback 机制
+
+### 14.1 DataOpTask 概述
+
+`DataOpTask` 是 Ray Data 中一个运行中的远程 task 在 driver 端的代理对象。它持有一个 `streaming_gen`（`ObjectRefGenerator`），通过回调机制将远端 worker 产出的数据逐步拉回到 driver 端并更新 operator 状态。
+
+`physical_operator.py:115-160`：
+
+```python
+class DataOpTask(OpTask):
+    def __init__(
+        self,
+        task_index: int,
+        streaming_gen: ObjectRefGenerator,
+        output_ready_callback: Callable[[RefBundle], None] = lambda bundle: None,
+        task_done_callback: TaskDoneCallbackType = lambda exc, worker_stats, driver_stats: None,
+        block_ready_callback: Callable[[ray.ObjectRef[Block]], None] = lambda block_ref: None,
+        metadata_ready_callback: Callable[[ray.ObjectRef[BlockMetadata]], None] = lambda metadata_ref: None,
+        ...
+    ):
+        self._streaming_gen = streaming_gen
+        self._output_ready_callback = output_ready_callback
+        self._task_done_callback = task_done_callback
+        self._block_ready_callback = block_ready_callback
+        self._metadata_ready_callback = metadata_ready_callback
+        ...
+```
+
+### 14.2 五个 Callback 的职责和触发时机
+
+| Callback | 触发时机 | 作用 | 生产/测试 |
+|----------|----------|------|-----------|
+| `block_ready_callback` | `streaming_gen` 产出 block ObjectRef 时 | 测试用的 seam，生产环境默认 no-op | 测试 |
+| `metadata_ready_callback` | `streaming_gen` 产出 metadata ObjectRef 时 | 测试用的 seam，生产环境默认 no-op | 测试 |
+| `output_ready_callback` | block + metadata 都拿到，组装成 RefBundle 后 | **核心回调**：调用 `on_task_output_generated()` + `on_output_queued()`，将 RefBundle 加入 operator 的 `_output_queue` | **生产** |
+| `task_done_callback` | task 结束（正常 StopIteration / 异常） | **核心回调**：调用 `on_task_finished()` 更新指标，从 `_data_tasks` 中移除 task，finalize `_output_queue` | **生产** |
+| `on_data_ready` (方法) | executor 每轮循环检测到 task 有数据可读时 | **入口方法**：从 streaming generator 中拉取已就绪的数据，然后依次触发上述 callback | **生产** |
+
+### 14.3 on_data_ready() 的完整执行流程
+
+`physical_operator.py:174-276`：
+
+```
+executor 每轮 step 循环:
+  → ray.wait() 检测到 task 的 streaming_gen 有数据可读
+  → DataOpTask.on_data_ready(max_bytes_to_read)
+
+on_data_ready() 内部循环:
+  ┌───────────────────────────────────────────────────────┐
+  │  1. _streaming_gen._next_sync(timeout=0)              │
+  │     → 取出 block_ref (ObjectRef)                      │
+  │     → block_ready_callback(block_ref)                 │
+  │                                                       │
+  │  2. _streaming_gen._next_sync(timeout=METADATA_WAIT)  │
+  │     → 取出 metadata_ref (ObjectRef)                   │
+  │     → metadata_ready_callback(metadata_ref)           │
+  │                                                       │
+  │  3. ray.get(metadata_ref, timeout=METADATA_GET)        │
+  │     → 拿到实际 BlockMetadata                           │
+  │     → 组装 RefBundle = [(block_ref, metadata)]        │
+  │     → output_ready_callback(RefBundle)                │
+  │                                                       │
+  │  4. 累加 bytes_read += metadata.size_bytes            │
+  │     → 循环直到 bytes_read >= max_bytes_to_read        │
+  │                                                       │
+  │  5. StopIteration → task_done_callback(None, stats)   │
+  │     或异常 → task_done_callback(exception, None)      │
+  └───────────────────────────────────────────────────────┘
+```
+
+详细代码逻辑：
+
+```python
+def on_data_ready(self, max_bytes_to_read: Optional[int]) -> int:
+    bytes_read = 0
+    self._track_task_output_backpressure(max_bytes_to_read)
+
+    while max_bytes_to_read is None or bytes_read < max_bytes_to_read:
+        # --- 步骤 1: 取 block_ref ---
+        if self._pending_block_ref.is_nil():
+            try:
+                self._pending_block_ref = self._streaming_gen._next_sync(timeout_s=0)
+            except StopIteration:
+                # task 正常结束
+                self._task_done_callback(None, self._last_block_meta.task_exec_stats, ...)
+                self._has_finished = True
+                break
+
+            if self._pending_block_ref.is_nil():
+                break  # 暂时没有新输出
+
+            self._block_ready_callback(self._pending_block_ref)
+
+        # --- 步骤 2: 取 metadata_ref ---
+        if self._pending_meta_ref.is_nil():
+            try:
+                self._pending_meta_ref = self._streaming_gen._next_sync(timeout_s=METADATA_WAIT_TIMEOUT_S)
+            except StopIteration:
+                # 异常：block_ref 是异常对象
+                try:
+                    ray.get(self._pending_block_ref)
+                except Exception as ex:
+                    self._task_done_callback(ex, None, None)
+                    self._has_finished = True
+                    raise ex
+
+            if self._pending_meta_ref.is_nil():
+                break  # metadata 还没准备好
+
+            self._metadata_ready_callback(self._pending_meta_ref)
+
+        # --- 步骤 3: 获取实际 metadata 并组装 RefBundle ---
+        try:
+            meta_with_schema_bytes = ray.get(self._pending_meta_ref, timeout=METADATA_GET_TIMEOUT_S)
+        except ray.exceptions.GetTimeoutError:
+            break  # metadata 对象不可用（可能节点死亡），下次重试
+
+        meta_with_schema = pickle.loads(meta_with_schema_bytes)
+        meta = meta_with_schema.metadata
+
+        # --- 核心：触发 output_ready_callback ---
+        self._output_ready_callback(
+            RefBundle(
+                [(self._pending_block_ref, meta)],
+                owns_blocks=True,
+                schema=meta_with_schema.schema,
+            ),
+        )
+
+        # 重置状态，准备取下一个 block
+        self._last_block_meta = meta
+        self._pending_block_ref = ray.ObjectRef.nil()
+        self._pending_meta_ref = ray.ObjectRef.nil()
+
+        bytes_read += meta.size_bytes
+
+    return bytes_read
+```
+
+### 14.4 output_ready_callback 在 MapOperator 中的实现
+
+`map_operator.py:576-585`：
+
+```python
+def _output_ready_callback(task_index, output: RefBundle):
+    # Since output is streamed, it should only contain one block.
+    assert len(output) == 1
+    self._metrics.on_task_output_generated(task_index, output)  # 更新 task 输出指标
+    self._output_queue.add(output, key=task_index)               # 加入 operator 输出队列
+    self._metrics.on_output_queued(output)                       # 更新 outqueue 指标
+```
+
+### 14.5 task_done_callback 在 MapOperator 中的实现
+
+`map_operator.py:586-623`：
+
+```python
+def _task_done_callback(
+    task_index: int,
+    exception: Optional[Exception],
+    task_exec_stats: Optional[TaskExecWorkerStats],
+    task_exec_driver_stats: Optional[TaskExecDriverStats],
+):
+    # 1. 更新所有 task 完成相关的指标
+    self._metrics.on_task_finished(task_index, exception, task_exec_stats, task_exec_driver_stats)
+
+    # 2. 估算总输出数量
+    (_, self._estimated_num_output_bundles, self._estimated_output_num_rows,) = \
+        estimate_total_num_of_blocks(self._next_data_task_idx, self.upstream_op_num_outputs(), self._metrics)
+
+    # 3. 从运行中 task 字典移除
+    self._data_tasks.pop(task_index)
+
+    # 4. 通知输出队列该 task 的输出已完成（finalize 后可被 get_next 取走）
+    self._output_queue.finalize(key=task_index)
+
+    # 5. 如果有外部的 task_done_callback（如 TaskPoolMapOperator 返还 task slot），调用之
+    if task_done_callback:
+        task_done_callback()
+```
+
+### 14.6 TaskPoolMapOperator 的 task_done_callback
+
+`task_pool_map_operator.py:145-150`：
+
+```python
+def task_done_callback():
+    # 释放 task slot，允许提交新 task
+    with self._task_pool_lock:
+        self._num_active_tasks -= 1
+```
+
+### 14.7 ActorPoolMapOperator 的 task_done_callback
+
+`actor_pool_map_operator.py:338-348`：
+
+```python
+def _task_done_callback(res_ref):
+    # 释放 actor，放回池中
+    self._actor_pool.return_actor(actor_to_return=res_ref)
+```
+
+```python
+# actor_pool_map_operator.py:413-420
+def _task_done_callback(actor_to_return):
+    # 执行完毕后将 actor 归还到池中
+    self._actor_pool.return_actor(actor_to_return=actor_to_return)
+```
+
+### 14.8 Callback 调用时机总结
+
+```
+executor step 循环
+  │
+  ├─ ray.wait(active_tasks) 检测就绪的 task
+  │
+  ▼
+对每个 ready 的 task:
+  DataOpTask.on_data_ready(max_bytes_to_read)
+    │
+    ├─ 每产出一个 (block, metadata) 对:
+    │   → block_ready_callback     (测试用, no-op)
+    │   → metadata_ready_callback  (测试用, no-op)
+    │   → output_ready_callback    (核心: on_task_output_generated + on_output_queued)
+    │
+    └─ task 结束:
+        → task_done_callback       (核心: on_task_finished + 清理 + 释放资源)
+```
+
+### 14.9 Watchdog 机制对 Callback 的干预
+
+当 task 长时间无输出时（worker 卡死），watchdog 机制会介入：
+
+`watchdog_block_patch.py:435-459`：
+
+```python
+_orig_on_data_ready = DataOpTask.on_data_ready
+
+def _patched_on_data_ready(self, max_bytes_to_read=None):
+    try:
+        return _orig_on_data_ready(self, max_bytes_to_read)
+    except WatchdogStalledError:
+        # watchdog 检测到 task 长时间无输出
+        # 直接调用 _task_done_callback 触发 task 驱逐
+        self._task_done_callback(exc)
+```
+
+---
+
+## 15. OpResourceAllocator: Allocation vs Budget
+
+### 15.1 定义
+
+`resource_manager.py:566-710`：
+
+```python
+class OpResourceAllocator(ABC):
+    @abstractmethod
+    def get_budget(self, op: PhysicalOperator) -> Optional[ExecutionResources]:
+        """Returns the budget for the given operator or `None` if the operator
+        has unlimited budget. Operator's budget is defined as:
+
+            Budget = Allocation - Usage
+        """
+        ...
+
+    @abstractmethod
+    def get_allocation(self, op: PhysicalOperator) -> Optional[ExecutionResources]:
+        """Returns allocation for the given operator or `None` if operator's
+        allocation is unlimited."""
+        ...
+```
+
+### 15.2 关系公式
+
+```
+Budget = Allocation - Usage
+```
+
+| 概念 | 含义 | 类比 |
+|------|------|------|
+| **Allocation** | 分配给该 operator 的资源配额上限（CPU、GPU、Object Store Memory） | 信用卡额度 |
+| **Usage** | 当前已使用的资源量 | 已消费金额 |
+| **Budget** | Allocation - Usage，剩余可用量 | 还能花多少 |
+
+### 15.3 日志中的体现
+
+`resource_manager.py:425-440`：
+
+```python
+if self._op_resource_allocator is not None:
+    allocation = self._op_resource_allocator.get_allocation(op)
+    if allocation:
+        usage_str += f", alloc=(cpu={allocation.cpu:.1f}"
+        usage_str += f",gpu={allocation.gpu:.1f}"
+        usage_str += f",obj_store={allocation.object_store_memory_str()})"
+
+    budget = self._op_resource_allocator.get_budget(op)
+    if budget:
+        usage_str += f", budget=(cpu={budget.cpu:.1f}"
+        usage_str += f",gpu={budget.gpu:.1f}"
+        usage_str += f",obj_store={budget.object_store_memory_str()}"
+```
+
+日志示例：
+```
+MapBatches(foo) [5 tasks]: 2.0 CPU, 13.9MiB object store, alloc=(cpu=4.0,gpu=0.0,obj_store=200MiB), budget=(cpu=2.0,gpu=0.0,obj_store=186.1MiB)
+```
+
+- `alloc`：分配了 4 CPU、200MiB object store
+- `budget`：还剩 2 CPU、186.1MiB object store 可用
+
+### 15.4 Allocation 的分配策略
+
+OpResourceAllocator 有两种实现：
+
+#### DefaultOpResourceAllocator
+
+最简单的实现，将全局限额按算子数量平均分配：
+
+```python
+class DefaultOpResourceAllocator(OpResourceAllocator):
+    def get_allocation(self, op):
+        return self._op_allocations.get(op)
+
+    def update_budgets(self, *, limits):
+        # 按算子数量平均分配
+        num_ops = len(self._topology)
+        per_op_allocation = limits.divide(num_ops)
+        for op in self._topology:
+            self._op_allocations[op] = per_op_allocation
+```
+
+#### 更复杂的实现
+
+可基于算子优先级、吞吐量、历史使用等动态分配 allocation，具体策略取决于 OpResourceAllocator 的子类实现。
+
+### 15.5 Budget 在反压中的作用
+
+Budget 为 0 时，算子将受到反压限制：
+
+- CPU budget = 0 → 不能提交新 task
+- Object store budget = 0 → 限制读取 task 输出（`max_task_output_bytes_to_read` 返回 0 或很小的值）
+- GPU budget = 0 → 不能提交需要 GPU 的 task
+
+`can_submit_new_task` 和 `max_task_output_bytes_to_read` 是 OpResourceAllocator 的两个核心控制方法：
+
+```python
+@abstractmethod
+def can_submit_new_task(self, op: PhysicalOperator) -> bool:
+    """Return whether the given operator can submit a new task."""
+    ...
+
+@abstractmethod
+def max_task_output_bytes_to_read(self, op: PhysicalOperator) -> Optional[int]:
+    """Return the maximum bytes of pending task outputs can be read for
+    the given operator. None means no limit."""
+    ...
+```
+
+### 15.6 关键源码文件
+
+| 文件 | 作用 |
+|------|------|
+| `python/ray/data/_internal/execution/resource_manager.py:566-710` | `OpResourceAllocator` 抽象基类定义 |
+| `python/ray/data/_internal/execution/resource_manager.py:425-440` | `get_op_usage_str` 中 allocation/budget 日志输出 |
+| `python/ray/data/_internal/execution/interfaces/physical_operator.py:174-276` | `DataOpTask.on_data_ready` — callback 触发入口 |
+| `python/ray/data/_internal/execution/operators/map_operator.py:565-644` | MapOperator 的 `_output_ready_callback` / `_task_done_callback` |
+| `python/ray/data/_internal/execution/operators/actor_pool_map_operator.py:338-420` | ActorPoolMapOperator 的 `_task_done_callback` |
+| `python/ray/data/_internal/execution/operators/task_pool_map_operator.py:145-150` | TaskPoolMapOperator 的 `task_done_callback` |
+| `python/ray/data/_internal/execution/streaming_executor_state.py:296-312` | `dispatch_next_task` — external → internal 数据流转 |
+| `python/ray/data/_internal/execution/watchdog_block_patch.py:435-459` | watchdog 机制对 callback 的干预 |
