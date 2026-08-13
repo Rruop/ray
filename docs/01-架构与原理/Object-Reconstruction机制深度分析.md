@@ -649,8 +649,8 @@ if (task_retryable) {
 对于 streaming generator task（Ray Data 的 `cached_remote_fn` 默认 `max_retries=-1`）：
 
 1. **第一次完成**（`first_execution = true`）→ `reconstructable_return_ids_` 填入所有 return → `task_retryable = true` → 保留 spec
-2. **Consumer 逐个消费 return object 并释放 ref** → `RemoveLineageReference` → `reconstructable_return_ids_` 逐个 erase
-3. **当 `reconstructable_return_ids_` 变空 且 `!IsPending()`** → `submissible_tasks_.erase(it)` → task spec 被删除
+2. **Consumer 逐个消费 return object 并释放 Python ref** → `RemoveLocalReference` → `local_ref_count--` → `RefCount()==0` → `OutOfScope=true` → 但此时 `lineage_ref_count>0` → `ShouldDelete()=false` → **不调 `RemoveLineageReference`**，spec 保留
+3. **只有当上游 `lineage_ref_count` 归零后**（即所有依赖此 object 的可重试 task 都不再可重试）→ `ShouldDelete()=true` → `ReleaseLineageReferences` → `RemoveLineageReference` → `reconstructable_return_ids_.empty()` → 删 spec
 4. **但此时 `object_id_refs_` 中的 `lineage_eligibility_` 仍然是 `ELIGIBLE`**——因为 `ReleaseLineageReferences` 检查 `!OutOfScope()` 时，object 已经 out of scope（`RefCount() == 0`），所以不会降级
 5. **后续如果某个 consumer（如 actor task）仍然持有该 block 的 ref**（`RefCount() > 0`），该 object 的 `lineage_eligibility_` 仍然是 `ELIGIBLE`
 6. **Tidal 节点死亡 → object 在 plasma 中丢失** → `RecoverObject()` → `GetLineageReconstructionEligibility()` 返回 `ELIGIBLE` → 进入 `ReconstructObject()`
@@ -1241,9 +1241,16 @@ C_task_3: map 依赖 Y3 产出 Z3
     → X.lineage_ref_count 不变 = 1
 
   → X.RefCount() = 0  ← 现在归零了
+  → X.OutOfScope() = true
+  → 但 X.lineage_ref_count=1 → ShouldDelete()=false → Reference 保留
 
   → B_task retryable → lineage_footprint 计入
   → total_lineage_footprint_bytes_ += B_task.spec.ByteSizeLong()
+
+  → driver del Y1/Y2/Y3 的 RefBundle:
+    → Y1.local_ref_count → 0, Y2.local_ref_count → 0, Y3.local_ref_count → 0
+    → 但 Y1/Y2/Y3 各自 lineage_ref_count > 0（C_task retryable）
+    → ShouldDelete()=false → RemoveLineageReference 不被调用
 
   此时 X 的状态:
     X.local_ref_count = 0
@@ -1573,7 +1580,21 @@ OOM Kill 路径中 `FailPendingTask` 直接调用 `put_in_local_plasma_callback_
 
 **重提交（ResubmitTask）不 +1**——`UpdateResubmittedTaskReferences` 只处理 `submitted_task_ref_count`，不增加 `lineage_ref_count`。
 
-### 17.2 -1 时机：通过 RemoveLineageReference 触发
+### 17.2 -1 时机：通过 ReleaseLineageReferences → RemoveLineageReference 触发
+
+**`RemoveLineageReference` 不是 consumer 释放 Python ref 时直接调用的。** 它只在两种场景下被触发：
+
+1. **`ShouldDelete()=true`**（即 `OutOfScope=true && lineage_ref_count==0`）→ `DeleteReferenceInternal` → `ReleaseLineageReferences` → `on_lineage_released_` → `RemoveLineageReference`
+2. **`EvictLineage` 强制淘汰** → `ReleaseLineageReferences` → `on_lineage_released_` → `RemoveLineageReference`
+
+Consumer 释放 Python ref 走的是另一条路径：
+```
+Python del ref → RemoveLocalReference → local_ref_count--
+  → RefCount()==0 → OutOfScope=true
+  → ShouldDelete()?
+    → lineage_ref_count>0 → false → 不触发 RemoveLineageReference
+    → lineage_ref_count==0 → true → 触发 ReleaseLineageReferences → RemoveLineageReference
+```
 
 ```cpp
 // task_manager.cc:1443-1491
@@ -1633,16 +1654,35 @@ B_task: streaming generator 产出 Y1, Y2, Y3
 A_task 的 lineage_ref_count 对 X 的 +1 由 B_task 首次提交时增加
 B_task 的 lineage_ref_count 对 X 不直接 +1（B_task 的参数是 X）
 
-释放时序：
-  1. Y1 被 C_task_1 消费完 → RemoveLineageReference(Y1)
-     → B_task.reconstructable_return_ids_.erase(Y1)
-     → 但 {Y2, Y3} 不为空 → B_task spec 保留 → X.lineage_ref_count 不减
+释放时序（关键：RemoveLineageReference 不是 consumer del ref 时直接触发的）：
 
-  2. Y2 被 C_task_2 消费完 → RemoveLineageReference(Y2)
+  1. C_task_1 完成 → driver del Y1 的 RefBundle
+     → RemoveLocalReference(Y1) → Y1.local_ref_count-- → RefCount()==0
+     → OutOfScope=true → ShouldDelete()?
+       → Y1.lineage_ref_count>0（C_task_1 retryable）→ false
+     → ★ RemoveLineageReference 不被调用
+     → B_task.reconstructable_return_ids_ 仍有 {Y1, Y2, Y3}
+
+  2. C_task_2 完成 → driver del Y2 的 RefBundle → 同上
+     → B_task.reconstructable_return_ids_ 仍有 {Y1, Y2, Y3}
+
+  3. C_task_3 完成 → driver del Y3 的 RefBundle → 同上
+     → B_task.reconstructable_return_ids_ 仍有 {Y1, Y2, Y3}
+
+  4. 当 C_task_1 的 return objects 全部 out of scope → C_task_1 spec 删除
+     → C_task_1 的参数 Y1 的 lineage_ref_count-- (1→0)
+     → Y1.ShouldDelete()=true → ReleaseLineageReferences(Y1)
+       → RemoveLineageReference(Y1)
+       → B_task.reconstructable_return_ids_.erase(Y1)
+       → {Y2, Y3} 不为空 → B_task spec 保留
+
+  5. 同理 C_task_2 的 return objects 全 out of scope → Y2.lineage_ref_count--
+     → Y2.ShouldDelete()=true → RemoveLineageReference(Y2)
      → B_task.reconstructable_return_ids_.erase(Y2)
-     → 但 {Y3} 不为空 → B_task spec 保留 → X.lineage_ref_count 不减
+     → {Y3} 不为空 → B_task spec 保留
 
-  3. Y3 被 C_task_3 消费完 → RemoveLineageReference(Y3)
+  6. C_task_3 的 return objects 全 out of scope → Y3.lineage_ref_count--
+     → Y3.ShouldDelete()=true → RemoveLineageReference(Y3)
      → B_task.reconstructable_return_ids_.erase(Y3)
      → {} 为空 → B_task spec 删除
      → released_objects 包含 X → X.lineage_ref_count-- (1→0)
@@ -1650,7 +1690,9 @@ B_task 的 lineage_ref_count 对 X 不直接 +1（B_task 的参数是 X）
      → EraseReference(X)
 ```
 
-**上游 input block 的 `lineage_ref_count` 要等直接依赖的 task 的所有输出都被消费完才归零。**
+**关键认知**：Consumer 释放 Python ref 只减 `local_ref_count`，不触发 `RemoveLineageReference`。`RemoveLineageReference` 只在 `ShouldDelete()=true`（即 `lineage_ref_count==0`）或被 `EvictLineage` 强制调用时才触发。
+
+**上游 input block 的 `lineage_ref_count` 要等直接依赖的 task 的所有输出最终触发 `ShouldDelete()=true` 后才归零——这比 consumer del ref 晚很多。**
 
 ### 17.5 pipeline 终端输出 Z 的 lineage_ref_count
 
@@ -1660,7 +1702,7 @@ Z（pipeline 终端输出，如 `write()` 或 `iter_batches()` 的输出）创�
 - Z 的 `ShouldDelete()` 取决于 `RefCount()` 和 `lineage_ref_count`
 
 Z 的回收触发：
-- `write()` 场景：`write()` 返回后 driver del Z 的 RefBundle → `RefCount()=0` → `ShouldDelete()=true` → 立即清理
+- `write()` 场景：`write()` 返回后 driver del Z 的 RefBundle → `RemoveLocalReference` → `local_ref_count=0` → `RefCount()=0` → `ShouldDelete()=true`（Z 的 `lineage_ref_count=0`）→ `ReleaseLineageReferences` → 立即清理
 - `iter_batches()` 场景：driver 消费完最后一个 batch 后 del → 同上
 
 ---
