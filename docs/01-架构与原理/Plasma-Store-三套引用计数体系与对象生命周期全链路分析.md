@@ -26,6 +26,10 @@
 - [18. Spill 流程详解](#18-spill-流程详解)
 - [19. Spill 恢复流程详解](#19-spill-恢复流程详解)
 - [20. 关键代码索引（补充）](#20-关键代码索引补充)
+- [21. 对象生命周期与引用保护层级](#21-对象生命周期与引用保护层级)
+- [22. HandleObjectMissing vs HandleObjectFreed](#22-handleobjectmissing-vs-handleobjectfreed)
+- [23. Pull 依赖对象的完整生命周期](#23-pull-依赖对象的完整生命周期)
+- [24. CancelPull 的必要性](#24-cancelpull-的必要性)
 
 ---
 
@@ -503,7 +507,7 @@ def store_task_output(self, serialized_object, return_id, ...):
 ### 7.2 C++ AllocateReturnObject 的大小判断
 
 ```cpp
-// core_worker.cc:2917
+// core_worker.cc:2707
 Status CoreWorker::AllocateReturnObject(const ObjectID &object_id, ...) {
   bool object_already_exists = false;
   std::shared_ptr<Buffer> data_buffer;
@@ -526,6 +530,212 @@ Status CoreWorker::AllocateReturnObject(const ObjectID &object_id, ...) {
   // object_already_exists时 return_ptr = NULL
 }
 ```
+
+### 7.2a AllocateReturnObject → Create 的 ref 递增完整代码链路
+
+大对象路径：`AllocateReturnObject` → `CreateExisting` → `PlasmaStoreProvider::Create` → `PlasmaClient::CreateAndSpillIfNeeded` → IPC → server `CreateObject` + `AddToClientObjectIds`。
+
+**Step 1: CreateExisting — 薄委托层**
+
+```cpp
+// core_worker.cc:1135
+Status CoreWorker::CreateExisting(const std::shared_ptr<Buffer> &metadata,
+                                  const size_t data_size,
+                                  const ObjectID &object_id, ...) {
+  return plasma_store_provider_->Create(
+      metadata, data_size, object_id, owner_address, data, created_by_worker);
+}
+```
+
+**Step 2: PlasmaStoreProvider::Create — 调用 CreateAndSpillIfNeeded**
+
+```cpp
+// plasma_store_provider.cc:126
+Status CoreWorkerPlasmaStoreProvider::Create(..., std::shared_ptr<Buffer> *data, ...) {
+  const auto source = created_by_worker
+                          ? plasma::flatbuf::ObjectSource::CreatedByWorker
+                          : plasma::flatbuf::ObjectSource::RestoredFromStorage;
+  Status status = store_client_->CreateAndSpillIfNeeded(
+      object_id, owner_address, is_mutable, data_size,
+      metadata ? metadata->Data() : nullptr, metadata ? metadata->Size() : 0,
+      data, source, /*device_num=*/0);
+  // IsObjectExists → status = OK（plasma 中已有此对象）
+  if (status.IsObjectExists()) {
+    status = Status::OK();
+  }
+  return status;
+}
+```
+
+**Step 3: PlasmaClient::CreateAndSpillIfNeeded — 发送 IPC CreateRequest**
+
+```cpp
+// client.cc:215-260
+Status PlasmaClient::CreateAndSpillIfNeeded(const ObjectID &object_id, ...) {
+  uint64_t retry_with_request_id = 0;
+  {
+    std::unique_lock<std::recursive_mutex> guard(client_mutex_);
+    // ★ try_immediately=false → server 将请求入 CreateRequestQueue，OOM 时触发 spill
+    RAY_RETURN_NOT_OK(SendCreateRequest(store_conn_, object_id, owner_address,
+                                        is_experimental_mutable_object,
+                                        data_size, metadata_size, source,
+                                        device_num,
+                                        /*try_immediately=*/false));
+    status = HandleCreateReply(object_id, is_experimental_mutable_object,
+                               metadata, &retry_with_request_id, data);
+  }
+  // 如果 store full，轮询重试
+  while (retry_with_request_id > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(
+        RayConfig::instance().object_store_full_delay_ms()));
+    std::unique_lock<std::recursive_mutex> guard(client_mutex_);
+    RAY_RETURN_NOT_OK(SendCreateRetryRequest(store_conn_, object_id, retry_with_request_id));
+    status = HandleCreateReply(...);
+  }
+  return status;
+}
+```
+
+**Step 4: Server 端 — PlasmaStore 收到 CreateRequest → 入队处理**
+
+```cpp
+// store.cc:380-424
+case fb::MessageType::PlasmaCreateRequest: {
+  // try_immediately == false → 入 CreateRequestQueue
+  auto req_id = create_request_queue_.AddRequest(object_id, client, handle_create, object_size);
+  ProcessCreateRequests();        // 尝试分配（可能触发 GC/spill/grace period/fallback）
+  ReplyToCreateClient(client, object_id, req_id);
+}
+
+// ProcessRequests 最终调用 handle_create lambda → HandleCreateObjectRequest
+```
+
+**Step 5: HandleCreateObjectRequest → CreateObject → AddToClientObjectIds**
+
+```cpp
+// store.cc:149-193
+PlasmaError PlasmaStore::HandleCreateObjectRequest(const std::shared_ptr<Client> &client,
+                                                   const std::vector<uint8_t> &message,
+                                                   bool fallback_allocator,
+                                                   PlasmaObject *object) {
+  ReadCreateRequest(input, input_size, &object_info, &source, &device_num);
+  auto error = CreateObject(object_info, source, client, fallback_allocator, object);
+  return error;
+}
+
+PlasmaError PlasmaStore::CreateObject(const ray::ObjectInfo &object_info,
+                                      fb::ObjectSource source,
+                                      const std::shared_ptr<Client> &client,
+                                      bool fallback_allocator,
+                                      PlasmaObject *result) {
+  auto pair = object_lifecycle_mgr_.CreateObject(object_info, source, fallback_allocator);
+  auto entry = pair.first;
+  if (entry == nullptr) { return pair.second; }
+  entry->ToPlasmaObject(result, /*check_sealed=*/false);
+  // ★ 创建成功后，将对象注册到 client → server ref_count +1
+  AddToClientObjectIds(object_info.object_id, fallback_allocated_fd, client);
+  return PlasmaError::OK;
+}
+```
+
+**Step 6: ObjectLifecycleManager::CreateObject — 创建对象（ref_count 初始为 0）**
+
+```cpp
+// obj_lifecycle_mgr.cc:40-62
+std::pair<const LocalObject *, PlasmaError> ObjectLifecycleManager::CreateObject(
+    const ray::ObjectInfo &object_info, ...) {
+  if (object_store_->GetObject(object_info.object_id) != nullptr) {
+    return {nullptr, PlasmaError::ObjectExists};  // 对象已存在
+  }
+  auto entry = CreateObjectInternal(object_info, source, fallback_allocator);
+  // CreateObjectInternal 创建对象时 ref_count_ = 0（不递增 ref）
+  // ref_count 递增在后续 AddToClientObjectIds → AddReference 中完成
+  if (entry == nullptr) { return {nullptr, PlasmaError::OutOfMemory}; }
+  eviction_policy_->ObjectCreated(object_info.object_id);
+  return {entry, PlasmaError::OK};
+}
+```
+
+**Step 7: AddToClientObjectIds → AddReference（server ref_count 0→1）**
+
+```cpp
+// store.cc:136-147
+void PlasmaStore::AddToClientObjectIds(const ObjectID &object_id, ...,
+                                       const std::shared_ptr<ClientInterface> &client) {
+  auto &object_ids = client->GetObjectIDs();
+  if (object_ids.find(object_id) != object_ids.end()) {
+    return;  // 该 client 已持有此对象，不重复 +1
+  }
+  RAY_CHECK(object_lifecycle_mgr_.AddReference(object_id));  // ★ server ref_count++
+  client->MarkObjectAsUsed(object_id, fallback_allocated_fd);
+}
+
+// obj_lifecycle_mgr.cc:128-145
+bool ObjectLifecycleManager::AddReference(const ObjectID &object_id) {
+  auto entry = object_store_->GetObject(object_id);
+  if (entry->ref_count_ == 0) {
+    eviction_policy_->BeginObjectAccess(object_id);  // 从 LRU 移除，不可淘汰
+  }
+  entry->ref_count_++;  // ★ server ref_count: 0 → 1
+  return true;
+}
+```
+
+**Step 8: Client 端 — HandleCreateReply → InsertObjectInUse + IncrementObjectCount（client count 0→1→2）**
+
+```cpp
+// client.cc:144-209
+Status PlasmaClient::HandleCreateReply(const ObjectID &object_id, ...) {
+  // ... 接收 CreateReply flatbuffer ...
+  // ... 创建 PlasmaMutableBuffer 包装 mmap 数据 ...
+
+  // ★ 首次注册：count = 1（"pin" 引用，PlasmaMutableBuffer 析构时 Release 减此引用）
+  InsertObjectInUse(object_id, std::move(object), /*is_sealed=*/false);
+
+  // ★ 二次递增：count = 2（"seal 保护"引用，确保 Create 返回的 buffer 即使出了作用域，
+  //   对象也不会在 Seal 之前被 Release。对应的 Release 在 Seal 中调用）
+  IncrementObjectCount(object_id);
+
+  // 可变对象额外 +1（count = 3）
+  if (is_experimental_mutable_object) {
+    IncrementObjectCount(object_id);
+  }
+  // ... 返回 buffer 给调用方 ...
+}
+
+// client.cc:110-125
+void PlasmaClient::InsertObjectInUse(const ObjectID &object_id,
+                                     std::unique_ptr<PlasmaObject> object,
+                                     bool is_sealed) {
+  auto inserted = objects_in_use_.insert({object_id, std::make_unique<ObjectInUseEntry>()});
+  RAY_CHECK(inserted.second) << "Object already in use";
+  auto it = inserted.first;
+  it->second->object = std::move(*object);
+  it->second->count = 1;       // ★ client count 初始化为 1
+  it->second->is_sealed = is_sealed;
+}
+
+// client.cc:126-133
+void PlasmaClient::IncrementObjectCount(const ObjectID &object_id) {
+  auto object_entry = objects_in_use_.find(object_id);
+  RAY_CHECK(object_entry != objects_in_use_.end());
+  object_entry->second->count += 1;  // ★ client count: 1 → 2
+}
+```
+
+**client count = 2 的含义**：
+
+| count | 来源 | 保护什么 | 何时释放 |
+|-------|------|---------|---------|
+| 1 | `InsertObjectInUse` | "对象正在被 client 使用" — PlasmaMutableBuffer 析构时 Release | buffer 出作用域 / 显式 Release |
+| 2 | `IncrementObjectCount` | "Seal 前保护" — 确保 Create 返回的 buffer 即使出了作用域，对象也不会被提前 Release 给 store | `Seal()` 中调用 `Release()` 减此引用 |
+| 3 (mutable) | 额外 `IncrementObjectCount` | "可变对象额外保护" | 可变对象专用的 Release |
+
+**为什么 Create 后 count=2 而不是 1**：如果 Create 返回的 buffer（`PlasmaMutableBuffer` shared_ptr）出了作用域，其析构会调用 `Release()`，count 1→0 → 发 SendReleaseRequest → server ref=0 → 对象被淘汰。但此时数据还没写完、还没 Seal！所以 `IncrementObjectCount` 额外加 1，保证即使 buffer 引用丢了（count 2→1），也不会触发 `SendReleaseRequest`（count ≠ 0）。只有 `Seal()` 中再 Release 一次（count 1→0）才会真正释放。
+
+**CreateAndSpillIfNeeded vs TryCreateImmediately**：两者 client 端 ref count 逻辑完全相同（都走 `HandleCreateReply` → count=2）。区别在 server 端调度：
+- `CreateAndSpillIfNeeded`：`try_immediately=false`，请求入 `CreateRequestQueue`，OOM 时触发 spill/GC/grace period/fallback
+- `TryCreateImmediately`：`try_immediately=true`，直接尝试分配（含 fallback），失败即返回
 
 ### 7.3 SealReturnObject
 
@@ -650,7 +860,449 @@ bool CoreWorker::PinExistingReturnObject(const ObjectID &return_id, ...) {
 
 ## 9. 完整链路 4：Pull（worker 主动拉取远程对象）
 
-### 9.1 数据接收（Remote Push → 本地 Create + Write + Seal + Release）
+### 9.0 PlasmaClient 实例分布与共享关系
+
+raylet 进程中有 **两个独立的 PlasmaClient 实例**，各自通过独立的 Unix socket 连接到同一个 Plasma Store 进程：
+
+| 实例 | 创建位置 | 持有者 | 连接时机 | 用途 |
+|------|---------|--------|---------|------|
+| PlasmaClient #1 | `main.cc:861`（ObjectManager 构造参数） | `ObjectManager` → `ObjectBufferPool::store_client_` | `object_manager.cc:137` Init | 对象 chunk 传输（Create、Write、Seal、Release、Abort、Get、Delete） |
+| PlasmaClient #2 | `main.cc:1011`（NodeManager 构造参数） | `NodeManager::store_client_` | `node_manager.cc:260` Start | Get 对象用于 pin、创建 error 对象、内存查询 |
+
+**关键区别**：两个 PlasmaClient 是独立的 Plasma client 连接，各自维护独立的 `objects_in_use_`（client count）。同一个对象在两个 client 中可以同时持有引用，server ref_count 是两者引用之和。
+
+**PlasmaClient #2 的共享路径**：
+
+```
+NodeManager::store_client_ (PlasmaClient #2)
+  ├─ NodeManager::GetObjectsFromPlasma()
+  │    → store_client_->Get() → 获取 RayObject（refcount++）
+  │    被以下组件通过回调/直接调用使用：
+  │    ├─ PullManager::pin_object_ 回调 (main.cc:843)
+  │    ├─ LocalLeaseManager::get_lease_arguments_ 回调 (main.cc:959)
+  │    └─ NodeManager::HandlePinObjectIDs (node_manager.cc:2578)
+  │
+  └─ 间接使用者（通过 NodeManager 中转）：
+       ├─ LocalObjectManager::PinObjectsAndWaitForFree
+       │    （HandlePinObjectIDs 调用 GetObjectsFromPlasma 后传入 RayObject）
+       ├─ PullManager::TryPinObject
+       │    （pin_object_ 回调 → GetObjectsFromPlasma → 返回 RayObject）
+       └─ LocalLeaseManager::PinLeaseArgsIfMemoryAvailable
+            （get_lease_arguments_ 回调 → GetObjectsFromPlasma → 返回 RayObject）
+```
+
+**PlasmaClient #1 的使用路径**：
+
+```
+ObjectBufferPool::store_client_ (PlasmaClient #1)
+  ├─ 远端 Pull 到达时：Create → Write chunks → Seal → Release
+  │    （buffer_pool.cc:225 EnsureBufferExists → CreateAndSpillIfNeeded）
+  └─ 远端 Push 请求时：Get → 读取对象数据 → 发送 chunks
+       （buffer_pool.cc:100 CreateObjectReader → store_client_->Get）
+```
+
+**三者持有 RayObject 的关系**：
+
+| 持有者 | 存储位置 | PlasmaClient | server ref 贡献 | 释放方式 |
+|--------|---------|-------------|----------------|---------|
+| PullManager::pinned_objects_ | `pull_manager.cc` | #2 (通过 pin_object_ 回调) | +1 | UnpinObject → RayObject 析构 → Release |
+| LocalLeaseManager::pinned_lease_arguments_ | `local_lease_manager.cc` | #2 (通过 get_lease_arguments_ 回调) | +1 | ReleaseLeaseArgs → RayObject 析构 → Release |
+| LocalObjectManager::pinned_objects_ | `local_object_manager.cc` | #2 (HandlePinObjectIDs 中 Get) | +1 | ReleaseFreedObject → RayObject 析构 → Release |
+| ObjectBufferPool (临时) | `object_buffer_pool.cc` | #1 | +1(创建时)/0(Seal+Release后) | Seal + Release 归零 |
+
+**同对象的引用叠加示例**：一个 Pull 来的对象在 lease 调度期间，PullManager 和 PinLeaseArgs 各持有一个 RayObject，两者都通过 PlasmaClient #2 的 `Get()` 获得引用，server ref_count = 2。CancelPull 释放 PullManager 的引用后 ref 降到 1，PinLeaseArgs 仍保护对象不被 LRU。
+
+### 9.0a PlasmaClient::Get() — client count 递增的完整代码链路
+
+三种 pin 机制获取 RayObject 时，最终都经过同一条代码路径：`GetObjectsFromPlasma` → `PlasmaClient::Get()` → IPC `GetRequest` → server `AddReference`。
+
+**Step 1: 三种回调定义（main.cc）**
+
+```cpp
+// PullManager::pin_object_ — main.cc:844
+[&](const ray::ObjectID &object_id) {
+  std::vector<ray::ObjectID> object_ids = {object_id};
+  std::vector<std::unique_ptr<ray::RayObject>> results;
+  std::unique_ptr<ray::RayObject> result;
+  if (node_manager->GetObjectsFromPlasma(object_ids, &results) &&
+      results.size() > 0) {
+    result = std::move(results[0]);
+  }
+  return result;
+},
+
+// LocalLeaseManager::get_lease_arguments_ — main.cc:993
+[&](const std::vector<ray::ObjectID> &object_ids,
+    std::vector<std::unique_ptr<ray::RayObject>> *results) {
+  return node_manager->GetObjectsFromPlasma(object_ids, results);
+},
+
+// HandlePinObjectIDs — node_manager.cc:2597（直接调用）
+std::vector<std::unique_ptr<RayObject>> results;
+if (!GetObjectsFromPlasma(object_ids, &results)) { ... }
+```
+
+**Step 2: GetObjectsFromPlasma — NodeManager 的统一入口**
+
+```cpp
+// node_manager.cc:2561-2577
+bool NodeManager::GetObjectsFromPlasma(
+    const std::vector<ObjectID> &object_ids,
+    std::vector<std::unique_ptr<RayObject>> *results) {
+  std::vector<plasma::ObjectBuffer> plasma_results;
+  if (!store_client_->Get(object_ids, /*timeout_ms=*/0, &plasma_results).ok()) {
+    return false;                              // PlasmaClient #2
+  }
+  for (const auto &plasma_result : plasma_results) {
+    if (plasma_result.data == nullptr) {
+      results->push_back(nullptr);
+    } else {
+      // 用 plasma buffer 构造 RayObject
+      // plasma_result.data 是 SharedMemoryBuffer::Slice → 持有 PlasmaBuffer
+      results->emplace_back(std::unique_ptr<RayObject>(
+          new RayObject(plasma_result.data, plasma_result.metadata, {})));
+    }
+  }
+  return true;
+}
+```
+
+**Step 3: PlasmaClient::Get() → GetBuffers()**
+
+```cpp
+// client.cc:469-474
+Status PlasmaClient::Get(const std::vector<ObjectID> &object_ids,
+                         int64_t timeout_ms,
+                         std::vector<ObjectBuffer> *out) {
+  std::lock_guard<std::recursive_mutex> guard(client_mutex_);
+  *out = std::vector<ObjectBuffer>(num_objects);
+  return GetBuffers(object_ids.data(), num_objects, timeout_ms, out->data());
+}
+
+// client.cc:327-336 — 发送 IPC GetRequest
+RAY_RETURN_NOT_OK(SendGetRequest(store_conn_, &object_ids[0], num_objects, timeout_ms));
+
+// client.cc:370-392 — 收到 reply 后处理每个对象
+for (int64_t i = 0; i < num_objects; ++i) {
+  if (object->data_size != -1) {
+    if (objects_in_use_.find(received_object_ids[i]) == objects_in_use_.end()) {
+      // ★ 首次引用此对象：count 0→1
+      InsertObjectInUse(received_object_ids[i], std::move(object), /*is_sealed=*/true);
+    } else {
+      // ★ 已有引用：count +=1
+      IncrementObjectCount(received_object_ids[i]);
+    }
+    // 创建 PlasmaBuffer（析构时自动调用 Release）
+    auto physical_buf = std::make_shared<PlasmaBuffer>(
+        shared_from_this(),
+        object_ids[i],
+        std::make_shared<SharedMemoryBuffer>(
+            data + object_entry->object.data_offset,
+            object_entry->object.data_size + object_entry->object.metadata_size));
+    object_buffers[i].data =
+        SharedMemoryBuffer::Slice(physical_buf, 0, object_entry->object.data_size);
+    object_buffers[i].metadata =
+        SharedMemoryBuffer::Slice(physical_buf,
+                                  object_entry->object.data_size,
+                                  object_entry->object.metadata_size);
+  }
+}
+```
+
+**Step 4: InsertObjectInUse / IncrementObjectCount**
+
+```cpp
+// client.cc:110-125 — 首次引用
+void PlasmaClient::InsertObjectInUse(const ObjectID &object_id,
+                                     std::unique_ptr<PlasmaObject> object,
+                                     bool is_sealed) {
+  auto inserted =
+      objects_in_use_.insert({object_id, std::make_unique<ObjectInUseEntry>()});
+  auto it = inserted.first;
+  it->second->object = std::move(*object);
+  it->second->count = 1;       // ← client count 初始化为 1
+  it->second->is_sealed = is_sealed;
+}
+
+// client.cc:126-133 — 再次引用
+void PlasmaClient::IncrementObjectCount(const ObjectID &object_id) {
+  auto object_entry = objects_in_use_.find(object_id);
+  RAY_CHECK(object_entry != objects_in_use_.end());
+  object_entry->second->count += 1;  // ← client count 递增
+}
+```
+
+**Step 5: Server 端 — AddToClientObjectIds → AddReference**
+
+```cpp
+// store.cc:108-109 — GetRequest 回调触发
+[this](const ObjectID &object_id, ..., const auto &request) {
+  this->AddToClientObjectIds(object_id, fallback_allocated_fd, request->client_);
+}
+
+// store.cc:136-145
+void PlasmaStore::AddToClientObjectIds(const ObjectID &object_id, ...,
+                                       const std::shared_ptr<ClientInterface> &client) {
+  auto &object_ids = client->GetObjectIDs();
+  if (object_ids.find(object_id) != object_ids.end()) {
+    return;  // 该 client 已持有此对象，不重复 +1
+  }
+  RAY_CHECK(object_lifecycle_mgr_.AddReference(object_id));  // ← server ref_count++
+  client->MarkObjectAsUsed(object_id, fallback_allocated_fd);
+}
+
+// obj_lifecycle_mgr.cc:128-145
+bool ObjectLifecycleManager::AddReference(const ObjectID &object_id) {
+  auto entry = object_store_->GetObject(object_id);
+  if (entry->ref_count_ == 0) {
+    eviction_policy_->BeginObjectAccess(object_id);  // 从 LRU 移除，不可淘汰
+  }
+  entry->ref_count_++;  // ← server ref_count 递增
+  return true;
+}
+```
+
+**PlasmaBuffer — RayObject 析构时自动 Release 的桥梁**
+
+```cpp
+// client.cc:40-52
+class PlasmaBuffer : public SharedMemoryBuffer {
+ public:
+  PlasmaBuffer(std::shared_ptr<PlasmaClient> client,
+               const ObjectID &object_id,
+               const std::shared_ptr<Buffer> &buffer)
+      : SharedMemoryBuffer(buffer, 0, buffer->Size()),
+        client_(std::move(client)),
+        object_id_(object_id) {}
+
+  ~PlasmaBuffer() override { RAY_UNUSED(client_->Release(object_id_)); }
+  // ★ PlasmaBuffer 是 SharedMemoryBuffer 的父 buffer，
+  //   RayObject 的 data_/metadata_ 是它的 Slice（shared_ptr 持有父引用）
+  //   当所有 Slice 和父 buffer 的 shared_ptr 归零时，~PlasmaBuffer 触发 Release
+
+ private:
+  std::shared_ptr<PlasmaClient> client_;  // 持有 PlasmaClient 引用防止先释放
+  ObjectID object_id_;
+};
+```
+
+### 9.0b PlasmaClient::Release() — client count 递减的完整代码链路
+
+三种 pin 机制释放 RayObject 时，最终都经过：`unique_ptr<RayObject>` 析构 → `shared_ptr<Buffer>` 归零 → `~PlasmaBuffer()` → `PlasmaClient::Release()` → IPC `ReleaseRequest` → server `RemoveReference`。
+
+**Step 1: RayObject 析构链**
+
+```
+unique_ptr<RayObject> 被销毁（erase from pinned_objects_ / pinned_lease_arguments_）
+  → RayObject 析构（编译器生成，无显式析构函数）
+    → shared_ptr<Buffer> data_ 引用计数递减
+    → shared_ptr<Buffer> metadata_ 引用计数递减
+      → 如果 data_ 和 metadata_ 是最后持有 PlasmaBuffer 的引用：
+        → PlasmaBuffer 析构
+          → ~PlasmaBuffer() { client_->Release(object_id_); }
+```
+
+**Step 2: PlasmaClient::Release()**
+
+```cpp
+// client.cc:487-530
+Status PlasmaClient::Release(const ObjectID &object_id) {
+  std::lock_guard<std::recursive_mutex> guard(client_mutex_);
+  const auto object_entry = objects_in_use_.find(object_id);
+  RAY_CHECK(object_entry != objects_in_use_.end());
+
+  object_entry->second->count -= 1;  // ← client count 递减
+  RAY_CHECK_GE(object_entry->second->count, 0);
+
+  if (object_entry->second->count == 0) {
+    // count 归零 → 该 client 不再使用此对象
+    RAY_RETURN_NOT_OK(MarkObjectUnused(object_id));   // 从 objects_in_use_ 移除
+    RAY_RETURN_NOT_OK(SendReleaseRequest(store_conn_, object_id, may_unmap));  // IPC
+  }
+  return Status::OK();
+}
+
+// client.cc:480-485
+Status PlasmaClient::MarkObjectUnused(const ObjectID &object_id) {
+  auto object_entry = objects_in_use_.find(object_id);
+  RAY_CHECK_EQ(object_entry->second->count, 0);
+  objects_in_use_.erase(object_id);  // 完全移除
+  return Status::OK();
+}
+```
+
+**Step 3: Server 端 — RemoveFromClientObjectIds → RemoveReference**
+
+```cpp
+// store.cc:434-448 — 处理 PlasmaReleaseRequest
+case fb::MessageType::PlasmaReleaseRequest: {
+  ObjectID object_id;
+  ReadReleaseRequest(input, input_size, &object_id, &may_unmap);
+  ReleaseObject(object_id, client);  // → RemoveFromClientObjectIds
+}
+
+// store.cc:265-270
+bool PlasmaStore::ReleaseObject(const ObjectID &object_id,
+                                const std::shared_ptr<Client> &client) {
+  return RemoveFromClientObjectIds(object_id, client);
+}
+
+// store.cc:247-259
+bool PlasmaStore::RemoveFromClientObjectIds(const ObjectID &object_id,
+                                            const std::shared_ptr<Client> &client) {
+  auto &object_ids = client->GetObjectIDs();
+  auto it = object_ids.find(object_id);
+  if (it != object_ids.end()) {
+    client->MarkObjectAsUnused(object_id);
+    object_lifecycle_mgr_.RemoveReference(object_id);  // ← server ref_count--
+    return should_unmap;
+  }
+  return false;
+}
+
+// obj_lifecycle_mgr.cc:148-168
+bool ObjectLifecycleManager::RemoveReference(const ObjectID &object_id) {
+  auto entry = object_store_->GetObject(object_id);
+  entry->ref_count_--;  // ← server ref_count 递减
+  if (entry->ref_count_ > 0) {
+    return true;
+  }
+  // ref_count_ == 0 → 可淘汰
+  eviction_policy_->EndObjectAccess(object_id);  // 加入 LRU → 可淘汰
+  // ...
+}
+```
+
+### 9.0c 三种 Pin 机制触发 Get/Release 的代码路径对比
+
+**路径1: PullManager::TryPinObject**
+
+```
+Pin:
+  pull_manager.cc:602  pin_object_(object_id)
+  → main.cc:844 lambda → node_manager->GetObjectsFromPlasma()
+  → node_manager.cc:2569  store_client_->Get()             [PlasmaClient #2]
+  → client.cc:390  InsertObjectInUse(count=1)              [client count 0→1]
+  → [IPC: GetRequest] → store.cc:144  AddReference         [server ref +1]
+  → 返回 unique_ptr<RayObject> → pinned_objects_[id] = std::move(ref)
+
+Unpin:
+  pull_manager.cc:628  pinned_objects_.erase(it)           [unique_ptr<RayObject> 销毁]
+  → ~RayObject → shared_ptr<Buffer> 归零 → ~PlasmaBuffer()
+  → client.cc:500  count -= 1 (1→0)                       [client count →0]
+  → client.cc:517  MarkObjectUnused + SendReleaseRequest
+  → [IPC: ReleaseRequest] → store.cc:256  RemoveReference  [server ref -1]
+  → 如果 ref=0 → EndObjectAccess → 加入 LRU
+```
+
+**路径2: PinLeaseArgs**
+
+```
+Pin:
+  local_lease_manager.cc:789  get_lease_arguments_(deps, &args)
+  → main.cc:993 lambda → node_manager->GetObjectsFromPlasma()
+  → node_manager.cc:2569  store_client_->Get()             [PlasmaClient #2]
+  → client.cc:390  InsertObjectInUse(count=1)              [client count 0→1]
+  → [IPC: GetRequest] → store.cc:144  AddReference         [server ref +1]
+  → local_lease_manager.cc:849  pinned_lease_arguments_.emplace(dep, {RayObject, refcount=0})
+  → local_lease_manager.cc:853  refcount++ (每个使用此参数的 lease)
+
+Unpin:
+  local_lease_manager.cc:873  refcount--                   [逻辑 refcount 递减]
+  → if refcount == 0:
+    local_lease_manager.cc:877  pinned_lease_arguments_.erase(arg_it)  [unique_ptr 销毁]
+    → ~RayObject → shared_ptr<Buffer> 归零 → ~PlasmaBuffer()
+    → client.cc:500  count -= 1 (1→0)                      [client count →0]
+    → client.cc:517  MarkObjectUnused + SendReleaseRequest
+    → [IPC: ReleaseRequest] → store.cc:256  RemoveReference [server ref -1]
+    → 如果 ref=0 → EndObjectAccess → 加入 LRU
+```
+
+**路径3: PinObjectsAndWaitForFree**
+
+```
+Pin:
+  node_manager.cc:2597  GetObjectsFromPlasma(object_ids, &results)
+  → node_manager.cc:2569  store_client_->Get()             [PlasmaClient #2]
+  → client.cc:390  InsertObjectInUse(count=1)              [client count 0→1]
+  → [IPC: GetRequest] → store.cc:144  AddReference         [server ref +1]
+  → local_object_manager.cc:67  pinned_objects_.emplace(id, std::move(object))
+  → local_object_manager.cc:57-98  订阅 WorkerObjectEviction
+
+Unpin:
+  local_object_manager.cc:135  pinned_objects_.erase(pinned_objects_it)  [unique_ptr 销毁]
+  → ~RayObject → shared_ptr<Buffer> 归零 → ~PlasmaBuffer()
+  → client.cc:500  count -= 1 (1→0)                       [client count →0]
+  → client.cc:517  MarkObjectUnused + SendReleaseRequest
+  → [IPC: ReleaseRequest] → store.cc:256  RemoveReference  [server ref -1]
+  → 如果 ref=0 → EndObjectAccess → 加入 LRU
+```
+
+**三种路径的核心共同点**：
+
+1. 都通过 `PlasmaClient #2` 的 `Get()` 获取 RayObject → `InsertObjectInUse(count=1)` + server `AddReference`
+2. 都通过 `unique_ptr<RayObject>` 销毁 → `~PlasmaBuffer()` → `PlasmaClient::Release()` + server `RemoveReference`
+3. PlasmaClient 只看到 client count（每个 client 独立计数），不知道 RayObject 被谁持有
+4. Server 只看到 ref_count（所有 client 引用之和），不知道哪个 client 持有
+
+**关键差异**：PlasmaClient #2 的 `Get()` 每次调用对同一对象都会 `IncrementObjectCount`（如果已在 `objects_in_use_` 中），所以同一 client 连续 Get 同一对象，client count 会叠加。但三种机制各持有一个 `unique_ptr<RayObject>`，每个 RayObject 持有独立的 `PlasmaBuffer` → Slice 链，释放时各走各的 `~PlasmaBuffer()` → `Release()`。
+
+### 9.1 RequestLeaseDependencies — Pull 的触发入口
+
+Lease 调度时，`LocalLeaseManager` 通过 `LeaseDependencyManager` 发起依赖拉取：
+
+```cpp
+// local_lease_manager.cc
+void LocalLeaseManager::ScheduleAndGrantLeases() {
+  for (auto &lease : leases_to_try) {
+    // Step 1: 检查依赖是否本地已有
+    if (!lease_dependency_manager_.IsLeaseReady(lease_id)) {
+      // Step 2: 依赖不全 → RequestLeaseDependencies
+      lease_dependency_manager_.RequestLeaseDependencies(
+          lease_id, lease.specification().DependencyIds());
+      continue;
+    }
+    // Step 3: 依赖就绪 → PinLeaseArgsIfMemoryAvailable → GrantLease
+    ...
+  }
+}
+```
+
+```cpp
+// lease_dependency_manager.cc
+void LeaseDependencyManager::RequestLeaseDependencies(
+    const LeaseID &lease_id, const std::vector<ObjectID> &dependencies) {
+  auto &lease_entry = lease_entries_[lease_id];
+
+  // 记录依赖关系到 required_objects_
+  for (const auto &obj_id : dependencies) {
+    required_objects_[obj_id].dependent_leases.insert(lease_id);
+    lease_entry->dependencies_.insert(obj_id);
+  }
+
+  // 检查哪些依赖缺失 → 需要远程拉取
+  std::vector<ObjectID> required_objects;
+  for (const auto &obj_id : dependencies) {
+    if (!local_objects_.contains(obj_id)) {
+      required_objects.push_back(obj_id);
+    }
+  }
+
+  if (!required_objects.empty()) {
+    // 发起 Pull 请求
+    lease_entry->pull_request_id_ = object_manager_.Pull(required_objects, TASK_ARGS);
+    // → ObjectManager::Pull → PullManager::Pull
+    // → PullManager 开始从远端 fetch objects → 异步回调
+  } else {
+    // 所有依赖都在本地 → 直接标记就绪
+    lease_entry->SetReady();
+  }
+}
+```
+
+**Pull 请求的生命周期绑定**：`pull_request_id_` 存储在 lease_entry 中，后续 lease 取消/完成时通过 `RemoveLeaseDependencies` 使用此 ID 调用 `CancelPull`。
+
+### 9.2 数据接收（Remote Push → 本地 Create + Write + Seal + Release）
 
 ```
 远端Push数据:
@@ -680,7 +1332,7 @@ bool CoreWorker::PinExistingReturnObject(const ObjectID &return_id, ...) {
         → EndObjectAccess → 加入LRU! evictable!
 ```
 
-### 9.2 add_object_callback_ 触发 PinNewObjectIfNeeded（恢复 server ref）
+### 9.3 add_object_callback_ 触发 PinNewObjectIfNeeded（恢复 server ref）
 
 ```
 plasma store线程: Seal → add_object_callback_(post到raylet main_service)
@@ -737,74 +1389,211 @@ pin_object_ 回调:
   → 返回 RayObject → pinned_objects_.emplace (pull_manager持有)
 ```
 
-### 9.3 Worker Get（使用对象）
+### 9.4 Pull 完成 → HandleObjectLocal → Lease 依赖递减
 
 ```
-HandleObjectLocal:
-  → node_manager.cc:2448 通知等待的worker
-  → worker收到 PlasmaObjectReady RPC
-  → worker 调 GetObjectsFromPlasmaStore
-    → [IPC: GetRequest] → AddToClientObjectIds → AddReference  server ref: 1→2
-
-  worker 用完后 Release:
-    → [IPC: ReleaseRequest] → RemoveFromClientObjectIds → RemoveReference  server ref: 2→1
+Pull 数据到达本地 plasma:
+  → ObjectManager::HandleObjectAdded → PullManager::PinNewObjectIfNeeded
+    → TryPinObject (如果 active pull)
+  → NodeManager::HandleObjectLocal
+    → LeaseDependencyManager::HandleObjectLocal(object_id)
+      → 遍历 required_objects_[object_id].dependent_leases
+      → 对每个 lease: DecrementMissingDependencies
+        → 当该 lease 所有依赖都到达:
+          → lease 状态变为 ready → 进入调度队列
 ```
 
-### 9.4 Pull request 取消 → Unpin
+### 9.5 Lease 调度 — PinLeaseArgs 接管保护
 
+Lease 依赖全部就绪后，`LocalLeaseManager` 尝试 pin 参数对象并调度：
+
+```cpp
+// local_lease_manager.cc
+bool LocalLeaseManager::PinLeaseArgsIfMemoryAvailable(
+    const LeaseSpecification &spec, bool *args_missing) {
+  std::vector<std::unique_ptr<RayObject>> args;
+  // get_lease_arguments_ = NodeManager::GetObjectsFromPlasma (main.cc:959)
+  if (!get_lease_arguments_(spec.DependencyIds(), &args)) {
+    *args_missing = true;
+    return false;
+  }
+  // 检查 pinned_lease_arguments_bytes_ 是否超限
+  int64_t args_size = ComputeArgsSize(args);
+  if (pinned_lease_arguments_bytes_ + args_size > GetPinnedArgsLimit()) {
+    return false;
+  }
+  PinLeaseArgs(spec, std::move(args));
+  return true;
+}
 ```
-Pull request 取消的三个触发场景:
 
-1. Worker 的 Get 请求完成（依赖满足）
-   → lease_dependency_manager.cc:156
-     → object_manager_.CancelPull(pull_request_id)
-
-2. Worker 断连
-   → lease_dependency_manager.cc:194
-     → object_manager_.CancelPull(pull_request_id)
-
-3. Lease 的依赖不再需要（Task被调度或取消）
-   → lease_dependency_manager.cc:263
-     → object_manager_.CancelPull(pull_request_id)
-
-CancelPull 链路:
-  → pull_manager.cc:317 CancelPull
-    → pull_manager.cc:325 if(bundles.active_requests.count(request_id) > 0):
-      → DeactivateBundlePullRequest
-        → pull_manager.cc:185 遍历request.objects_
-        → pull_manager.cc:188 if(it->second.empty()):
-          → pull_manager.cc:197 UnpinObject(obj_id)
-
-UnpinObject:
-  // pull_manager.cc:625
-  void PullManager::UnpinObject(const ObjectID &object_id) {
-    auto it = pinned_objects_.find(object_id);
-    if (it != pinned_objects_.end()) {
-      pinned_objects_size_ -= it->second->GetSize();
-      pinned_objects_.erase(it);  // RayObject析构 → PlasmaClient::Release
+```cpp
+// local_lease_manager.cc
+void LocalLeaseManager::PinLeaseArgs(
+    const LeaseSpecification &lease_spec,
+    std::vector<std::unique_ptr<RayObject>> args) {
+  auto &lease_entry = lease_entries_[lease_spec.LeaseId()];
+  for (size_t i = 0; i < args.size(); i++) {
+    const auto &dep_id = lease_spec.DependencyIds()[i];
+    if (args[i] != nullptr) {
+      lease_entry->pinned_lease_arguments_[dep_id] = {
+          std::move(args[i]), /*refcount=*/1};
+      pinned_lease_arguments_bytes_ += args[i]->GetSize();
+      // RayObject 持有 plasma buffer → server ref +1 (PlasmaClient #2)
     }
   }
-
-  → RayObject 析构 → PlasmaClient::Release
-    → [IPC: ReleaseRequest] → server ref 1→0 → 加入LRU → 可淘汰
+}
 ```
 
-### 9.5 Pull 路径完整时序
+**PinLeaseArgs 使用的 PlasmaClient 路径**：
 
 ```
-时间    pull_manager (raylet client)     worker (worker client)     server ref
-──────────────────────────────────────────────────────────────────────────────
-T1      PinNewObjectIfNeeded → Get       -                           1
-T2      持有 pin                          Get → 加入                  2
-T3      CancelPull → UnpinObject          持有 RayObject               1
-        → RayObject析构
-        → raylet ReleaseRequest
-T4      -                                  用完 → RayObject析构          0
-                                           → worker ReleaseRequest
-                                           → 加入LRU → 可淘汰
+get_lease_arguments_ 回调:
+  // main.cc:959-962
+  [&](const std::vector<ObjectID> &object_ids,
+      std::vector<std::unique_ptr<RayObject>> *results) {
+    return node_manager->GetObjectsFromPlasma(object_ids, results);
+  }
+
+GetObjectsFromPlasma:
+  // node_manager.cc:2578
+  → store_client_->Get(object_ids, ...)     [PlasmaClient #2]
+    → [IPC: GetRequest] → AddToClientObjectIds → AddReference
+  → 返回 unique_ptr<RayObject>（持有 plasma buffer 引用）
 ```
 
-**Pull pin 的生命周期 = pull 请求的生命周期**，和 owner 无关。对象到了、worker 用完了、或者 worker/task 不需要了 → cancel pull → unpin → server ref=0。
+**PinLeaseArgs 接管后立即 CancelPull**：
+
+```cpp
+// PinLeaseArgsIfMemoryAvailable 成功后：
+RemoveLeaseDependencies(lease_id);
+  → lease_dependency_manager_.RemoveLeaseDependencies(lease_id)
+
+// lease_dependency_manager.cc
+void LeaseDependencyManager::RemoveLeaseDependencies(
+    const LeaseID &lease_id) {
+  auto &lease_entry = lease_entries_[lease_id];
+  for (const auto &obj_id : lease_entry->dependencies_) {
+    auto it = required_objects_.find(obj_id);
+    it->second.dependent_leases.erase(lease_id);
+    RemoveObjectIfNotNeeded(it);  // 如果无其他 lease 依赖此对象
+  }
+  if (lease_entry->pull_request_id_.has_value()) {
+    object_manager_.CancelPull(lease_entry->pull_request_id_.value());
+    // → PullManager::CancelPull → DeactivateBundlePullRequest → UnpinObject
+    // → 释放 PullManager 的 pinned_objects_ → RayObject 析构 → server ref -1
+  }
+}
+```
+
+**PinLeaseArgs 接管保护的含义**：CancelPull 释放 PullManager 的 pin 后，对象不被 LRU 淘汰，因为 PinLeaseArgs 持有的 `pinned_lease_arguments_` 中仍有 RayObject 引用（server ref 仍 > 0）。PinLeaseArgs 成为对象的新保护者。
+
+### 9.6 Lease 完成 → ReleaseLeaseArgs
+
+```cpp
+// local_lease_manager.cc
+void LocalLeaseManager::CleanupLease(const LeaseID &lease_id) {
+  auto &lease_entry = lease_entries_[lease_id];
+  ReleaseLeaseArgs(lease_id);
+  // ... 其他清理
+}
+
+void LocalLeaseManager::ReleaseLeaseArgs(const LeaseID &lease_id) {
+  auto it = lease_entries_.find(lease_id);
+  for (auto &[dep_id, arg_entry] : it->second->pinned_lease_arguments_) {
+    if (arg_entry.refcount > 0) {
+      arg_entry.refcount--;
+      pinned_lease_arguments_bytes_ -= arg_entry.object->GetSize();
+      if (arg_entry.refcount == 0) {
+        // refcount 归零 → RayObject unique_ptr 释放
+        // → RayObject 析构 → 释放持有的 plasma buffer
+        // → PlasmaClient::Release (PlasmaClient #2)
+        //   → count-=1 → count==0 → SendReleaseRequest
+        //   → [IPC: ReleaseRequest] → server ref -1
+        //   → 如果无其他 pin（PinObjectsAndWaitForFree 未持有）:
+        //     server ref → 0 → EndObjectAccess → 加入 LRU → 可淘汰
+      }
+    }
+  }
+  it->second->pinned_lease_arguments_.clear();
+}
+```
+
+**ReleaseLeaseArgs 释放后**：如果 `PinObjectsAndWaitForFree` 没有长期 pin 此对象，则 server ref 归零，对象可被 plasma LRU 淘汰。Pull 来的临时对象通常不会走 `PinObjectsAndWaitForFree`，因此 lease 完成后即可被 LRU 回收。
+
+### 9.7 CancelPull 的必要性（资源清理细节）
+
+`CancelPull` 不仅是"停止拉取"，更重要的是清理 PullManager 中的残留状态和资源：
+
+```cpp
+// pull_manager.cc
+void PullManager::CancelPull(const PullRequestID &pull_request_id) {
+  auto it = pull_request_id_to_bundles_.find(pull_request_id);
+  auto &bundles = it->second;
+
+  // 1. DeactivateBundlePullRequest → UnpinObject
+  //    释放 pinned_objects_ 中的 RayObject → plasma 引用 (server ref -1)
+
+  // 2. 清理 object_pull_requests_ — pull 状态和重试计时器
+  for (auto &[obj_id, req] : bundles.object_pull_requests) {
+    req->timer_.stop();        // 取消重试定时器
+    req->cancel_callback_();   // 取消位置订阅
+  }
+
+  // 3. 清理 active_object_pull_requests_ — admission control 配额释放
+  for (auto &obj_id : bundles.active_objects) {
+    active_object_pull_requests_.erase(obj_id);
+  }
+
+  // 4. 清理位置订阅 — object directory 位置订阅 (浪费网络开销)
+  //    取消对 object_directory 的 SubscribeObjectLocations
+}
+```
+
+| 资源 | 存储位置 | 影响 | 不清理后果 |
+|------|---------|------|-----------|
+| `pinned_objects_` | PullManager | 占用 plasma 内存配额 (server ref > 0) | 对象永不释放，内存泄漏 |
+| `object_pull_requests_` | PullManager | 维护 pull 状态和重试计时器 | 定时器持续触发无效重试 |
+| 位置订阅 | ObjectDirectory | 订阅对象位置变化 | 持续网络开销、回调触发 |
+| `active_object_pull_requests_` | PullManager | 占用 admission control 配额 | 新 pull 被限流 |
+
+### 9.8 Pull + Lease 完整时序（含 PinLeaseArgs 接管）
+
+```
+时间  PullManager pin   PinLeaseArgs pin   Worker client   Server ref   说明
+────────────────────────────────────────────────────────────────────────────────
+T1    Get → +1          -                  -               1            Pull完成,PinNewObjectIfNeeded
+T2    持有 pin           -                  -               1            PullManager 保护中
+T3    持有 pin           Get → +1           -               2            PinLeaseArgsIfMemoryAvailable
+T4    CancelPull         持有 pin           -               1            UnpinObject 释放 PullManager ref
+     → UnpinObject →    (接管保护)                                        PinLeaseArgs 独占保护
+     → RayObject析构
+     → ReleaseRequest
+T5    -                  持有 pin           Get → +1        2            Worker 获取参数
+T6    -                  持有 pin           持有引用        2            任务执行中
+T7    -                  持有 pin           Release → -1    1            Worker 用完释放
+T8    -                  ReleaseLeaseArgs   -               0            CleanupLease
+     -                  → RayObject析构
+                        → ReleaseRequest
+                                                      → EndObjectAccess
+                                                      → 加入LRU → 可淘汰
+```
+
+**关键转折点 T3→T4**：PinLeaseArgs 获取引用后立即 CancelPull，两者交接保护权。这是无间隙的——PinLeaseArgs 的 Get 在 CancelPull 的 UnpinObject 之前完成，所以 server ref 在交接期间为 2，始终 > 0，对象不会被 LRU 淘汰。
+
+**Pull pin 的生命周期 = pull 请求的生命周期**，和 owner 无关。PinLeaseArgs 的生命周期 = lease 的生命周期。两者接力保护对象不被 LRU，直到 lease 完成。
+
+### 9.9 RemoveLeaseDependencies 的调用场景
+
+`RemoveLeaseDependencies`（含 CancelPull）在以下场景触发（均在 `local_lease_manager.cc`）：
+
+| 行号 | 场景 | 说明 |
+|------|------|------|
+| ~495 | Spillback | lease 被调度到其他节点，取消本地 pull |
+| ~542 | Unschedulable | lease 无法调度，spillback |
+| ~604 | 等待队列移除 | lease 从等待队列移除 |
+| ~905 | CancelWaitingLease | 基于谓词取消等待中的 lease |
+| ~943 | CancelLeaseToGrantWithoutReply | 取消已授权但未回复的 lease |
 
 ---
 
@@ -1732,3 +2521,97 @@ condition: !request.spilled_url.empty() && request.spilled_node_id.IsNil()
 | `object_manager/object_manager.cc` | 355 | `PushLocalObject` | 从内存推送 |
 | `object_manager/object_manager.cc` | 411 | `PushFromFilesystem` | 从 spill 文件推送 |
 | `object_manager/spilled_object_reader.cc` | 29 | `CreateSpilledObjectReader` | 从 URL 创建磁盘读取器 |
+
+---
+
+## 21. 对象生命周期与引用保护层级
+
+Ray 中 pull 到的临时对象有多层引用保护，各层独立、释放互不影响：
+
+| 保护层 | Pin 方式 | 上报 Owner | 订阅 Eviction | Spill/Delete | 释放时机 |
+|--------|----------|-----------|--------------|-------------|---------|
+| PullManager pin | plasma 客户端引用 | 不上报 | 不订阅 | 不涉及 | CancelPull → UnpinObject |
+| PinLeaseArgs | plasma 客户端引用 | 不上报 | 不订阅 | 不涉及 | CleanupLease → ReleaseLeaseArgs |
+| PinObjectsAndWaitForFree | plasma 客户端引用 + 订阅 | 上报 Owner | 订阅 WorkerObjectEviction | 完整生命周期 | Owner GC / Owner 死亡 |
+
+**PullManager pin**：`TryPinObject` 获取 plasma 引用，`CancelPull` → `DeactivateBundlePullRequest` → `UnpinObject` 释放。只保护"拉取意图"和临时引用。
+
+**PinLeaseArgs**：`PinLeaseArgsIfMemoryAvailable` 获取 plasma 引用（refcount++），`ReleaseLeaseArgs` 释放（refcount--，归零时释放 RayObject unique_ptr）。只在 lease 调度期间保护参数不被 LRU。
+
+**PinObjectsAndWaitForFree**：只有 recovery / tidal transfer / restore 场景才触发，长期 pin，owner GC 时释放，走完整 spill → delete 生命周期。
+
+PullManager 的 `PinNewObjectIfNeeded` 不等于 `PinObjectsAndWaitForFree`：
+- PullManager pin 只是 plasma 客户端引用级 pin，不上报 Owner，不订阅 eviction
+- `PinObjectsAndWaitForFree` 是长期 pin，上报 Owner，走完整 spill/delete 生命周期
+- Pull 来的临时对象如果不走 `PinObjectsAndWaitForFree`，lease 完成后可被 LRU 淘汰
+
+**三层保护的接力关系**（详见第9.3-9.7节完整代码逻辑）：
+
+```
+PullManager pin ──(PinLeaseArgs 接管)──→ PinLeaseArgs pin ──(lease 完成)──→ 无保护 → LRU 可淘汰
+                                            │
+                                            └─(如果对象被 Owner pin)──→ PinObjectsAndWaitForFree
+                                                                       └─(Owner GC)──→ ReleaseFreedObject
+```
+
+---
+
+## 22. HandleObjectMissing vs HandleObjectFreed
+
+| | HandleObjectMissing | HandleObjectFreed |
+|---|---|---|
+| **触发原因** | plasma LRU 淘汰，object 从内存中消失 | owner worker 通知 object out of scope（GC 释放） |
+| **语义** | "内存中没了，但磁盘副本仍有效" | "对象生命周期结束，磁盘副本也应该删除" |
+| **对 spilled entry** | 保留（磁盘副本还在，可 restore） | 删除（owner 不要了，磁盘也要清掉） |
+| **对 spilled_replicated_bytes_current_** | 不减（磁盘占用还在） | 减（磁盘占用释放） |
+| **对 subscription** | spilled entry 保留订阅不变 | 取消订阅 |
+| **是否触发磁盘删除** | 否 | 是（`on_spilled_replicated_delete_` → 入 delete 队列） |
+
+---
+
+## 23. Pull 依赖对象的完整生命周期（概览）
+
+> 完整代码逻辑详见第9.1-9.8节。此处为精简的流程概览。
+
+```
+① RequestLeaseDependencies
+│  ├─ 记录依赖关系到 required_objects_
+│  └─ lease_entry->pull_request_id_ = object_manager_.Pull(required_objects, TASK_ARGS)
+│     → PullManager 开始从远端 fetch objects → PinNewObjectIfNeeded（plasma 级 pin）
+
+② Pull 完成 → 对象到达本地 plasma
+│  ├─ HandleObjectLocal → DecrementMissingDependencies
+│  │  → 所有依赖就绪 → lease 进入调度队列
+│  └─ PullManager.PinNewObjectIfNeeded → TryPinObject（plasma 客户端引用级 pin）
+
+③ Lease 调度 — PinLeaseArgs 接管保护
+│  ├─ PinLeaseArgsIfMemoryAvailable → get_lease_arguments_ → PinLeaseArgs
+│  │  → pinned_lease_arguments_[dep] = (RayObject, refcount++)  // 防止 LRU 淘汰
+│  ├─ RemoveLeaseDependencies → CancelPull(pull_request_id_)
+│  │  → PullManager.DeactivateBundlePullRequest → UnpinObject（释放 PullManager pin）
+│  │  // 此时 PinLeaseArgs 已接管保护，对象不会被 LRU
+│  └─ PopWorker → GrantLease → worker 执行任务
+
+④ Lease 完成
+   └─ CleanupLease → ReleaseLeaseArgs
+      → pinned_lease_arguments_[dep].refcount--
+      → refcount == 0 → 释放 RayObject unique_ptr
+         → 如果 PinObjectsAndWaitForFree 没有长期 pin → 对象可被 plasma LRU 淘汰
+```
+
+---
+
+## 24. CancelPull 的必要性
+
+> 完整代码逻辑详见第9.6节。此处为精简要点。
+
+`CancelPull` 不仅是"停止拉取"，更重要的是清理 PullManager 中的残留状态和资源：
+
+| 资源 | 存储位置 | 影响 | 不清理后果 |
+|------|---------|------|-----------|
+| `pinned_objects_` | PullManager | 占用 plasma 内存配额 (server ref > 0) | 对象永不释放，内存泄漏 |
+| `object_pull_requests_` | PullManager | 维护 pull 状态和重试计时器 | 定时器持续触发无效重试 |
+| 位置订阅 | ObjectDirectory | 订阅对象位置变化 | 持续网络开销、回调触发 |
+| `active_object_pull_requests_` | PullManager | 占用 admission control 配额 | 新 pull 被限流 |
+
+Pull 完成后如果不 CancelPull，这些资源永远不会被清理。

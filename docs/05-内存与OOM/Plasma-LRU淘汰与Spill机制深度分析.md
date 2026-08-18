@@ -17,6 +17,14 @@
 13. [Dashboard Object Store Memory 指标追踪](#13-dashboard-object-store-memory-指标追踪)
 14. [关键数值汇总](#14-关键数值汇总)
 15. [源码索引](#15-源码索引)
+16. [Primary Object Spill 后的 Delete 流程](#16-primary-object-spill-后的-delete-流程)
+17. [Replicated Object Spill 后的 Delete 流程](#17-replicated-object-spill-后的-delete-流程)
+18. [HandleObjectMissing vs HandleObjectFreed](#18-handleobjectmissing-vs-handleobjectfreed)
+19. [Pull 依赖对象的完整生命周期](#19-pull-依赖对象的完整生命周期)
+20. [CancelPull 的必要性](#20-cancelpull-的必要性)
+21. [Fused Spill 文件与指标语义](#21-fused-spill-文件与指标语义)
+22. [Spill 指标体系](#22-spill-指标体系)
+23. [代码修改记录](#23-代码修改记录)
 
 ---
 
@@ -1872,3 +1880,146 @@ Eviction (真正淘汰):
 | `node_manager.cc` | `HandleGetNodeStats`, FlushFreeObjects 定时器 | gRPC GetNodeStats 处理 + 定期 flush |
 | `datacenter.py` | `DataOrganizer.get_node_info` | Dashboard 后端数据转换 |
 | `NodeRow.tsx` / `index.tsx` | PercentageBar | Dashboard 前端显示 |
+
+---
+
+## 16. Primary Object Spill 后的 Delete 流程
+
+1. **Owner GC 触发** → `ReleaseFreedObject(object_id)`
+   - 如果还在 `pinned_objects_`（未 spill）：直接释放内存，无需删磁盘
+   - 如果已 spill（不在 `pinned_objects_`）：标记 `is_freed_=true`，push 进 `spilled_object_pending_delete_` 队列
+
+2. **ProcessSpilledObjectsDeleteQueue** 处理队列：
+   - 在 `spilled_objects_url_` 中找到 URL → 递减 `url_ref_count_`，ref=0 时收集 URL 删磁盘
+   - 递减 `spilled_bytes_current_`（primary spill 当前值）
+   - 删除 `local_objects_entry`
+
+3. **DeleteSpilledObjects** 发送 RPC 给 IO worker 删磁盘文件（失败重试最多 3 次）
+
+---
+
+## 17. Replicated Object Spill 后的 Delete 流程
+
+1. **Owner GC 触发** → `ReplicatedObjectManager::HandleObjectFreed(object_id)`
+   - 如果还在 `replicated_objects_`（未 spill）：释放 pinned 内存
+   - 如果已 spill（在 `spilled_object_ids_`）：
+     - 递减 `spilled_replicated_bytes_current_`
+     - erase `spilled_object_ids_`
+     - 调用 `on_spilled_replicated_delete_` → `EnqueueSpilledObjectForDelete` → push 进 `spilled_object_pending_delete_` 队列
+   - 如果正在 spill（在 `pending_free_object_ids_`）：推迟到 `OnSpillComplete`
+
+2. **ProcessSpilledObjectsDeleteQueue** 处理队列：
+   - `spilled_objects_url_` 中有 replicated 对象的 entry（`OnObjectSpilled` 对所有对象都 emplace 了）
+   - 可以找到 URL → 递减 `url_ref_count_`，ref=0 时删磁盘
+   - `is_replicated = !local_objects_.contains(object_id)` 为 true，不会递减 `spilled_bytes_current_`（正确）
+
+磁盘文件删除流程完整：replicated 对象的 `url_ref_count_` 和磁盘删除都能正确执行，无泄漏。
+
+---
+
+## 18. HandleObjectMissing vs HandleObjectFreed
+
+| | HandleObjectMissing | HandleObjectFreed |
+|---|---|---|
+| **触发原因** | plasma LRU 淘汰，object 从内存中消失 | owner worker 通知 object out of scope（GC 释放） |
+| **语义** | "内存中没了，但磁盘副本仍有效" | "对象生命周期结束，磁盘副本也应该删除" |
+| **对 spilled entry** | 保留（磁盘副本还在，可 restore） | 删除（owner 不要了，磁盘也要清掉） |
+| **对 spilled_replicated_bytes_current_** | 不减（磁盘占用还在） | 减（磁盘占用释放） |
+| **对 subscription** | spilled entry 保留订阅不变 | 取消订阅 |
+| **是否触发磁盘删除** | 否 | 是（`on_spilled_replicated_delete_` → 入 delete 队列） |
+
+---
+
+## 19. Pull 依赖对象的完整生命周期
+
+```
+① RequestLeaseDependencies
+│  ├─ 记录依赖关系到 required_objects_
+│  └─ lease_entry->pull_request_id_ = object_manager_.Pull(required_objects, TASK_ARGS)
+│     → PullManager 开始从远端 fetch objects → PinNewObjectIfNeeded（plasma 级 pin）
+
+② Pull 完成 → 对象到达本地 plasma
+│  ├─ HandleObjectLocal → HandleObjectLocal → DecrementMissingDependencies
+│  │  → 所有依赖就绪 → lease 进入调度队列
+│  └─ PullManager.PinNewObjectIfNeeded → TryPinObject（plasma 客户端引用级 pin）
+
+③ Lease 调度 — PinLeaseArgs 接管保护
+│  ├─ PinLeaseArgsIfMemoryAvailable → get_lease_arguments_ → PinLeaseArgs
+│  │  → pinned_lease_arguments_[dep] = (RayObject, refcount++)  // 防止 LRU 淘汰
+│  │
+│  ├─ RemoveLeaseDependencies → CancelPull(pull_request_id_)
+│  │  → PullManager.DeactivateBundlePullRequest → UnpinObject（释放 PullManager pin）
+│  │  // 此时 PinLeaseArgs 已接管保护，对象不会被 LRU
+│  │
+│  └─ PopWorker → GrantLease → worker 执行任务
+
+④ Lease 完成
+   └─ CleanupLease → ReleaseLeaseArgs
+      → pinned_lease_arguments_[dep].refcount--
+      → refcount == 0 → 释放 RayObject unique_ptr
+         → 如果 PinObjectsAndWaitForFree 没有长期 pin → 对象可被 plasma LRU 淘汰
+```
+
+---
+
+## 20. CancelPull 的必要性
+
+`CancelPull` 不仅是"停止拉取"，更重要的是清理 PullManager 中的残留状态和资源：
+
+1. **pinned_objects_** — 持有 plasma 客户端引用（占用内存配额）
+2. **object_pull_requests_** — 维护 pull 状态和重试计时器
+3. **object directory 位置订阅** — 订阅对象位置变化（浪费网络开销）
+4. **active_object_pull_requests_** — 占用 admission control 配额
+
+Pull 完成后如果不 CancelPull，这些资源永远不会被清理。
+
+---
+
+## 21. Fused Spill 文件与指标语义
+
+Ray 的 fused spill 机制将多个 object 合并写入同一个文件，`url_ref_count_` 记录每个 base URL 的引用数。
+
+`spilled_bytes_current_`（Primary）和 `spilled_replicated_bytes_current_`（Replicated）的含义：
+
+- **递增时机**：`OnObjectSpilled` / `OnSpillComplete` 时，对象成功 spill 到磁盘
+- **递减时机**：
+  - Primary：`ProcessSpilledObjectsDeleteQueue` 中，从 `spilled_objects_url_` 删 entry 时
+  - Replicated：`HandleObjectFreed` / `ReleasePins` 中，owner GC 时
+- **语义**："仍有效的 spill 字节数"（对象逻辑上未 free），不等于实际磁盘占用
+
+由于 fused spill 文件机制：
+- 递减 `spilled_bytes_current_` 时只是 `url_ref_count_--`，磁盘文件可能还在（ref_count > 0）
+- 只有 `url_ref_count_ == 0` 时才真正删磁盘文件
+- RPC 删除可能失败（最多重试 3 次）
+
+---
+
+## 22. Spill 指标体系
+
+| 指标 | 类型 | tag | 含义 |
+|------|------|-----|------|
+| `spill_manager_objects_bytes{Spilled,Primary}` | Gauge | State=Spilled, Source=Primary | Primary spill 仍有效字节数 |
+| `spill_manager_objects_bytes{Spilled,Replicated}` | Gauge | State=Spilled, Source=Replicated | Replicated spill 仍有效字节数 |
+| `spill_manager_objects{OnDisk}` | Gauge | State=OnDisk | 磁盘上残留的 fused spill 文件数量（`url_ref_count_.size()`） |
+| `spill_manager_objects{PendingDelete}` | Gauge | State=PendingDelete | delete 队列深度 |
+| `spill_manager_request_total{FailedDeletion}` | Counter | Type=FailedDeletion | 删除 RPC 失败次数 |
+
+泄漏检测方法：
+- OnDisk 文件数量持续增长但 Spilled 字节数平稳 → fused file 未及时删除
+- FailedDeletion 增长 → 删除 RPC 失败
+- `spilled_bytes_current_` + `spilled_replicated_bytes_current_` 对比 OnDisk，差值反映"fused file 中对象已 free 但文件未删"的部分
+
+三者的关系：OnDisk(文件数) >= 0，Spilled(字节数)反映逻辑状态，两者独立。如果 OnDisk 持续增长而 Spilled 下降，说明 fused file 泄漏。
+
+---
+
+## 23. 代码修改记录
+
+| 修改 | 文件 | 说明 |
+|------|------|------|
+| RAY_CHECK 下溢保护 | `replicated_object_manager.cc` | `HandleObjectFreed` / `ReleasePins` / `RestoreSpilledReplicatedObject` 中 `spilled_replicated_bytes_current_` 减操作前加 RAY_CHECK |
+| OnSpillComplete 优化 | `replicated_object_manager.cc` | 提前检查 `pending_free_object_ids_`，避免不必要的 emplace+erase |
+| 删除无用累计指标 | `node_manager.proto`, `local_object_manager.h/cc` | 删除 `spilled_bytes_primary` / `spilled_bytes_replicated` / `spilled_objects_primary` / `spilled_objects_replicated` 及相关代码 |
+| OnDisk gauge | `node_manager.proto`, `local_object_manager.cc` | 新增 `spilled_files_on_disk` proto 字段和 `spill_manager_objects{OnDisk}` gauge |
+| 命名一致性 | `local_object_manager.cc` | Restored → RestoredTotal，与 SpilledTotal 一致 |
+| 代码清理 | `local_object_manager.cc` | 合并 `OnObjectSpilled` 中两个连续的 `if (is_replicated)` 块，DebugString 补充 OnDisk 信息 |
