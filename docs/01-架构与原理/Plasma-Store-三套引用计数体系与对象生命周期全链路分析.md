@@ -722,37 +722,135 @@ PlasmaError PlasmaStore::CreateObject(const ray::ObjectInfo &object_info,
 | `CreateObject` 中 | `store.cc:191` | 新建对象后立即注册 client（Part A → Part B 同函数） | 0→1（首次） |
 | Get 请求回调中 | `store.cc:108` | 对象已存在，新 client 通过 Get 获取时注册 | N→N+1 |
 
-**Step 6: ObjectLifecycleManager::CreateObject — 纯内存分配（ref_count = 0）**
+**Step 6: ObjectStore vs ObjectLifecycleManager — 分层架构与 object_table_**
+
+Plasma Store 内部分三层，各司其职：
+
+```
+┌──────────────────────────────────────────────────────────┐
+│ PlasmaStore (store.cc)                                    │
+│  - IPC 收发（CreateRequest/GetRequest/ReleaseRequest）    │
+│  - client 管理（AddToClientObjectIds/RemoveFromClient...） │
+│  - 调用 ObjectLifecycleManager 的接口                     │
+├──────────────────────────────────────────────────────────┤
+│ ObjectLifecycleManager (obj_lifecycle_mgr.cc)             │
+│  - ref_count 操作（AddReference/RemoveReference）         │
+│  - 生命周期控制（CreateObjectInternal/EvictObjects/      │
+│    DeleteObjectInternal/SealObject）                      │
+│  - 持有 object_store_ (unique_ptr<IObjectStore>)          │
+│  - 持有 eviction_policy_ (unique_ptr<EvictionPolicy>)     │
+├──────────────────────────────────────────────────────────┤
+│ ObjectStore (object_store.cc)                             │
+│  - 纯内存操作（CreateObject/SealObject/DeleteObject）     │
+│  - 持有 object_table_ — 所有对象的存储表                  │
+│  - 分配器调用（allocator_.Allocate/Free）                 │
+│  - 不知道 ref_count、client、eviction 的存在              │
+└──────────────────────────────────────────────────────────┘
+```
+
+**ObjectLifecycleManager 持有 ObjectStore 的方式**：
 
 ```cpp
-// obj_lifecycle_mgr.cc:40-62
-std::pair<const LocalObject *, PlasmaError> ObjectLifecycleManager::CreateObject(
-    const ray::ObjectInfo &object_info, ...) {
-  if (object_store_->GetObject(object_info.object_id) != nullptr) {
-    return {nullptr, PlasmaError::ObjectExists};  // 对象已存在
-  }
-  auto entry = CreateObjectInternal(object_info, source, fallback_allocator);
-  // CreateObjectInternal 只创建 LocalObject，ref_count_ 初始 = 0
-  // ref_count 递增在 CreateObject 的调用者中通过 AddToClientObjectIds 完成
-  if (entry == nullptr) { return {nullptr, PlasmaError::OutOfMemory}; }
-  eviction_policy_->ObjectCreated(object_info.object_id);
-  return {entry, PlasmaError::OK};
+// obj_lifecycle_mgr.h:161
+std::unique_ptr<IObjectStore> object_store_;
+
+// obj_lifecycle_mgr.cc:28-33 构造
+ObjectLifecycleManager::ObjectLifecycleManager(IAllocator &allocator, ...)
+    : object_store_(std::make_unique<ObjectStore>(allocator)),
+      eviction_policy_(std::make_unique<EvictionPolicy>(*object_store_, allocator)),
+      delete_object_callback_(std::move(delete_object_callback)),
+      stats_collector_(std::make_unique<ObjectStatsCollector>()) {}
+```
+
+**object_table_ — 所有对象的存储表**：
+
+```cpp
+// object_store.h:59-100
+class ObjectStore : public IObjectStore {
+ public:
+  const LocalObject *CreateObject(...) override;   // emplace 到 object_table_
+  const LocalObject *GetObject(const ObjectID &) const override;  // find
+  const LocalObject *SealObject(const ObjectID &) override;       // 修改 state_
+  bool DeleteObject(const ObjectID &) override;    // erase + allocator_.Free
+
+ private:
+  IAllocator &allocator_;
+  absl::flat_hash_map<ObjectID, std::unique_ptr<LocalObject>> object_table_;  // ★ 核心存储
+};
+
+// object_store.cc:30-64
+const LocalObject *ObjectStore::CreateObject(const ray::ObjectInfo &object_info,
+                                              plasma::flatbuf::ObjectSource source,
+                                              bool fallback_allocate) {
+  RAY_CHECK(!object_table_.contains(object_info.object_id));
+  auto allocation = fallback_allocate ? allocator_.FallbackAllocate(object_size)
+                                      : allocator_.Allocate(object_size);
+  if (!allocation.has_value()) { return nullptr; }
+  auto ptr = std::make_unique<LocalObject>(std::move(allocation.value()));
+  // ★ LocalObject 构造时 ref_count_ = 0（common.h:106）
+  auto entry = object_table_.emplace(object_info.object_id,
+                                     std::move(ptr)).first->second.get();
+  entry->object_info_ = object_info;
+  entry->state_ = ObjectState::PLASMA_CREATED;  // 未 Seal
+  entry->source_ = source;
+  return entry;
 }
 
-// obj_lifecycle_mgr.cc:181-219
-const LocalObject *ObjectLifecycleManager::CreateObjectInternal(
-    const ray::ObjectInfo &object_info, ...) {
-  // 循环最多 11 次 LRU 淘汰尝试分配内存
-  for (int num_tries = 0; num_tries <= 10; num_tries++) {
-    auto result = object_store_->CreateObject(object_info, source, /*fallback=*/false);
-    if (result != nullptr) { return result; }
-    // RequireSpace → EvictObjects → 重试
-    ...
-  }
-  // fallback 分配（磁盘 mmap）
-  return object_store_->CreateObject(object_info, source, /*fallback=*/true);
+// object_store.cc:66-71
+const LocalObject *ObjectStore::GetObject(const ObjectID &object_id) const {
+  auto it = object_table_.find(object_id);
+  if (it == object_table_.end()) { return nullptr; }
+  return it->second.get();
+}
+
+// object_store.cc:80-88
+bool ObjectStore::DeleteObject(const ObjectID &object_id) {
+  auto entry = GetMutableObject(object_id);
+  if (entry == nullptr) { return false; }
+  allocator_.Free(std::move(entry->allocation_));  // 释放内存（dlfree）
+  object_table_.erase(object_id);                  // 从存储表移除
+  return true;
 }
 ```
+
+**LocalObject 的所有字段**：
+
+```cpp
+// common.h:104-177
+class LocalObject {
+ public:
+  explicit LocalObject(Allocation allocation)
+      : allocation_(std::move(allocation)), ref_count_(0) {}  // ★ ref_count 初始 = 0
+
+ private:
+  Allocation allocation_;              // 内存分配信息（dlmalloc 指针 + fallback fd）
+  ray::ObjectInfo object_info_;       // 对象元数据（id, size, owner 等）
+  mutable int32_t ref_count_;         // ★ server ref —— "多少个 client 连接在用"
+  int64_t create_time_;
+  int64_t construct_duration_;
+  ObjectState state_;                 // PLASMA_CREATED(1) / PLASMA_SEALED(2)
+  plasma::flatbuf::ObjectSource source_;  // CreatedByWorker / ReceivedByPull / ...
+};
+
+// common.h:36-40
+enum class ObjectState : int {
+  PLASMA_CREATED = 1,  // 已创建未 Seal
+  PLASMA_SEALED = 2,   // 已 Seal，可读
+};
+```
+
+**三层的职责边界**：
+
+| 操作 | ObjectStore | ObjectLifecycleManager | PlasmaStore |
+|------|------------|----------------------|-------------|
+| 分配内存 | `allocator_.Allocate` | - | - |
+| 创建对象（`object_table_` emplace） | ★ | → 调用 ObjectStore | - |
+| 递增 ref_count | - | ★ `AddReference` | → 调用 |
+| 递减 ref_count | - | ★ `RemoveReference` | → 调用 |
+| 从 LRU 移除/加入 | - | → 调用 EvictionPolicy | - |
+| 淘汰对象（`object_table_` erase） | ★ `DeleteObject` | → 调用 | - |
+| client 注册（AddToClientObjectIds） | - | - | ★ |
+| client 移除（RemoveFromClientObjectIds） | - | - | ★ |
 
 **Step 7: AddToClientObjectIds → AddReference（ref_count 0→1）**
 
@@ -770,70 +868,209 @@ void PlasmaStore::AddToClientObjectIds(const ObjectID &object_id, ...,
 
 // obj_lifecycle_mgr.cc:128-145
 bool ObjectLifecycleManager::AddReference(const ObjectID &object_id) {
-  auto entry = object_store_->GetObject(object_id);
+  auto entry = object_store_->GetObject(object_id);  // 从 object_table_ 查找
   if (entry->ref_count_ == 0) {
-    eviction_policy_->BeginObjectAccess(object_id);  // 从 LRU 移除，不可淘汰
+    eviction_policy_->BeginObjectAccess(object_id);  // ★ 从 LRU 移除，不可淘汰
   }
   entry->ref_count_++;  // ★ server ref_count: 0 → 1
   return true;
 }
 ```
 
-**Step 8: Client 端 — HandleCreateReply → InsertObjectInUse + IncrementObjectCount（client count 0→1→2）**
+**Step 8: Client 端 — HandleCreateReply → PlasmaMutableBuffer + InsertObjectInUse + IncrementObjectCount**
+
+Create 返回的 buffer 是 **`PlasmaMutableBuffer`**，不是 `Get` 返回的 `PlasmaBuffer`。两者析构行为完全不同：
 
 ```cpp
-// client.cc:144-209
-Status PlasmaClient::HandleCreateReply(const ObjectID &object_id, ...) {
-  // ... 接收 CreateReply flatbuffer ...
-  // ... 创建 PlasmaMutableBuffer 包装 mmap 数据 ...
+// client.cc:35-46 — Get 返回的 PlasmaBuffer：析构自动 Release
+class PlasmaBuffer : public SharedMemoryBuffer {
+ public:
+  PlasmaBuffer(std::shared_ptr<PlasmaClient> client, const ObjectID &object_id,
+               const std::shared_ptr<Buffer> &buffer)
+      : SharedMemoryBuffer(buffer, 0, buffer->Size()),
+        client_(std::move(client)), object_id_(object_id) {}
 
-  // ★ 首次注册：count = 1（"pin" 引用，PlasmaMutableBuffer 析构时 Release 减此引用）
+  ~PlasmaBuffer() override { RAY_UNUSED(client_->Release(object_id_)); }
+  // ★ 析构时自动调 Release → 可能触发 SendReleaseRequest
+ private:
+  std::shared_ptr<PlasmaClient> client_;
+  ObjectID object_id_;
+};
+
+// client.cc:48-56 — Create 返回的 PlasmaMutableBuffer：析构不 Release
+class PlasmaMutableBuffer : public SharedMemoryBuffer {
+ public:
+  PlasmaMutableBuffer(std::shared_ptr<PlasmaClient> client,
+                       uint8_t *mutable_data, int64_t data_size)
+      : SharedMemoryBuffer(mutable_data, data_size), client_(std::move(client)) {}
+  // ★ 析构时什么都不做！不调用 Release
+  // 保持 PlasmaClient 引用只是防止 client 先于 buffer 被销毁
+ private:
+  std::shared_ptr<PlasmaClient> client_;
+  // 注意：没有 object_id_ 字段 — 因为它不会调 Release
+};
+```
+
+**为什么 PlasmaMutableBuffer 析构不调 Release**：Create 返回的 buffer 是给调用方写入数据的，写入完成后必须显式调用 `Seal()` → `Release()`。如果 buffer 析构自动 Release，数据还没写完对象就被释放了。
+
+**HandleCreateReply 完整代码**：
+
+```cpp
+// client.cc:222-281
+Status PlasmaClient::HandleCreateReply(const ObjectID &object_id,
+                                       bool is_experimental_mutable_object,
+                                       const uint8_t *metadata,
+                                       uint64_t *retry_with_request_id,
+                                       std::shared_ptr<Buffer> *data) {
+  // ... 接收 CreateReply flatbuffer，获取 store_fd, mmap ...
+
+  // ★ 创建 PlasmaMutableBuffer（析构不调 Release）
+  *data = std::make_shared<PlasmaMutableBuffer>(
+      shared_from_this(),
+      GetStoreFdAndMmap(store_fd, mmap_size) + object->data_offset,
+      object->data_size);
+
+  // ★ InsertObjectInUse: count = 1
   InsertObjectInUse(object_id, std::move(object), /*is_sealed=*/false);
 
-  // ★ 二次递增：count = 2（"seal 保护"引用，确保 Create 返回的 buffer 即使出了作用域，
-  //   对象也不会在 Seal 之前被 Release。对应的 Release 在 Seal 中调用）
+  // ★ IncrementObjectCount: count = 2
+  // 注释原文: "We increment the count a second time (and the corresponding
+  // decrement will happen in a PlasmaClient::Release call in plasma_seal)
+  // so even if the buffer returned by PlasmaClient::Create goes out of scope,
+  // the object does not get released before the call to PlasmaClient::Seal
+  // happens."
   IncrementObjectCount(object_id);
 
-  // 可变对象额外 +1（count = 3）
   if (is_experimental_mutable_object) {
-    IncrementObjectCount(object_id);
+    IncrementObjectCount(object_id);  // count = 3
   }
-  // ... 返回 buffer 给调用方 ...
-}
-
-// client.cc:110-125
-void PlasmaClient::InsertObjectInUse(const ObjectID &object_id,
-                                     std::unique_ptr<PlasmaObject> object,
-                                     bool is_sealed) {
-  auto inserted = objects_in_use_.insert({object_id, std::make_unique<ObjectInUseEntry>()});
-  RAY_CHECK(inserted.second) << "Object already in use";
-  auto it = inserted.first;
-  it->second->object = std::move(*object);
-  it->second->count = 1;       // ★ client count 初始化为 1
-  it->second->is_sealed = is_sealed;
-}
-
-// client.cc:126-133
-void PlasmaClient::IncrementObjectCount(const ObjectID &object_id) {
-  auto object_entry = objects_in_use_.find(object_id);
-  RAY_CHECK(object_entry != objects_in_use_.end());
-  object_entry->second->count += 1;  // ★ client count: 1 → 2
+  return Status::OK();
 }
 ```
 
 **client count = 2 的含义**：
 
-| count | 来源 | 保护什么 | 何时释放 |
-|-------|------|---------|---------|
-| 1 | `InsertObjectInUse` | "对象正在被 client 使用" — PlasmaMutableBuffer 析构时 Release | buffer 出作用域 / 显式 Release |
-| 2 | `IncrementObjectCount` | "Seal 前保护" — 确保 Create 返回的 buffer 即使出了作用域，对象也不会被提前 Release 给 store | `Seal()` 中调用 `Release()` 减此引用 |
-| 3 (mutable) | 额外 `IncrementObjectCount` | "可变对象额外保护" | 可变对象专用的 Release |
+| count | 来源 | 保护什么 | 何时释放 | 对 server ref 影响 |
+|-------|------|---------|---------|-----------------|
+| 1 | `InsertObjectInUse` | "对象正在被 client 使用" — 基础引用 | 最终显式 `Release()` | count 归零时 → `SendReleaseRequest` → server `RemoveReference` |
+| 2 | `IncrementObjectCount` | "Seal 前保护" — 即使 `PlasmaMutableBuffer` 出作用域（**它析构不调 Release！**），或者用户意外多调一次 Release，count 也不会归零 | `Seal()` 内部调用 `Release()` | 无（只影响 client count，不影响 server ref） |
+| 3 (mutable) | 额外 `IncrementObjectCount` | 可变对象额外保护 | 可变对象专用 Release | 无 |
 
-**为什么 Create 后 count=2 而不是 1**：如果 Create 返回的 buffer（`PlasmaMutableBuffer` shared_ptr）出了作用域，其析构会调用 `Release()`，count 1→0 → 发 SendReleaseRequest → server ref=0 → 对象被淘汰。但此时数据还没写完、还没 Seal！所以 `IncrementObjectCount` 额外加 1，保证即使 buffer 引用丢了（count 2→1），也不会触发 `SendReleaseRequest`（count ≠ 0）。只有 `Seal()` 中再 Release 一次（count 1→0）才会真正释放。
+**重要澄清**：`PlasmaMutableBuffer` 析构**不调 Release**，所以它出作用域时 client count 不变。count=2 的真正保护场景是：如果用户在 Seal 之前**显式调用** `Release()`，count 从 2→1（而非 1→0），不会触发 `SendReleaseRequest`。
+
+**Create → Seal → Release 完整时序**：
+
+```
+步骤  Client 操作                         client count  server ref  LRU状态   说明
+─────────────────────────────────────────────────────────────────────────────────────
+1     InsertObjectInUse                   0→1           0→1         移除       Create reply
+2     IncrementObjectCount                1→2           1           移除       Seal 前保护
+3     PlasmaMutableBuffer 出作用域        2             1           移除       ★ 析构不调 Release！
+4     Seal() → 内部 Release               2→1           1           移除       减"seal 保护"引用
+5     用户显式 Release                    1→0           1→0         加入       ★ 触发 SendReleaseRequest
+      → MarkObjectUnused + SendReleaseRequest
+      → server RemoveReference → EndObjectAccess
+```
 
 **CreateAndSpillIfNeeded vs TryCreateImmediately**：两者 client 端 ref count 逻辑完全相同（都走 `HandleCreateReply` → count=2）。区别在 server 端调度：
 - `CreateAndSpillIfNeeded`：`try_immediately=false`，请求入 `CreateRequestQueue`，OOM 时触发 spill/GC/grace period/fallback
 - `TryCreateImmediately`：`try_immediately=true`，直接尝试分配（含 fallback），失败即返回
+
+**Step 8a: Evict 如何看 ref_count — 淘汰的充要条件**
+
+Evict 不直接"检查" ref_count==0，而是通过 **LRU cache 的成员关系**间接保证：
+
+```
+ref_count > 0 的对象 → BeginObjectAccess → 从 LRU cache 移除 → 不在 LRU 中 → 不可能被选中
+ref_count = 0 的对象 → EndObjectAccess → 加入 LRU cache → 在 LRU 中 → 可被选中
+```
+
+**EvictionPolicy 三层调用链**：
+
+```cpp
+// 1. CreateObjectInternal 中需要空间时调用
+// obj_lifecycle_mgr.cc:195-198
+int64_t space_needed = eviction_policy_->RequireSpace(
+    object_info.GetObjectSize(), objects_to_evict);
+EvictObjects(objects_to_evict);
+
+// 2. RequireSpace 计算需要释放多少空间
+// eviction_policy.cc:120-134
+int64_t EvictionPolicy::RequireSpace(int64_t size,
+                                     std::vector<ObjectID> &objects_to_evict) {
+  int64_t required_space = Allocated() + size - GetFootprintLimit();
+  int64_t space_to_free = std::max(required_space, GetFootprintLimit() / 5);  // 最少淘汰 20%
+  int64_t num_bytes_evicted = ChooseObjectsToEvict(space_to_free, objects_to_evict);
+  return required_space - num_bytes_evicted;
+}
+
+// 3. ChooseObjectsToEvict 从 LRU cache 中选择对象
+// eviction_policy.cc:103-112
+int64_t EvictionPolicy::ChooseObjectsToEvict(int64_t num_bytes_required,
+                                             std::vector<ObjectID> &objects_to_evict) {
+  int64_t bytes_evicted = cache_.ChooseObjectsToEvict(num_bytes_required, objects_to_evict);
+  for (auto &object_id : objects_to_evict) {
+    cache_.Remove(object_id);  // 从 LRU 中移除（已选中淘汰）
+  }
+  return bytes_evicted;
+}
+
+// 4. LRUCache 从链表尾部（最久未使用）选择
+// eviction_policy.cc:77-87
+int64_t LRUCache::ChooseObjectsToEvict(int64_t num_bytes_required,
+                                       std::vector<ObjectID> &objects_to_evict) {
+  int64_t bytes_evicted = 0;
+  auto it = item_list_.end();
+  while (bytes_evicted < num_bytes_required && it != item_list_.begin()) {
+    it--;
+    objects_to_evict.push_back(it->first);   // 选中最久未使用的
+    bytes_evicted += it->second;
+  }
+  return bytes_evicted;
+}
+
+// 5. EvictObjects 执行淘汰 — 双重 RAY_CHECK 保证安全
+// obj_lifecycle_mgr.cc:225-237
+void ObjectLifecycleManager::EvictObjects(const std::vector<ObjectID> &object_ids) {
+  for (const auto &object_id : object_ids) {
+    auto entry = object_store_->GetObject(object_id);
+    RAY_CHECK(entry != nullptr) << "must be in the object table";
+    RAY_CHECK(entry->state_ == ObjectState::PLASMA_SEALED)
+        << "must have been sealed";              // ★ 只淘汰已 Seal 的
+    RAY_CHECK(entry->ref_count_ == 0)
+        << "no clients currently using it";      // ★ ref 必须为 0
+    DeleteObjectInternal(object_id);              // 物理删除 + 释放内存
+  }
+}
+```
+
+**淘汰三要素（缺一不可）**：
+
+| 条件 | 检查点 | 保证机制 |
+|------|--------|---------|
+| ref_count == 0 | `EvictObjects` RAY_CHECK | LRU cache 只包含 ref=0 的对象（BeginObjectAccess 移除 ref>0 的） |
+| sealed | `EvictObjects` RAY_CHECK | `EndObjectAccess` 中也有 `RAY_CHECK(Sealed())` |
+| 在 LRU cache 中 | `ChooseObjectsToEvict` 只从 LRU 选 | `BeginObjectAccess` 将 ref>0 的从 LRU 移除 |
+
+**三个操作与 LRU 的关系**：
+
+```cpp
+// AddReference (ref 0→1) → BeginObjectAccess → 从 LRU 移除
+void EvictionPolicy::BeginObjectAccess(const ObjectID &object_id) {
+  cache_.Remove(object_id);                      // 不可淘汰
+  pinned_memory_bytes_ += GetObjectSize(object_id);
+}
+
+// RemoveReference (ref →0) → EndObjectAccess → 加入 LRU
+void EvictionPolicy::EndObjectAccess(const ObjectID &object_id) {
+  auto size = GetObjectSize(object_id);
+  cache_.Add(object_id, size);                   // 可淘汰
+  pinned_memory_bytes_ -= size;
+}
+
+// Seal — 不改变 LRU 状态（对象创建时 ref=0，不在 LRU；AddReference 后 ref=1，也不在 LRU）
+// 只有 RemoveReference 使 ref→0 时才加入 LRU
+```
 
 ### 7.3 SealReturnObject
 
