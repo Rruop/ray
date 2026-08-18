@@ -35,16 +35,30 @@
 
 ## 1. 三套计数体系总览
 
-| 计数 | 存储位置 | 含义 | 决定什么 |
-|------|---------|------|---------|
-| **owner ref** | `reference_counter.cc` → `object_id_refs_[id]` | 对象语义生命周期（谁 owns、是否 out of scope、pin 在哪个节点） | 何时发布 WorkerObjectEviction |
-| **client count** | `client.cc` → `objects_in_use_[id].count` | "这个 client 进程还要不要持有 mmap 映射" | 何时发 ReleaseRequest 给 server（count=0 时） |
-| **server ref_count** | `common.h:181` → `LocalObject.ref_count_` | "有多少个 client 在用此对象" | 是否可被 LRU 淘汰（=0 时加入 LRU） |
+| 计数 | 存储位置 | 数据结构 | 精确字段 | 含义 | 决定什么 |
+|------|---------|---------|---------|------|---------|
+| **owner ref** | CoreWorker 进程 | `ObjectRefCount` | `reference_counter.cc` → `object_id_refs_[id]` | 对象语义生命周期（谁 owns、是否 out of scope、pin 在哪个节点） | 何时发布 WorkerObjectEviction |
+| **client count** | Plasma Client 进程 | `ObjectInUseEntry` | `client.h:339` → `objects_in_use_[id].count` | "这个 client 连接对该对象的 Create/Get 次数 - Release 次数" | 何时发 ReleaseRequest 给 server（count=0 时） |
+| **server ref_count** | Plasma Store 进程 | `LocalObject` | `common.h:181` → `ref_count_` | "有多少个 client 连接在用此对象" | 是否可被 LRU 淘汰（=0 时加入 LRU） |
 
 **核心规则**：
 - server ref_count > 0 → `BeginObjectAccess`（从 LRU 移除）→ 不可淘汰
 - server ref_count == 0 → `EndObjectAccess`（加入 LRU）→ 可淘汰
 - LRU 淘汰只看 server ref_count，不看 client count 也不看 owner ref
+
+**三者的数值关系**：
+
+```
+server ref_count = Σ (每个 client 连接的贡献)
+                  = Σ [若 client_i.objects_in_use_.count > 0 → 1, 否则 → 0]
+
+client count ≥ 1 时 → 该 client 对 server ref 贡献 1
+client count = 0 时 → 该 client 对 server ref 贡献 0（已 MarkObjectUnused + SendReleaseRequest）
+```
+
+- **server ref 只看"该 client 是否还在用"，不看 client count 具体是多少**：client count=2 和 count=1 对 server ref 贡献相同（都是 +1）
+- **client count 是一个 client 内部的多次引用累加**：Create 返回 count=2 是因为 InsertObjectInUse(+1) + IncrementObjectCount(+1)，但 server 只 AddReference 一次
+- **只有 client count 归零时才发 ReleaseRequest**：server 收到后才 RemoveReference（ref_count -1）
 
 ---
 
@@ -402,6 +416,58 @@ server ref_count 1→0
 
 **Owner 从不经过 PlasmaClient**。owner 不需要 plasma client 连接。owner 只管语义引用计数，发布 "这个对象可以释放了" 的消息。真正持有 plasma client 的是 **raylet**（pin 时 Get 进来的）和 **worker**（Create/Get 进来的）。
 
+### 5.3 client count 与 server ref 的数值对应关系
+
+**server ref_count 不等于所有 client count 之和**。server 只关心"一个 client 连接是否还在使用此对象"，不关心 client 内部 count 具体值：
+
+```
+                  client count (内部)          server ref_count (全局)
+                  ─────────────────           ─────────────────────
+Client A:         count = 2 (Create后)    →    贡献 1
+                  count = 1 (Seal后Release) →   贡献 1 (仍 > 0)
+                  count = 0 (最终Release)  →    贡献 0 (SendReleaseRequest)
+
+Client B:         count = 1 (Get后)       →    贡献 1
+                  count = 0 (Release后)    →    贡献 0
+
+server ref_count = Client A 贡献 + Client B 贡献
+```
+
+**对应规则**：
+
+| client count 状态 | 该 client 对 server ref 的贡献 | IPC 行为 |
+|-------------------|----------------------------|---------|
+| 0 → 正数（InsertObjectInUse / IncrementObjectCount） | 不变（已在 `objects_in_use_` 中则不触发 AddReference） | 无 |
+| 首次引用（InsertObjectInUse，count 0→1） | +1 | Get/Create 流程中 server 端 `AddToClientObjectIds → AddReference` |
+| 正数 → 正数（IncrementObjectCount / Release count>0） | 不变 | 无 |
+| 正数 → 0（Release 后 count==0） | -1 | `MarkObjectUnused` + `SendReleaseRequest` → server 端 `RemoveFromClientObjectIds → RemoveReference` |
+
+**关键代码对应**：
+
+```cpp
+// AddToClientObjectIds — 只在 client 首次引用时调用（store.cc:136-147）
+void PlasmaStore::AddToClientObjectIds(...) {
+  auto &object_ids = client->GetObjectIDs();
+  if (object_ids.find(object_id) != object_ids.end()) {
+    return;  // ★ 该 client 已注册过此对象 → 不重复 AddReference
+  }
+  RAY_CHECK(object_lifecycle_mgr_.AddReference(object_id));  // +1
+  client->MarkObjectAsUsed(object_id, fallback_allocated_fd);
+}
+
+// RemoveFromClientObjectIds — 只在 client 完全释放时调用（store.cc:247-259）
+bool PlasmaStore::RemoveFromClientObjectIds(...) {
+  auto &object_ids = client->GetObjectIDs();
+  auto it = object_ids.find(object_id);
+  if (it != object_ids.end()) {
+    client->MarkObjectAsUnused(object_id);
+    object_lifecycle_mgr_.RemoveReference(object_id);  // -1
+  }
+}
+```
+
+**所以 Create 路径的 count=2 对 server ref 只有 +1**：`InsertObjectInUse` 时 server 端 `AddToClientObjectIds` 已经注册了此 client，`IncrementObjectCount` 只在 client 内部 count++，不会触发新的 IPC 或 AddReference。只有最终 count 归零时 `SendReleaseRequest` → server `RemoveReference`（-1）。
+
 ---
 
 ## 6. 完整链路 1：Put（owner 本地小对象）
@@ -610,7 +676,9 @@ case fb::MessageType::PlasmaCreateRequest: {
 // ProcessRequests 最终调用 handle_create lambda → HandleCreateObjectRequest
 ```
 
-**Step 5: HandleCreateObjectRequest → CreateObject → AddToClientObjectIds**
+**Step 5: HandleCreateObjectRequest → CreateObject（Create + AddToClientObjectIds 同函数）**
+
+`CreateObject` 和 `AddToClientObjectIds` **在同一个函数中顺序调用，同一把 mutex 下完成，不可分割**：
 
 ```cpp
 // store.cc:149-193
@@ -628,17 +696,33 @@ PlasmaError PlasmaStore::CreateObject(const ray::ObjectInfo &object_info,
                                       const std::shared_ptr<Client> &client,
                                       bool fallback_allocator,
                                       PlasmaObject *result) {
+  // ★ Part A: 创建对象 — ref_count_ 初始 = 0（只分配内存，不递增 ref）
   auto pair = object_lifecycle_mgr_.CreateObject(object_info, source, fallback_allocator);
   auto entry = pair.first;
   if (entry == nullptr) { return pair.second; }
   entry->ToPlasmaObject(result, /*check_sealed=*/false);
-  // ★ 创建成功后，将对象注册到 client → server ref_count +1
+
+  // ★ Part B: 紧接着注册到 client → AddReference → ref_count 0→1
+  //    在同一把 mutex_ 下完成，中间不可能有其他线程操作此对象
+  std::optional<MEMFD_TYPE> fallback_allocated_fd = std::nullopt;
+  if (entry->GetAllocation().fallback_allocated_) {
+    fallback_allocated_fd = entry->GetAllocation().fd_;
+  }
   AddToClientObjectIds(object_info.object_id, fallback_allocated_fd, client);
   return PlasmaError::OK;
 }
 ```
 
-**Step 6: ObjectLifecycleManager::CreateObject — 创建对象（ref_count 初始为 0）**
+**为什么 Create 和 AddReference 不在 `CreateObjectInternal` 中合并**：
+
+`CreateObjectInternal` 只负责"分配内存 + 创建 LocalObject 对象"，它被设计为**纯粹的内存操作**，不知道也不关心 client 是谁。ref_count 的递增是"client 注册"语义，属于 `AddToClientObjectIds` 的职责。这种分离让 `AddToClientObjectIds` 有**两个独立的调用点**：
+
+| 调用点 | 位置 | 场景 | ref 变化 |
+|--------|------|------|---------|
+| `CreateObject` 中 | `store.cc:191` | 新建对象后立即注册 client（Part A → Part B 同函数） | 0→1（首次） |
+| Get 请求回调中 | `store.cc:108` | 对象已存在，新 client 通过 Get 获取时注册 | N→N+1 |
+
+**Step 6: ObjectLifecycleManager::CreateObject — 纯内存分配（ref_count = 0）**
 
 ```cpp
 // obj_lifecycle_mgr.cc:40-62
@@ -648,15 +732,29 @@ std::pair<const LocalObject *, PlasmaError> ObjectLifecycleManager::CreateObject
     return {nullptr, PlasmaError::ObjectExists};  // 对象已存在
   }
   auto entry = CreateObjectInternal(object_info, source, fallback_allocator);
-  // CreateObjectInternal 创建对象时 ref_count_ = 0（不递增 ref）
-  // ref_count 递增在后续 AddToClientObjectIds → AddReference 中完成
+  // CreateObjectInternal 只创建 LocalObject，ref_count_ 初始 = 0
+  // ref_count 递增在 CreateObject 的调用者中通过 AddToClientObjectIds 完成
   if (entry == nullptr) { return {nullptr, PlasmaError::OutOfMemory}; }
   eviction_policy_->ObjectCreated(object_info.object_id);
   return {entry, PlasmaError::OK};
 }
+
+// obj_lifecycle_mgr.cc:181-219
+const LocalObject *ObjectLifecycleManager::CreateObjectInternal(
+    const ray::ObjectInfo &object_info, ...) {
+  // 循环最多 11 次 LRU 淘汰尝试分配内存
+  for (int num_tries = 0; num_tries <= 10; num_tries++) {
+    auto result = object_store_->CreateObject(object_info, source, /*fallback=*/false);
+    if (result != nullptr) { return result; }
+    // RequireSpace → EvictObjects → 重试
+    ...
+  }
+  // fallback 分配（磁盘 mmap）
+  return object_store_->CreateObject(object_info, source, /*fallback=*/true);
+}
 ```
 
-**Step 7: AddToClientObjectIds → AddReference（server ref_count 0→1）**
+**Step 7: AddToClientObjectIds → AddReference（ref_count 0→1）**
 
 ```cpp
 // store.cc:136-147
