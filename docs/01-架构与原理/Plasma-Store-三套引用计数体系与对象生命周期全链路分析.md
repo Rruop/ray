@@ -20,6 +20,12 @@
 - [12. Pull Pin vs Primary Pin 生命周期对比](#12-pull-pin-vs-primary-pin-生命周期对比)
 - [13. 汇总对比表](#13-汇总对比表)
 - [14. 关键代码索引](#14-关键代码索引)
+- [15. Object Location 上报机制](#15-object-location-上报机制)
+- [16. WorkerObjectEviction Pub/Sub 完整机制](#16-workerobjecteviction-pubsub-完整机制)
+- [17. WorkerObjectLocations Pub/Sub 机制](#17-workerobjectlocations-pubsub-机制)
+- [18. Spill 流程详解](#18-spill-流程详解)
+- [19. Spill 恢复流程详解](#19-spill-恢复流程详解)
+- [20. 关键代码索引（补充）](#20-关键代码索引补充)
 
 ---
 
@@ -1035,3 +1041,694 @@ add_object_callback_ 触发:
 | `raylet/lease_dependency_manager.cc` | 53 | `CancelPull` (wait) | Wait 请求完成 → cancel pull |
 | `raylet/lease_dependency_manager.cc` | 156 | `CancelPull` (get) | Get 请求完成 → cancel pull |
 | `raylet/lease_dependency_manager.cc` | 263 | `CancelPull` (lease) | Lease 不再需要 → cancel pull |
+
+---
+
+## 15. Object Location 上报机制
+
+Ray 集群中每个节点需要将对象的位置信息（内存副本、spill 位置）上报给 Owner Worker，Owner 维护全局 location 集合并通过 pub/sub 推送给订阅者。
+
+### 15.1 上报通道
+
+所有 location 上报通过 `OwnershipBasedObjectDirectory` → gRPC `UpdateObjectLocationBatch` 发送给 Owner Worker，**三种更新类型复用同一通道**：
+
+| 事件类型 | 触发点 | RPC 字段 | 含义 |
+|---------|--------|---------|------|
+| 内存副本增加 | `ObjectManager::HandleObjectAdded` (object_manager.cc:178) | `plasma_location_update=ADDED` | 对象进入本节点 plasma |
+| 内存副本移除 | `ObjectManager::HandleObjectDeleted` (object_manager.cc:207) | `plasma_location_update=REMOVED` | 对象从本节点 plasma 移除 |
+| Spill 完成 | `LocalObjectManager::OnObjectSpilled` (local_object_manager.cc:440) | `spilled_location_update{spilled_url, spilled_to_local_storage}` | 对象被 spill 到外部存储 |
+
+### 15.2 上报流程详解
+
+```
+节点 B (Raylet)                              节点 A (Owner Worker)
+────────────────                             ────────────────────
+
+1. 对象进入/离开 plasma / spill 完成
+
+2. OwnershipBasedObjectDirectory:
+   ReportObjectAdded / ReportObjectRemoved / ReportObjectSpilled
+   (ownership_object_directory.cc:121 / :144 / :167)
+
+3. 构造 ObjectLocationUpdate，缓存到:
+   location_buffers_[owner_worker_id].second[object_id]
+   location_buffers_[owner_worker_id].first.emplace_back(object_id)
+
+4. SendObjectLocationUpdateBatchIfNeeded()
+   → batch 最多 kMaxObjectReportBatchSize 个 update
+   → gRPC UpdateObjectLocationBatch ─────────→
+
+5. Owner Worker 收到:                        CoreWorker::HandleUpdateObjectLocationBatch
+                                              (core_worker.cc:3705)
+
+                                              遍历 object_location_updates:
+                                              ├ has_plasma_location_update?
+                                              │  ├ ADDED → AddObjectLocationOwner
+                                              │  │   → reference_counter_->AddObjectLocation
+                                              │  │     → it->second.locations.emplace(node_id)
+                                              │  │     → PushToLocationSubscribers(it)
+                                              │  └ REMOVED → RemoveObjectLocationOwner
+                                              │      → reference_counter_->RemoveObjectLocation
+                                              │        → it->second.locations.erase(node_id)
+                                              │        → PushToLocationSubscribers(it)
+                                              │
+                                              └ has_spilled_location_update?
+                                                → AddSpilledObjectLocationOwner
+                                                  → reference_counter_->HandleObjectSpilled
+                                                    → it->second.spilled = true
+                                                    → it->second.spilled_url = url
+                                                    → it->second.spilled_node_id = node_id
+                                                    → PushToLocationSubscribers(it)
+```
+
+### 15.3 关键点：Pull 对象也会上报
+
+**Pull 路径创建的对象同样走 `HandleObjectAdded` → `ReportObjectAdded`**。无论对象来自 Push 还是 Pull，只要被 Seal 到 plasma store 且有 `object_info`（含 owner 信息），都会上报到 Owner。
+
+**但 ReceivedByPush 对象的问题是**：Seal+Release 后 ref=0 → LRU 立即淘汰 → `HandleObjectDeleted` → `ReportObjectRemoved` → Owner 把节点从 locations 移除。**加进去又被移除了**，所以 Owner 认为该节点没有副本。
+
+### 15.4 Owner 端 location 数据结构
+
+```cpp
+// reference_counter.cc — Reference 结构中的关键字段
+struct Reference {
+    absl::flat_hash_set<NodeID> locations;   // 有内存副本的节点集合
+    std::string spilled_url;                 // spill URL (本地路径或 S3 URL)
+    NodeID spilled_node_id;                  // spill 所在节点 (IsNil 表示外部存储)
+    bool spilled;                            // 是否已被 spill
+    bool did_spill;                          // 是否执行过 spill
+    std::optional<NodeID> pinned_at_node_id_; // primary copy 所在节点
+};
+```
+
+Owner 的 `PushToLocationSubscribers` 发布 `WorkerObjectLocationsPubMessage`，包含：
+- `node_ids`：所有有内存副本的节点
+- `spilled_url`：spill URL
+- `spilled_node_id`：spill 所在节点
+- `pending_creation`：是否正在创建中
+- `object_size`：对象大小
+
+---
+
+## 16. WorkerObjectEviction Pub/Sub 完整机制
+
+Owner Worker 上持有对象语义生命周期，当对象 OutOfScope 时需要通知所有 pin 了该对象的 raylet 释放。这套通知通过 **WorkerObjectEviction** pub/sub channel 实现。
+
+### 16.1 架构：每个 Worker 进程既是 Publisher 又是 Subscriber
+
+```
+节点 A (Owner Worker)                     节点 B (Raylet)
+┌──────────────────────┐                  ┌──────────────────────┐
+│ CoreWorker 进程       │                  │ Raylet 进程           │
+│                      │                  │                      │
+│ Publisher            │                  │ core_worker_subscriber_│
+│  (object_info_publisher_)               │   (Subscriber)       │
+│  ├ 注册 channel:      │                  │   ├ 注册 channel:     │
+│  │  WORKER_OBJECT_   │                  │   │  WORKER_OBJECT_   │
+│  │  EVICTION         │                  │   │  EVICTION         │
+│  │                   │                  │   │                   │
+│  ├ subscribers_:      │   Long Polling   │   │                   │
+│  │  subscriber_id→   │◄───gRPC──────────│   │                   │
+│  │  SubscriberState  │                  │   │                   │
+│  │   ├ mailbox_      │                  │   │                   │
+│  │   └ long_polling_ │                  │   │                   │
+│  │     connection    │                  │   │                   │
+│  │                   │    消息发布       │   │                   │
+│  │ Publish() ────────│───gRPC──────────→│   HandleLongPolling   │
+│  │                   │   (Long Polling   │   Response           │
+│  │                   │    Reply)         │   → subscription_callback│
+└──────────────────────┘                  └──────────────────────┘
+```
+
+### 16.2 步骤 1：订阅（Raylet → Owner Worker）
+
+```
+1. LocalObjectManager::PinObjectsAndWaitForFree
+   (local_object_manager.cc:57)
+   构造 WorkerObjectEvictionSubMessage:
+     {
+       object_id,
+       intended_worker_id = owner_address.worker_id(),
+       subscriber_address = {self_node_id, ip, port}  // raylet 地址
+     }
+
+2. core_worker_subscriber_->Subscribe(
+     sub_message,
+     ChannelType::WORKER_OBJECT_EVICTION,
+     owner_address,       // Owner 的 RPC 地址（可能跨节点）
+     object_id.Binary(),
+     subscription_callback,  // Owner 发布 eviction 时触发
+     owner_dead_callback)    // Owner 死亡时触发
+
+3. Subscriber::Subscribe (subscriber.cc:261)
+   → 构造 CommandItem (subscribe 命令)
+   → commands_[publisher_id].emplace(command)
+   → SendCommandBatchIfPossible()
+     → gRPC PubsubCommandBatchRequest 发给 Owner Worker
+   → Channel(channel_type)->Subscribe() → 注册本地回调
+   → MakeLongPollingConnectionIfNotConnected()
+     → 建立长轮询连接
+
+4. Owner Worker 收到 PubsubCommandBatchRequest
+   → CoreWorker::HandlePubsubCommandBatch
+   → ProcessSubscribeMessage
+     → ProcessSubscribeForObjectEviction (core_worker.cc:3562)
+       → 构造 unpin_object lambda:
+           [this](const ObjectID &object_id) {
+             PubMessage pub_message;
+             pub_message.set_channel_type(WORKER_OBJECT_EVICTION);
+             pub_message.mutable_worker_object_eviction_message()
+               ->set_object_id(object_id.Binary());
+             object_info_publisher_->Publish(std::move(pub_message));
+           }
+       → reference_counter_->AddObjectOutOfScopeOrFreedCallback(
+             object_id, unpin_object)
+         → 存入 it->second.on_object_out_of_scope_or_freed_callbacks
+
+5. Owner Worker 的 Publisher 注册订阅:
+   → Publisher::RegisterSubscription(channel_type, subscriber_id, key_id)
+   → subscription_index_map_[channel].AddEntry(key_id, subscriber)
+```
+
+### 16.3 步骤 2：Long Polling（Raylet 持续等待消息）
+
+```
+6. Subscriber::MakeLongPollingPubsubConnection (subscriber.cc:296)
+   → 构造 PubsubLongPollingRequest {subscriber_id, publisher_id, max_processed_sequence_id}
+   → subscriber_client->PubsubLongPolling(request, callback)
+     → [gRPC] 发给 Owner Worker
+
+7. Owner Worker 收到 PubsubLongPollingRequest
+   → Publisher::ConnectToSubscriber (publisher.cc:364)
+   → 找到/创建 SubscriberState
+   → subscriber->ConnectToSubscriber(request, ...)
+     → long_polling_connection_ = make_unique<LongPollConnection>(reply_callback)
+     → PublishIfPossible(force_noop=false)
+       → mailbox_ 为空? → 不回复，保持长轮询挂起
+       → mailbox_ 有消息? → 立刻回复
+
+   (长轮询挂起: Owner Worker 持有 reply_callback, 不立刻回复，
+    等 Publish 有消息时才回复)
+```
+
+### 16.4 步骤 3：Owner OutOfScope → 发布 eviction 消息
+
+```
+8. Owner 的 ReferenceCounter 判定对象 OutOfScope
+   → OnObjectOutOfScopeOrFreed (reference_counter.cc:839)
+     → 遍历 on_object_out_of_scope_or_freed_callbacks:
+       → callback(object_id)
+
+9. unpin_object lambda (core_worker.cc:3566):
+   → 构造 PubMessage {channel=WORKER_OBJECT_EVICTION, object_id}
+   → object_info_publisher_->Publish(std::move(pub_message))
+
+10. Publisher::Publish (publisher.cc:421)
+    → pub_message.set_sequence_id(++next_sequence_id_)
+    → subscription_index.Publish(pub_message)
+      → EntityState::Publish(msg)
+        → mailbox_.push_back(msg)
+        → PublishIfPossible(force_noop=false)
+          → long_polling_connection_ 存在?
+            → 从 mailbox_ 取出消息
+            → pub_messages->Add(msg)
+            → long_polling_connection_->send_reply_callback(...)
+              → [gRPC reply] 发给 Raylet 的 Subscriber
+```
+
+### 16.5 步骤 4：Raylet 收到消息 → unpin
+
+```
+11. Subscriber::HandleLongPollingResponse (subscriber.cc:321)
+    → 收到 PubsubLongPollingReply {pub_messages}
+    → 遍历 pub_messages:
+      → Channel(channel_type)->HandlePublishedMessage(publisher_address, msg)
+        → 查找注册的 subscription_callback → 调用
+
+12. subscription_callback (local_object_manager.cc:68):
+    → ReleaseFreedObject(obj_id)
+      → pinned_objects_.erase(it)
+      → RayObject 析构 → PlasmaClient A Release → [IPC] server ref-1
+
+13. 重新建立长轮询 (subscriber.cc:399):
+    → if (SubscriptionExists(publisher_id)):
+        MakeLongPollingPubsubConnection(publisher_address)
+        → 重新发起 Long Polling，等待下一个消息
+```
+
+### 16.6 步骤 5：Owner 死亡的处理
+
+```
+Owner Worker 进程崩溃 → gRPC 连接断开
+  → Subscriber::HandleLongPollingResponse 收到错误 status
+    → subscriber.cc:328: status.ok() == false
+    → 遍历 channels_ → HandlePublisherFailure(publisher_address, status)
+      → 调用 owner_dead_callback (local_object_manager.cc:76):
+        → ReleaseFreedObject(obj_id)
+        → pinned_objects_.erase → RayObject 析构 → server ref-1
+```
+
+### 16.7 时序图
+
+```
+节点 B Raylet                      节点 A Owner Worker
+────────────────                   ────────────────────
+1. Subscribe(owner_address)
+   → PubsubCommandBatch ──gRPC──→  注册 subscription
+   → Long Polling ──gRPC────────→  挂起 reply_callback
+                                    (等待消息)
+
+     ... 对象 pin 期间, Long Polling 持续挂起 ...
+
+                                    7. OutOfScope
+                                    → callback → Publish()
+                                    → mailbox_ 有消息
+5. ←── Long Polling Reply ──gRPC──  回复 (包含 eviction 消息)
+
+8. subscription_callback
+   → ReleaseFreedObject
+   → server ref-1
+   → 重新 Long Polling ──gRPC──→   挂起新的 reply_callback
+                                    (无更多消息)
+```
+
+### 16.8 连接粒度和资源消耗
+
+**不是每个 object 一条连接**，是 **每个 owner worker 一条长轮询 gRPC 连接**，多个 object 共享。
+
+Subscriber 内部数据结构：
+```cpp
+// subscriber.cc
+publishers_connected_: Map<publisher_id, bool>
+  → 每个 publisher_id (owner worker_id) 只建立一条 Long Polling gRPC 连接
+
+commands_[publisher_id]: Queue<CommandItem>
+  → 同一个 owner 的多个 subscribe 命令会 batch 到一个 PubsubCommandBatchRequest 里发送
+```
+
+关键代码 `MakeLongPollingConnectionIfNotConnected` (subscriber.cc:308):
+```cpp
+auto publishers_connected_it = publishers_connected_.find(publisher_id);
+if (publishers_connected_it == publishers_connected_.end()) {
+    publishers_connected_.emplace(publisher_id);
+    MakeLongPollingPubsubConnection(publisher_address);  // 只在首次创建
+}
+```
+
+资源消耗模型：
+
+| 维度 | 粒度 | 数量级 |
+|------|------|--------|
+| gRPC 长轮询连接 | per owner worker | = 活跃 worker 数 (百~千级) |
+| subscribe 命令 | per object | 一次性，batch 发送 |
+| channel 内订阅条目 | per (publisher, key_id) | = 被 pin 的 object 数 |
+| 消息投递 | per eviction event | 按需，仅 OutOfScope 时 |
+
+- **连接数**：100 个 worker → 100 条长轮询连接（而非几万条）
+- **内存**：每条连接维护一个 `mailbox_` 和 `SubscriberState`
+- **CPU**：长轮询无消息时完全挂起，零开销；有消息时一次 reply 可批量携带多个 `pub_message`
+- 每个 object 在 Owner 的 `ReferenceCounter` 里注册一个回调（`on_object_out_of_scope_or_freed_callbacks`）—— 纯内存，O(1) per object
+- 每个 object 在 Publisher 的 `SubscriptionIndex` 里占一个 entry —— 纯内存
+
+---
+
+## 17. WorkerObjectLocations Pub/Sub 机制
+
+除了 eviction 通道，还有 **WorkerObjectLocations** 通道，用于对象位置变更通知。PullManager 等组件通过订阅此通道获取对象的实时位置（内存副本节点、spill URL）。
+
+### 17.1 订阅流程
+
+```
+PullManager 需要拉取对象 → ObjectManager::Pull
+  → object_directory_->SubscribeObjectLocations(callback_id, object_id, owner_address, callback)
+    → OwnershipBasedObjectDirectory::SubscribeObjectLocations (ownership_object_directory.cc:320)
+      → 构造 WorkerObjectLocationsSubMessage {intended_worker_id, object_id}
+      → object_location_subscriber_->Subscribe(
+          sub_message,
+          ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL,
+          owner_address,
+          object_id.Binary(),
+          subscribe_done_callback,
+          msg_published_callback,    // 位置变更时触发
+          failure_callback)         // Owner 死亡或 ref 已删除时触发
+      → 创建 LocationListenerState:
+        {
+          owner_address,
+          current_object_locations,   // 当前已知内存副本节点
+          spilled_url,                // spill URL
+          spilled_node_id,            // spill 所在节点
+          pending_creation,           // 是否正在创建
+          object_size,                // 对象大小
+          callbacks                   // 回调集合
+        }
+```
+
+### 17.2 消息发布
+
+当 Owner 端的对象位置发生变化时（`PushToLocationSubscribers`，reference_counter.cc:1678）：
+```cpp
+void ReferenceCounter::PushToLocationSubscribers(ReferenceTable::iterator it) {
+    rpc::PubMessage pub_message;
+    pub_message.set_key_id(object_id.Binary());
+    pub_message.set_channel_type(WORKER_OBJECT_LOCATIONS_CHANNEL);
+    auto object_locations_msg = pub_message.mutable_worker_object_locations_message();
+    FillObjectInformationInternal(it, object_locations_msg);
+    object_info_publisher_->Publish(std::move(pub_message));
+}
+```
+
+发布内容 (`FillObjectInformationInternal`，reference_counter.cc:1713):
+```cpp
+for (const auto &node_id : it->second.locations) {
+    object_info->add_node_ids(node_id.Binary());    // 内存副本节点
+}
+object_info->set_object_size(it->second.object_size_);
+object_info->set_spilled_url(it->second.spilled_url);     // spill URL
+object_info->set_spilled_node_id(it->second.spilled_node_id.Binary());  // spill 节点
+object_info->set_pending_creation(it->second.pending_creation_);
+object_info->set_did_spill(it->second.did_spill);
+```
+
+### 17.3 订阅者收到更新
+
+```
+Subscriber 收到 Long Polling Reply
+  → ObjectLocationSubscriptionCallback (ownership_object_directory.cc:264)
+    → UpdateObjectLocations(location_info, ..., &current_object_locations, &spilled_url, &spilled_node_id, ...)
+    → 位置有变化? → 回调 PullManager 的 callback:
+      callback(locations, spilled_url, spilled_node_id, pending_creation, object_size)
+      → PullManager 更新 request.client_locations, request.spilled_url 等
+```
+
+### 17.4 触发 PushToLocationSubscribers 的场景
+
+| 场景 | 触发代码 | 位置变更 |
+|------|---------|---------|
+| 内存副本增加 | `AddObjectLocationInternal` (reference_counter.cc:1468) | `locations +{node_id}` |
+| 内存副本移除 | `RemoveObjectLocationInternal` | `locations -{node_id}` |
+| Spill 完成 | `HandleObjectSpilled` (reference_counter.cc:1551) | `spilled_url`, `spilled_node_id` |
+| 对象大小更新 | `UpdateObjectSize` (reference_counter.cc:414) | `object_size` |
+| Pending creation 变更 | `UpdateObjectPendingCreationInternal` (reference_counter.cc:1494) | `pending_creation` |
+| 首次订阅 | `PublishObjectLocationSnapshot` (reference_counter.cc:1731) | 全量快照 |
+
+### 17.5 与 Eviction 通道的对比
+
+| 维度 | WORKER_OBJECT_EVICTION | WORKER_OBJECT_LOCATIONS |
+|------|----------------------|------------------------|
+| 订阅者 | pin 了 primary copy 的 raylet | 需要拉取对象的 raylet (PullManager) |
+| 触发条件 | Owner OutOfScope | 任何 location 变更 |
+| 消息内容 | 仅 object_id | locations + spilled_url + object_size + ... |
+| 生命周期 | primary copy pin 期间 | pull request 存续期间 |
+| 连接粒度 | per owner worker | per owner worker |
+
+两个通道共享同一套 pub/sub 基础设施（Long Polling），但独立运作，互不干扰。
+
+---
+
+## 18. Spill 流程详解
+
+当 Plasma Store 内存压力过大时，raylet 会将 primary copy 对象 spill 到外部存储（本地磁盘或 S3）。
+
+### 18.1 Spill 触发条件
+
+```
+NodeManager::SpillIfOverPrimaryObjectsThreshold()
+  → LocalObjectManager::SpillObjectUptoMaxThroughput() (local_object_manager.cc:162)
+    → 循环调用 TryToSpillObjects() 直到没有更多可 spill 或 worker 用满
+```
+
+### 18.2 Spillable 判定
+
+```cpp
+// store.cc:562
+bool PlasmaStore::IsObjectSpillable(const ObjectID &object_id) {
+    absl::MutexLock lock(&mutex_);
+    auto entry = object_lifecycle_mgr_.GetObject(object_id);
+    if (!entry) return false;
+    return entry->Sealed() && entry->GetRefCount() == 1;
+    // 只有 ref_count==1 (只有一个 client 持有) 才可 spill
+}
+```
+
+**只有 primary pin 的对象可 spill**：
+- Primary pin：raylet PlasmaClient A Create → Seal → Release → ref_count=1 → 满足条件
+- Pull pin：同样 ref_count=1，但 `LocalObjectManager::TryToSpillObjects` 只遍历 `pinned_objects_`（primary pin 集合），不包含 PullManager 的 `pinned_objects_`
+- **ReceivedByPush**：ref_count=0，不可 spill（也无需 spill，已经被 LRU 淘汰了）
+
+### 18.3 Spill 执行流程
+
+```
+1. LocalObjectManager::TryToSpillObjects() (local_object_manager.cc:186)
+   → 遍历 pinned_objects_，找 is_plasma_object_spillable_==true 的对象
+   → 最多合并 max_fused_object_count_ 个对象到一个文件
+   → 构造 objects_to_spill 列表
+
+2. 对象从 pinned_objects_ 移到 objects_pending_spill_:
+   → pinned_objects_.erase(it)
+   → objects_pending_spill_[id] = std::move(it->second)
+   → num_bytes_pending_spill_ += object_size
+
+3. SpillObjectsInternal (local_object_manager.cc:234)
+   → io_worker_pool_.PopSpillWorker()  // 获取一个 I/O worker
+   → gRPC SpillObjects → CoreWorker::HandleSpillObjects (core_worker.cc:4214)
+     → options_.spill_objects(object_refs)  // Python 层写外部存储
+     → 返回 spilled_objects_url[]
+
+4. Spill 成功 → OnObjectSpilled (local_object_manager.cc:417)
+   → spilled_objects_url_.emplace(object_id, object_url)
+   → 从 objects_pending_spill_ 移除
+   → 更新 spilled_bytes_total_, spilled_objects_total_
+
+5. 上报 Owner:
+   → object_directory_->ReportObjectSpilled(
+       object_id, self_node_id_, owner_address, object_url, generator_id, is_local_fs)
+     → gRPC UpdateObjectLocationBatch → Owner Worker
+     → Owner 更新 spilled_url, spilled_node_id
+     → PushToLocationSubscribers → 通知所有订阅者
+```
+
+### 18.4 Spill 后对象在 plasma 中的状态
+
+Spill 完成后，对象**仍然在 plasma store 中**（primary pin 持有），但 owner 已知 spill URL。当 Owner OutOfScope 时：
+```
+Owner → eviction pub/sub → raylet ReleaseFreedObject
+  → pinned_objects_.erase → RayObject 析构 → PlasmaClient Release
+  → server ref_count 0 → LRU 可淘汰
+  → 如果还没被淘汰，plasma 自动清理
+  → 如果对象已被 LRU 淘汰，那 spill URL 就是唯一的恢复途径
+```
+
+### 18.5 Pull pin 对象的 spill 行为
+
+- Pull pin 的对象**不会被主动 spill**（不在 `LocalObjectManager::pinned_objects_` 中）
+- Pull 请求结束后，`PullManager::UnpinObject` → RayObject 析构 → ref_count=0 → **被 LRU 淘汰**（evict，非 spill）
+- Evict 和 Spill 的区别：evict 不保存到外部存储，数据直接丢失；spill 保存后可恢复
+
+---
+
+## 19. Spill 恢复流程详解
+
+当 PullManager 需要拉取一个对象，但该对象没有内存副本时，可以从 spill 存储中恢复。
+
+### 19.1 TryToMakeObjectLocal 完整优先级
+
+```cpp
+// pull_manager.cc:447
+void PullManager::TryToMakeObjectLocal(const ObjectID &object_id) {
+    // 优先级1: 从有内存副本的节点 pull
+    bool did_pull = PullFromRandomLocation(object_id);
+    if (did_pull) return;
+
+    // 优先级2: 本地 spill 文件直接 restore
+    std::string direct_restore_url = get_locally_spilled_object_url_(object_id);
+    // → LocalObjectManager::GetLocalSpilledObjectURL
+    //   → is_external_storage_type_fs_==true 才有值
+    //   → 返回 spilled_objects_url_[object_id]
+
+    // 优先级3: S3 等外部存储 URL restore
+    if (direct_restore_url.empty()) {
+        if (!request.spilled_url.empty() && request.spilled_node_id.IsNil()) {
+            direct_restore_url = request.spilled_url;
+        }
+    }
+
+    if (!direct_restore_url.empty()) {
+        restore_spilled_object_(object_id, object_size, url, callback);
+    }
+
+    // 优先级4: 都没有 → 等待 reconstruction 或超时
+}
+```
+
+### 19.2 PullFromRandomLocation 内部优先级
+
+```cpp
+// pull_manager.cc:511
+bool PullManager::PullFromRandomLocation(const ObjectID &object_id) {
+    auto &node_vector = request.client_locations;  // 有内存副本的节点
+    auto &spilled_node_id = request.spilled_node_id;
+
+    if (!node_vector.empty()) {
+        // 子优先级 A: 从随机一个内存节点 pull
+        int node_index = random(0, node_vector.size()-1);
+        send_pull_request_(object_id, node_vector[node_index]);
+        return true;
+    }
+
+    if (!spilled_node_id.IsNil() && spilled_node_id != self_node_id_) {
+        // 子优先级 B: 向 spill 所在节点发 pull request
+        // 远端会自动从磁盘恢复并推送
+        send_pull_request_(object_id, spilled_node_id);
+        return true;
+    }
+
+    // spilled_node_id == self_node_id_ (本地有 spill)
+    // → 返回 false，让后面走本地 restore 路径
+    return false;
+}
+```
+
+**关键**：如果 `spilled_node_id == self_node_id_`（spill 在本节点），不会向自己发 pull request，避免 gRPC 自己跟自己通信。返回 false 后走本地 restore 路径。
+
+### 19.3 完整优先级排序
+
+| 优先级 | 路径 | 延迟组成 | 条件 |
+|--------|------|-----------|------|
+| 1 | 远端内存节点 pull | 网络传输 | owner locations 中有其他节点有内存副本 |
+| 2 | 本地 spill restore | 本地磁盘读 + plasma 写入 | 本地有 spill 文件（fs 类型存储） |
+| 3 | 远端 spill 节点 pull | 远端磁盘读 + 网络传输 | `spilled_node_id` 非空且非本节点 |
+| 4 | S3 外部存储 restore | 网络下载 + 本地写入 | `spilled_node_id.IsNil()`，有 URL |
+| 5 | 等待 reconstruction | 重新计算 | 都没有 |
+
+### 19.4 远端 spill 节点的自动恢复
+
+当 PullManager 向 spill 所在节点发 pull request 时：
+
+```
+节点 A (PullManager)                节点 B (spill 所在节点)
+────────────────                    ────────────────────
+send_pull_request_(object_id, B)
+  → gRPC PullRequest ───────────→  ObjectManager::HandlePull (object_manager.cc:616)
+                                     → Push(object_id, node_id=A)
+
+                                   Push() 逻辑 (object_manager.cc:321):
+                                   ├ local_objects_ 有? → PushLocalObject (内存推送)
+                                   ├ 本地有 spill 文件?
+                                   │  → PushFromFilesystem (从磁盘读→推送)
+                                   │    → SpilledObjectReader::CreateSpilledObjectReader(url)
+                                   │    → chunk_object_reader
+                                   │    → PushObjectInternal(from_disk=true)
+                                   └ 都没有? → 加入 unfulfilled_push_requests_
+                                       → 等对象恢复后再推送
+```
+
+`PushFromFilesystem` (object_manager.cc:411) 将磁盘读取调度到 RPC 线程（off-main-thread），不阻塞主事件循环。
+
+### 19.5 本地 restore 流程
+
+```
+1. get_locally_spilled_object_url_(object_id) 返回非空 URL
+
+2. restore_spilled_object_(object_id, object_size, url, callback)
+   → ObjectManager → LocalObjectManager::AsyncRestoreSpilledObject
+     (local_object_manager.cc:470)
+     → io_worker_pool_.PopRestoreWorker()  // 获取 restore I/O worker
+     → gRPC RestoreSpilledObjects → CoreWorker::HandleRestoreSpilledObjects
+       → options_.restore_spilled_objects(object_refs, spilled_urls)
+         → Python 层读取外部存储 → 写回 plasma store
+
+3. restore 成功 → 对象重新进入 plasma → HandleObjectAdded
+   → ReportObjectAdded → Owner 更新 locations
+```
+
+### 19.6 S3 外部存储 restore
+
+当 `spilled_node_id.IsNil()` 时，说明对象 spill 到了 S3 等外部存储，没有具体节点可以请求。这时直接从 URL 下载：
+
+```
+condition: !request.spilled_url.empty() && request.spilled_node_id.IsNil()
+  → direct_restore_url = request.spilled_url  // S3 URL
+  → restore_spilled_object_(...)  // 同本地 restore 路径
+    → Python 层从 S3 下载 → 写入 plasma
+```
+
+---
+
+## 20. 关键代码索引（补充）
+
+### Pub/Sub 基础设施
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `pubsub/subscriber_interface.h` | 40 | `SubscriberInterface` | 订阅者接口 |
+| `pubsub/subscriber.cc` | 261 | `Subscriber::Subscribe` | 注册订阅 + 建立长轮询 |
+| `pubsub/subscriber.cc` | 296 | `MakeLongPollingPubsubConnection` | 建立/复用 gRPC 长轮询 |
+| `pubsub/subscriber.cc` | 321 | `HandleLongPollingResponse` | 处理长轮询回复 |
+| `pubsub/subscriber.cc` | 308 | `MakeLongPollingConnectionIfNotConnected` | 每个 publisher 只建一条连接 |
+| `pubsub/publisher.cc` | 364 | `Publisher::ConnectToSubscriber` | 注册长轮询连接 |
+| `pubsub/publisher.cc` | 421 | `Publisher::Publish` | 发布消息到 mailbox + 触发长轮询回复 |
+| `pubsub/publisher.cc` | 28 | `EntityState::Publish` | 消息入 mailbox + PublishIfPossible |
+
+### Object Location 上报
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `object_manager/ownership_object_directory.cc` | 121 | `ReportObjectAdded` | 上报内存副本增加 (ADDED) |
+| `object_manager/ownership_object_directory.cc` | 144 | `ReportObjectRemoved` | 上报内存副本移除 (REMOVED) |
+| `object_manager/ownership_object_directory.cc` | 167 | `ReportObjectSpilled` | 上报 spill 完成 (spilled_url) |
+| `object_manager/ownership_object_directory.cc` | 228 | `SendObjectLocationUpdateBatchIfNeeded` | 批量发送 location 更新 |
+| `core_worker/core_worker.cc` | 3705 | `HandleUpdateObjectLocationBatch` | Owner 接收 location 更新 |
+| `core_worker/core_worker.cc` | 3774 | `AddObjectLocationOwner` | 添加内存副本节点 |
+| `core_worker/core_worker.cc` | 3805 | `RemoveObjectLocationOwner` | 移除内存副本节点 |
+| `core_worker/reference_counter.cc` | 1443 | `AddObjectLocation` | locations.emplace(node_id) |
+| `core_worker/reference_counter.cc` | 1470 | `RemoveObjectLocation` | locations.erase(node_id) |
+| `core_worker/reference_counter.cc` | 1520 | `HandleObjectSpilled` | 记录 spilled_url, spilled_node_id |
+
+### WorkerObjectEviction Pub/Sub
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `raylet/local_object_manager.cc` | 57 | `PinObjectsAndWaitForFree` | 订阅 owner eviction |
+| `raylet/local_object_manager.cc` | 68 | `subscription_callback` | 收到 eviction → ReleaseFreedObject |
+| `raylet/local_object_manager.cc` | 76 | `owner_dead_callback` | Owner 死亡 → ReleaseFreedObject |
+| `core_worker/core_worker.cc` | 3562 | `ProcessSubscribeForObjectEviction` | Owner 注册 eviction 回调 |
+| `core_worker/reference_counter.cc` | 839 | `OnObjectOutOfScopeOrFreed` | 遍历 callbacks → 触发 eviction |
+| `core_worker/reference_counter.cc` | 889 | `AddObjectOutOfScopeOrFreedCallback` | 注册 eviction 回调 |
+
+### WorkerObjectLocations Pub/Sub
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `object_manager/ownership_object_directory.cc` | 320 | `SubscribeObjectLocations` | 订阅对象位置变更 |
+| `object_manager/ownership_object_directory.cc` | 264 | `ObjectLocationSubscriptionCallback` | 收到位置更新 |
+| `core_worker/reference_counter.cc` | 1678 | `PushToLocationSubscribers` | 发布位置快照 |
+| `core_worker/reference_counter.cc` | 1713 | `FillObjectInformationInternal` | 填充 locations/spilled_url 等 |
+| `core_worker/reference_counter.cc` | 1731 | `PublishObjectLocationSnapshot` | 首次订阅时发布全量快照 |
+| `core_worker/core_worker.cc` | 3642 | `ProcessSubscribeObjectLocations` | Owner 处理位置订阅 |
+
+### Spill 相关
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `object_manager/plasma/store.cc` | 560 | `IsObjectSpillable` | 判定 ref_count==1 且 sealed |
+| `raylet/local_object_manager.cc` | 186 | `TryToSpillObjects` | 遍历 pinned_objects_ 找可 spill 对象 |
+| `raylet/local_object_manager.cc` | 234 | `SpillObjectsInternal` | 调度 I/O worker 执行 spill |
+| `raylet/local_object_manager.cc` | 417 | `OnObjectSpilled` | spill 完成回调 |
+| `raylet/local_object_manager.cc` | 440 | `ReportObjectSpilled` | 上报 spill URL 给 Owner |
+| `core_worker/core_worker.cc` | 4214 | `HandleSpillObjects` | I/O Worker 执行实际 spill |
+
+### Spill 恢复相关
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `object_manager/pull_manager.cc` | 447 | `TryToMakeObjectLocal` | 恢复优先级入口 |
+| `object_manager/pull_manager.cc` | 511 | `PullFromRandomLocation` | 内存节点 / 远端 spill 节点 |
+| `object_manager/pull_manager.cc` | 473 | `get_locally_spilled_object_url_` | 本地 spill URL 查询 |
+| `object_manager/pull_manager.cc` | 485 | `restore_spilled_object_` | 触发 restore |
+| `raylet/local_object_manager.cc` | 470 | `AsyncRestoreSpilledObject` | 本地 restore 调度 |
+| `raylet/local_object_manager.cc` | 449 | `GetLocalSpilledObjectURL` | 本地 spill URL 获取 |
+| `core_worker/core_worker.cc` | 4230 | `HandleRestoreSpilledObjects` | I/O Worker 执行实际 restore |
+| `object_manager/object_manager.cc` | 321 | `Push` | 远端 Push 入口（内存 / 磁盘 / 等待） |
+| `object_manager/object_manager.cc` | 355 | `PushLocalObject` | 从内存推送 |
+| `object_manager/object_manager.cc` | 411 | `PushFromFilesystem` | 从 spill 文件推送 |
+| `object_manager/spilled_object_reader.cc` | 29 | `CreateSpilledObjectReader` | 从 URL 创建磁盘读取器 |
