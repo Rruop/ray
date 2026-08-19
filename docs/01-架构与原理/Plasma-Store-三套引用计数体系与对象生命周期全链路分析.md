@@ -9,6 +9,7 @@
 - [1. 三套计数体系总览](#1-三套计数体系总览)
 - [2. Client Count 详解](#2-client-count-详解)
 - [3. Server ref_count 详解](#3-server-ref_count-详解)
+  - [3.5 Server 端多 Client 管理架构](#35-server-端多-client-管理架构)
 - [4. Owner Ref 详解](#4-owner-ref-详解)
 - [5. 三套计数的联动关系](#5-三套计数的联动关系)
 - [6. 完整链路 1：Put（owner 本地小对象）](#6-完整链路-1putowner-本地小对象)
@@ -280,6 +281,230 @@ void EvictionPolicy::EndObjectAccess(const ObjectID &object_id) {
 ```
 
 **关键**：`BeginObjectAccess` 在 ref_count 从 0→1 时调用（从 LRU 移除），`EndObjectAccess` 在 ref_count 从 1→0 时调用（加入 LRU）。LRU 只淘汰 ref_count=0 的对象。
+
+### 3.5 Server 端多 Client 管理架构
+
+PlasmaStore 是**单进程单线程**，通过一个 Unix domain socket 监听，所有 PlasmaClient 都连到同一个 socket。Server 端不关心"Worker"还是"Raylet"的身份标签，只认 `Client*` 指针（即 socket 连接）。
+
+#### 3.5.1 每个 PlasmaClient 连接时，Server 创建独立的 Client 对象
+
+```cpp
+// store.cc:502 — 持续监听 Unix socket 的新连接
+void PlasmaStore::DoAccept() {
+  acceptor_.async_accept(socket_,
+      boost::bind(&PlasmaStore::ConnectClient, this, placeholders::error));
+}
+
+// store.cc:304 — 每个新连接创建一个 Client 对象
+void PlasmaStore::ConnectClient(const boost::system::error_code &error) {
+  auto new_connection = Client::Create(
+      [this](const std::shared_ptr<Client> &client, MessageType msg_type, const vector<uint8_t> &msg) {
+        return ProcessClientMessage(client, msg_type, msg);
+      },
+      [this](const std::shared_ptr<Client> &client, const error_code &err) {
+        HandleClientConnectionError(client, err);
+      },
+      std::move(socket_));
+  new_connection->ProcessMessages();
+  DoAccept();
+}
+```
+
+#### 3.5.2 Client 对象持有自己的 object_ids 集合
+
+```cpp
+// connection.h:42
+class Client : public ray::ClientConnection, public ClientInterface {
+  std::unordered_set<ray::ObjectID> object_ids;
+  std::string name = "anonymous_client";
+
+  const std::unordered_set<ray::ObjectID> &GetObjectIDs() override { return object_ids; }
+
+  void MarkObjectAsUsed(const ObjectID &object_id, ...) override {
+    const auto [_, inserted] = object_ids.insert(object_id);
+  }
+
+  bool MarkObjectAsUnused(const ObjectID &object_id) override {
+    auto it = object_ids.find(object_id);
+    if (it != object_ids.end()) {
+      object_ids.erase(it);
+      return should_unmap;
+    }
+    return false;
+  }
+};
+```
+
+#### 3.5.3 消息到达时自动携带 Client 身份
+
+ProcessMessages 从 socket 读消息，回调时把 `shared_ptr<Client>` 传出来：
+
+```cpp
+// connection.cc — Client::Create
+std::shared_ptr<Client> Client::Create(PlasmaStoreMessageHandler message_handler, ...) {
+  ray::MessageHandler ray_message_handler =
+      [message_handler](const std::shared_ptr<ray::ClientConnection> &client, ...) {
+        message_handler(std::static_pointer_cast<Client>(client), msg_type, msg);
+        client->ProcessMessages();
+      };
+}
+```
+
+#### 3.5.4 ProcessClientMessage 根据 Client* 分发
+
+```cpp
+// store.cc:349
+Status PlasmaStore::ProcessClientMessage(const std::shared_ptr<Client> &client,
+                                        MessageType msg_type, const vector<uint8_t> &msg) {
+  switch (msg_type) {
+    case PlasmaCreateRequest:
+      HandleCreateObjectRequest(client, msg, ...);
+      break;
+    case PlasmaGetRequest:
+      ProcessGetRequest(client, object_ids, timeout);
+      break;
+    case PlasmaReleaseRequest:
+      ReleaseObject(object_id, client);
+      break;
+    ...
+  }
+}
+```
+
+#### 3.5.5 同一对象在不同 Client 中的 AddToClientObjectIds
+
+```cpp
+// store.cc:133
+void PlasmaStore::AddToClientObjectIds(const ObjectID &object_id, ...,
+                                       const std::shared_ptr<ClientInterface> &client) {
+  auto &object_ids = client->GetObjectIDs();
+  if (object_ids.find(object_id) != object_ids.end()) {
+    return;
+  }
+  object_lifecycle_mgr_.AddReference(object_id);
+  client->MarkObjectAsUsed(object_id, ...);
+}
+```
+
+#### 3.5.6 RemoveFromClientObjectIds 只移除指定 client 的引用
+
+```cpp
+// store.cc:247
+bool PlasmaStore::RemoveFromClientObjectIds(const ObjectID &object_id,
+                                            const std::shared_ptr<Client> &client) {
+  auto &object_ids = client->GetObjectIDs();
+  auto it = object_ids.find(object_id);
+  if (it != object_ids.end()) {
+    client->MarkObjectAsUnused(object_id);
+    object_lifecycle_mgr_.RemoveReference(object_id);
+  }
+}
+```
+
+#### 3.5.7 Client 断连时清理所有引用
+
+```cpp
+// store.cc — HandleClientConnectionError
+void PlasmaStore::HandleClientConnectionError(const std::shared_ptr<Client> &client, ...) {
+  for (const auto &object_id : client->GetObjectIDs()) {
+    object_lifecycle_mgr_.RemoveReference(object_id);
+  }
+}
+```
+
+#### 3.5.8 Server 引用计数机制总结
+
+**server ref_count = 有几个 Client 的 `object_ids` set 中包含该对象**
+
+每个 Client 最多贡献 1，不论 client 内部 count 是多少：
+
+| 场景 | 调用 | ref 变化 |
+|------|------|---------|
+| Create 成功 | `AddToClientObjectIds(creator_client)` | +1 |
+| Get 请求满足 | `AddToClientObjectIds(getter_client)` | +1（新 client 首次） |
+| 同一 client 再 Get 同一对象 | `object_ids.find != end` → return | **不变** |
+| ReleaseRequest | `RemoveFromClientObjectIds(releaser_client)` | -1 |
+| Client 断连 | 遍历该 client 所有 object_ids 逐个 RemoveReference | 每个对象 -1 |
+
+**所以 server ref_count 不等于所有 client count 之和**：
+
+```
+Client A: object_ids = {X}  →  贡献 1
+Client B: object_ids = {X}  →  贡献 1
+Client C: 没有 X            →  贡献 0
+
+server X.ref_count = 2
+
+即使 Client A 内部 count=2（InsertObjectInUse+IncrementObjectCount），
+对 server 而言也只贡献 1。
+server 只看"该 Client 是否在 object_ids 中"，不看 client count 具体值。
+```
+
+#### 3.5.9 完整数值关系示例
+
+```
+              Worker Client              Raylet Client           server
+              (socket A)                (socket B)             ref_count
+              ───────────               ───────────            ─────────
+              object_ids = {}           object_ids = {}
+
+Worker Create:
+  AddToClientObjectIds(worker_client)
+    → worker_client.object_ids 查无 → AddReference         1
+    → worker_client.MarkObjectAsUsed
+    → worker_client.object_ids = {X}
+
+Raylet Get (pin):
+  AddToClientObjectIds(raylet_client)
+    → raylet_client.object_ids 查无 → AddReference         2
+    → raylet_client.MarkObjectAsUsed
+    → raylet_client.object_ids = {X}
+
+Worker Release:
+  RemoveFromClientObjectIds(worker_client)
+    → worker_client.object_ids 有 X → RemoveReference       1
+    → worker_client.MarkObjectAsUnused
+    → worker_client.object_ids = {}
+
+Raylet ReleaseFreedObject:
+  RemoveFromClientObjectIds(raylet_client)
+    → raylet_client.object_ids 有 X → RemoveReference       0
+    → raylet_client.MarkObjectAsUnused
+    → raylet_client.object_ids = {}
+    → EndObjectAccess → 加入 LRU
+```
+
+#### 3.5.10 PlasmaStore 维护多 Client 的运行模型
+
+Server 不需要一个显式的 `vector<Client>` 来"维护"——每个 `Client::ProcessMessages()` 通过 **boost::asio 异步回调** 保持存活。只要 socket 连接在、有消息要读，`shared_ptr<Client>` 就不会释放。Client 断连时 `HandleClientConnectionError` 清理引用。
+
+```
+                    同一个 Unix domain socket
+                    /tmp/plasma_store_socket
+                              │
+                    ┌─────────▼──────────┐
+                    │   PlasmaStore 进程   │
+                    │                     │
+                    │  acceptor_ 持续监听   │
+                    └──┬──────┬──────┬────┘
+                       │      │      │
+              ┌────────┘      │      └────────┐
+              ▼               ▼               ▼
+        socket A        socket B        socket C
+        Worker 进程      Raylet 进程      另一个 Worker
+        PlasmaClient #1  PlasmaClient #2  PlasmaClient #3
+              │               │               │
+              ▼               ▼               ▼
+        Client {           Client {         Client {
+          object_ids={X,Y}   object_ids={X,Z}  object_ids={W}
+        }                 }               }
+
+        server LocalObject:
+          X: ref_count=2  (Worker + Raylet 都持有)
+          Y: ref_count=1  (只有 Worker)
+          Z: ref_count=1  (只有 Raylet)
+          W: ref_count=1  (只有另一个 Worker)
+```
 
 ---
 
@@ -1112,21 +1337,118 @@ Status CoreWorker::SealExisting(const ObjectID &object_id,
 }
 ```
 
-### 7.5 ref 变化时序
+### 7.5 AllocateReturnObject → SealExisting → PinObjectIDs 完整代码调用与 ref 时序
+
+**Python → C++ 调用链**：
+
+```python
+# _raylet.pyx:4190 store_task_output
+# Step 1: Allocate
+CCoreWorkerProcess.GetCoreWorker().AllocateReturnObject(
+    return_id, data_size, metadata, contained_id, caller_address, ...)
+
+# Step 2: Write (memcpy to plasma buffer)
+(<SerializedObject>serialized_object).write_to(Buffer.make(return_ptr.get().GetData()))
+
+# Step 3: Seal + Pin
+CCoreWorkerProcess.GetCoreWorker().SealReturnObject(
+    return_id, return_ptr[0], generator_id, caller_address)
+```
+
+**C++ 完整调用链**：
 
 ```
-步骤  代码位置                                        client count   server ref
-────────────────────────────────────────────────────────────────────────────────
-1     AllocateReturnObject→Create                       2             1
-2     Python write_to (memcpy到plasma buffer)           2             1
+AllocateReturnObject (core_worker.cc:2921)
+  └─ CreateExisting (core_worker.cc:1148)
+       └─ PlasmaStoreProvider::Create (plasma_store_provider.cc:126)
+            └─ PlasmaClient::CreateAndSpillIfNeeded (client.cc:215)
+                 ├─ SendCreateRequest [IPC → server]
+                 └─ HandleCreateReply (client.cc:136)
+                      ├─ PlasmaMutableBuffer 创建（析构不调 Release）
+                      ├─ InsertObjectInUse(count=1, is_sealed=false)
+                      └─ IncrementObjectCount(count=2)
+
+SealReturnObject (core_worker.cc:3224)
+  └─ SealExisting (core_worker.cc:1204)
+       ├─ PlasmaStoreProvider::Seal (plasma_store_provider.cc:172)
+       │    └─ PlasmaClient::Seal (client.cc:569)
+       │         ├─ is_sealed = true
+       │         ├─ SendSealRequest [IPC → server]
+       │         │    └─ server: SealObject (state_ = PLASMA_SEALED)
+       │         │         └─ add_object_callback_ → HandleObjectAdded + HandleObjectLocal
+       │         └─ Release (client.cc:490) → count 2→1 (不发 SendReleaseRequest)
+       │
+       └─ PinObjectIDs [异步 RPC → raylet]
+            └─ NodeManager::HandlePinObjectIDs (node_manager.cc:2661)
+                 ├─ GetObjectsFromPlasma (node_manager.cc:2634)
+                 │    └─ store_client_->Get() [PlasmaClient #2]
+                 │         ├─ InsertObjectInUse(count=1, is_sealed=true)
+                 │         ├─ IncrementObjectCount(count=2)
+                 │         └─ [IPC: GetRequest] → server AddReference (ref+1)
+                 │              → 返回 RayObject（持有 PlasmaBuffer）
+                 │
+                 └─ PinObjectsAndWaitForFree (local_object_manager.cc:31)
+                      ├─ local_objects_.emplace
+                      ├─ pinned_objects_.emplace(id, std::move(RayObject))
+                      └─ Subscribe(WorkerObjectEviction) → 等待 owner 释放
+
+PinObjectIDs 回调（raylet 成功后触发）:
+  └─ PlasmaStoreProvider::Release (plasma_store_provider.cc:191)
+       └─ PlasmaClient::Release (client.cc:490) [Worker PlasmaClient #1]
+            ├─ count 1→0
+            ├─ MarkObjectUnused (从 objects_in_use_ 移除)
+            └─ SendReleaseRequest [IPC → server]
+                 └─ RemoveFromClientObjectIds → RemoveReference (server ref-1)
+```
+
+**三端 ref 完整时序（Worker PlasmaClient / Raylet PlasmaClient / server ref）**：
+
+```
+步骤  代码位置                                Worker    Raylet    server ref  说明
+                                              client    client
+                                              count     count
+────────────────────────────────────────────────────────────────────────────────────────
+1     AllocateReturnObject→Create
+      ├ InsertObjectInUse                       1         -          1       server AddReference
+      ├ IncrementObjectCount                    2         -          1
+      └ [IPC: CreateRequest] → AddToClientObjectIds → AddReference
+
+2     Python write_to (memcpy)                  2         -          1       数据写入
+
 3     SealReturnObject→SealExisting
-      → Seal: client.cc:598 Release(count 2→1)          1             1
-      → PinObjectIDs(异步): raylet Get → AddRef          1             2
-      → 回调Release: count 1→0 → SendReleaseRequest      已移除          1
+      ├ Seal: is_sealed=true
+      ├ SendSealRequest → server SealObject
+      │  (state_ = PLASMA_SEALED)
+      │  → add_object_callback_ (通知 raylet)
+      └ Release (count 2→1)                     1         -          1       不发 ReleaseRequest
+
+4     PinObjectIDs [异步RPC → raylet]
+      ├ GetObjectsFromPlasma
+      │  └ PlasmaClient #2::Get
+      │     ├ InsertObjectInUse                 1         1          2       server AddReference
+      │     ├ IncrementObjectCount              1         2          2       (raylet 加入)
+      │     └ [IPC: GetRequest] → AddReference
+      │        → 返回 RayObject（持有 PlasmaBuffer）
+      │
+      └ PinObjectsAndWaitForFree
+         ├ pinned_objects_.emplace(id, RayObject)  1       2          2
+         └ Subscribe(WorkerObjectEviction)
+
+5     PinObjectIDs 回调 → Worker Release
+      ├ PlasmaClient #1::Release (count 1→0)    0         2          2
+      ├ MarkObjectUnused (从 objects_in_use_ 移除)
+      └ SendReleaseRequest [IPC → server]
+         └ RemoveFromClientObjectIds → RemoveReference
+            (server ref 2→1)                     已移除     2          1
 
       ──── 最终稳态 ────
-      server ref: 1 (raylet pin持有) → spillable
+      Worker client: 已移除（无引用）
+      Raylet client: count=2（pinned_objects_ 持有 RayObject → PlasmaBuffer）
+      server ref: 1（raylet pin 持有）→ spillable（ref=1 可 spill 不可 evict）
+      owner ref: pinned_at_node_id_ = 本节点
 ```
+
+**关键交接点**：步骤 5 中 Worker Release 后 server ref 从 2→1（不是 0！），raylet 的 PinObjectsAndWaitForFree 仍然持有对象。只有 owner GC → `ReleaseFreedObject` 释放 raylet 的 pin 时，server ref 才 1→0 → 加入 LRU → 可淘汰。
 
 ---
 
