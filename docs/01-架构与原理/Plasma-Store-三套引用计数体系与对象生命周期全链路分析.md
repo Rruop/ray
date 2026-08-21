@@ -38,6 +38,11 @@
 - [28. HandleObjectMissing 对 spilled 条目的 Bug 分析与修复](#28-handleobjectmissing-对-spilled-条目的-bug-分析与修复)
 - [29. Pull 对象不会走 PinObjectsAndWaitForFree](#29-pull-对象不会走-pinobjectsandwaitforfree)
 - [30. 完整代码索引（补充二）](#30-完整代码索引补充二)
+- [31. Plasma Store 内存模型：Fallback Allocation 与 dlmalloc 机制](#31-plasma-store-内存模型fallback-allocation-与-dlmalloc-机制)
+- [32. OOM 与 ObjectReconstructionFailed 生产场景分析](#32-oom-与-objectreconstructionfailed-生产场景分析)
+- [33. ResubmitTask / MarkGeneratorFailedAndResubmit 重建流程](#33-resubmittask--markgeneratorfailedandresubmit-重建流程)
+- [34. Push/Pull 数据到达后如何通知 HandleObjectAdded](#34-pushpull-数据到达后如何通知-handleobjectadded)
+- [35. available_memory_bytes 与 RayParams 内存配置详解](#35-available_memory_bytes-与-rayparams-内存配置详解)
 
 ---
 
@@ -4389,6 +4394,573 @@ Plasma LRU 淘汰 Pull 来的对象:
 ```
 
 Pull 对象被淘汰后，如果该对象还被 lease 依赖，LeaseDependencyManager 会增加 missing_dependencies，触发重新 pull。
+
+---
+
+## 31. Plasma Store 内存模型：Fallback Allocation 与 dlmalloc 机制
+
+### 31.1 内存配置传递链路
+
+```
+Python ray.init() / ray start
+  → estimate_available_memory() → available_memory_bytes
+  → resolve_object_store_memory(available_memory_bytes, object_store_memory)
+    → 默认: available_memory_bytes * 0.3, 上限 /dev/shm 大小
+  → RayParams(available_memory_bytes=..., object_store_memory=...)
+    → raylet main.cc --object_store_memory flag
+      → plasma store runner: system_memory_ = object_store_memory
+        → PlasmaAllocator(footprint_limit=system_memory_)
+```
+
+### 31.2 available_memory_bytes 的作用
+
+`available_memory_bytes` 用于：
+1. 计算 `object_store_memory`（Plasma Store 共享内存大小）
+2. 计算调度资源 `memory = available_memory_bytes - object_store_memory`（剩余内存供 worker 进程使用）
+
+`available_memory_bytes` 不直接传递给 raylet，而是通过 Python 层计算后分别设置 `--object-store-memory` 和 `--memory` 两个参数。
+
+### 31.3 dlmalloc 初始分配与 /dev/shm
+
+```cpp
+// plasma_allocator.cc:44-55
+PlasmaAllocator::PlasmaAllocator(const std::string &plasma_directory,
+                                  const std::string &fallback_directory,
+                                  bool hugepage_enabled,
+                                  int64_t footprint_limit)
+    : kFootprintLimit(footprint_limit), ... {
+  internal::SetDLMallocConfig(plasma_directory, fallback_directory,
+                              hugepage_enabled, /*fallback_enabled=*/true);
+  auto allocation = Allocate(kFootprintLimit - kDlMallocReserved);
+  // ★ 初始分配：footprint_limit - 256B 从 /dev/shm 预分配
+  // 立即释放 → 但地址空间已预留给 dlmalloc
+}
+```
+
+**"Ray allocates all plasma memory up-front at once"**（dlmalloc.cc:85）：Plasma Store 启动时在 `/dev/shm` 上一次性 mmap 预分配 `object_store_memory` 大小的文件。这块内存后续由 dlmalloc 管理，用于 `Allocate()` 调用。
+
+### 31.4 /dev/shm 空间限制与 cap
+
+```cpp
+// store_runner.cc:48-63
+if (fallback_directory.empty()) {
+  fallback_directory = "/tmp";
+}
+shm_mem_avail = 9 * shm_mem_avail / 10;  // 90% /dev/shm 可用空间
+if (system_memory > shm_mem_avail) {
+  RAY_LOG(WARNING) << "System memory request exceeds memory available in "
+                   << plasma_directory;
+  system_memory = shm_mem_avail;  // ★ cap 到 /dev/shm 的 90%
+}
+```
+
+如果 `object_store_memory` 超过 `/dev/shm` 可用空间的 90%，会被自动 cap。
+
+### 31.5 Fallback Allocation — /dev/shm 满后的磁盘分配
+
+```cpp
+// dlmalloc.cc:168-178 — create_and_mmap_buffer
+std::string file_template = dlmalloc_config.directory;  // 首次用 /dev/shm
+if (allocated_once && dlmalloc_config.fallback_enabled) {
+  file_template = dlmalloc_config.fallback_directory;  // 后续用 /tmp
+}
+file_template += "/plasmaXXXXXX";
+```
+
+**关键机制**：首次分配使用 `plasma_directory`（`/dev/shm`），后续分配使用 `fallback_directory`（`/tmp/ray/...`）。
+
+```cpp
+// dlmalloc.cc:219-228 — fake_mmap
+void *fake_mmap(size_t size) {
+  if (dlmalloc_config.fallback_enabled && allocated_once && mparams.mmap_threshold > 0) {
+    // ★ 初始分配后，普通 Allocate() 的 mmap 被拒绝
+    return MFAIL;
+  }
+  // FallbackAllocate() 设置 mmap_threshold=0 → 可以通过
+  // ... 正常 mmap
+}
+```
+
+```cpp
+// plasma_allocator.cc:82-103 — FallbackAllocate
+std::optional<Allocation> PlasmaAllocator::FallbackAllocate(size_t bytes) {
+  RAY_CHECK(dlmallopt(M_MMAP_THRESHOLD, 0));  // ★ 强制 mmap
+  void *mem = dlmemalign(kAlignment, bytes);
+  RAY_CHECK(dlmallopt(M_MMAP_THRESHOLD, MAX_SIZE_T));  // 恢复
+  if (internal::IsOutsideInitialAllocation(mem)) {
+    is_fallback_allocated = true;  // ★ 标记为 fallback
+    fallback_allocated_ += bytes;
+  }
+  return BuildAllocation(mem, bytes, is_fallback_allocated);
+}
+```
+
+### 31.6 Fallback 不受 footprint_limit 限制
+
+`footprint_limit`（`object_store_memory`）只限制 `/dev/shm` 中的初始区域。Fallback 分配可以**无限增长**——直到磁盘空间耗尽。
+
+### 31.7 生产环境 MMAP_SHM 指标解释
+
+```
+配置: --object_store_memory=200GB
+/dev/shm: 200 GB 初始分配
+
+实际指标:
+  Prometheus MMAP_SHM ~871 GiB → 包含了 plasma + fallback + spill 的总和
+  /dev/shm 占用只有 6 GB (新启动的 Tidal 节点)
+
+解释:
+  /dev/shm 只是初始分配目录，fallback 后 mmap 可以到任意地址空间
+  dlmalloc 用 mmap 分配内存，不一定在 /dev/shm 里
+  /proc/meminfo 中的 Shmem: 176 GB 才是真实共享内存使用
+  ray_object_store_memory = plasma + fallback + spill 总和
+  ray_object_store_available_memory = 系统级可用内存（1 TB 机器内存）
+  所以 used + avail ≈ 1600 GB
+```
+
+### 31.8 分配器层面的硬限制
+
+| 分配方式 | 目录 | 是否受 footprint_limit 限制 | 触发条件 |
+|---------|------|---------------------------|---------|
+| `Allocate()` | `/dev/shm` | 是（初始区域用完后 fake_mmap 返回 MFAIL） | 正常创建对象 |
+| `FallbackAllocate()` | `fallback_directory`（`/tmp`） | **否**，可无限增长 | `/dev/shm` 满后自动 fallback |
+| Spill 文件 | 配置的外部存储 | 否 | plasma 内存压力 |
+
+**当 `Allocate()` 返回 nullopt 时**，PlasmaStore 的 `CreateRequestQueue` 触发 spill/GC/grace period 逻辑。如果仍无法腾出空间，则使用 `FallbackAllocate()` 在磁盘上创建 mmap 文件。
+
+---
+
+## 32. OOM 与 ObjectReconstructionFailed 生产场景分析
+
+### 32.1 典型错误链路
+
+```
+ray.exceptions.RayTaskError(OutOfMemoryError)
+  → 节点内存使用 957.55GB / 1006.84GB (0.951040 > 0.950000)
+  → Ray OOM killer 杀掉 worker
+  → worker 持有的 ObjectRef 丢失
+  → 下游依赖此对象的任务无法获取参数
+    → ray.exceptions.ObjectReconstructionFailedError
+    → [OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED]
+      → max_retries 耗尽 → 对象不可恢复
+```
+
+### 32.2 QG V4 场景中的两种失败模式
+
+**模式 A：OOM → 对象丢失 → Recovery 超过 max_retries**
+
+```
+StreamingRepartition 产生对象 → OOM 杀掉 worker
+  → MapWorker(MapBatches(QGPreprocessMapper)) 依赖此对象
+  → Owner 触发 RecoverObject → ResubmitTask
+  → max_retries 耗尽 → OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED
+  → 下游 StreamingGenerator _next_sync 收到 nil ref
+    → assert not ref.is_nil() → AssertionError
+```
+
+**模式 B：对象重建后又被淘汰 → 循环重建**
+
+```
+ResubmitTask → 对象重新创建 → plasma 内存仍然紧张
+  → 新创建的对象立即被 LRU 淘汰
+  → Recovery 再次触发 → 重试计数递增
+  → 循环直到 max_retries 耗尽
+```
+
+### 32.3 OOM 错误信息解读
+
+```
+Object store memory usage:
+  - objects spillable: 21
+  - bytes spillable: 41282258121 (~41 GB)
+  - objects unsealed: 0
+  - bytes unsealed: 0
+  - objects in use: 32
+  - bytes in use: 56822725626 (~56 GB)
+  - objects evictable: 91
+  - bytes evictable: 39174816225 (~39 GB)
+  - objects created by worker: 21
+  - bytes created by worker: 41282258121 (~41 GB)
+  - objects received: 102
+  - bytes received: 54715283730 (~54 GB)
+Eviction Stats:
+  (global lru) capacity: 200000000000  (200 GB)
+  (global lru) used: 19.5874%
+  (global lru) num objects: 91
+  (global lru) num evictions: 0
+```
+
+**关键观察**：
+- `bytes in use` (56 GB) + `bytes spillable` (41 GB) + `bytes evictable` (39 GB) ≈ 136 GB → 远小于 200 GB 配置
+- 但进程级别内存 957.55 GB / 1006.84 GB → OOM killer 触发
+- **问题不在于 Plasma Store 内存**，而在于**进程级别内存**（raylet 自身 71.62 GB + worker 进程 + 其他）
+- raylet 进程占用 71.62 GB → 这是 fallback allocation 的 mmap 文件被 raylet 进程地址空间映射
+
+### 32.4 解决方向
+
+| 方向 | 具体措施 | 说明 |
+|------|---------|------|
+| 减少 plasma 内存占用 | 限制副本占用空间、及时 spill | object_replication_min_bytes 控制 |
+| 减少 fallback | 限制 fallback 目录大小或禁止 | 当前 fallback 不受 footprint_limit 限制 |
+| 增加 max_retries | `@ray.remote(max_retries=N)` | 给 Recovery 更多机会 |
+| 减少并行度 | 增加 CPU 请求 | 降低同时活跃的对象数 |
+| 修复 cgroup memory | 确保 cgroup memory limit 有效 | 避免 OOM killer 计算错误 |
+
+---
+
+## 33. ResubmitTask / MarkGeneratorFailedAndResubmit 重建流程
+
+### 33.1 ResubmitTask — 普通任务重建入口
+
+```cpp
+// task_manager.cc:353-410
+std::optional<rpc::ErrorType> TaskManager::ResubmitTask(
+    const TaskID &task_id, std::vector<ObjectID> *task_deps) {
+  TaskSpecification spec;
+  bool should_queue_generator_resubmit = false;
+  {
+    absl::MutexLock lock(&mu_);
+    auto it = submissible_tasks_.find(task_id);
+    if (it == submissible_tasks_.end()) {
+      return rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED;
+    }
+    auto &task_entry = it->second;
+    if (task_entry.is_canceled_) {
+      return rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_TASK_CANCELLED;
+    }
+
+    if (task_entry.spec_.IsStreamingGenerator() &&
+        task_entry.GetStatus() == rpc::TaskStatus::SUBMITTED_TO_WORKER) {
+      // ★ streaming generator 正在运行 → 不能直接 resubmit
+      // 需要等 generator 完成或失败后再 resubmit
+      should_queue_generator_resubmit = true;
+    } else if (task_entry.GetStatus() != rpc::TaskStatus::FINISHED &&
+               task_entry.GetStatus() != rpc::TaskStatus::FAILED) {
+      // 任务还在运行 → 不需要 resubmit
+      return std::nullopt;
+    } else {
+      // 任务已完成或失败 → 可以直接 resubmit
+      SetupTaskEntryForResubmit(task_entry);
+    }
+    spec = task_entry.spec_;
+  }
+
+  if (should_queue_generator_resubmit) {
+    // 排队等待 generator 完成后自动 resubmit
+    return queue_generator_resubmit_(spec)
+               ? std::nullopt
+               : std::make_optional(
+                     rpc::ErrorType::OBJECT_UNRECONSTRUCTABLE_TASK_CANCELLED);
+  }
+
+  UpdateReferencesForResubmit(spec, task_deps);
+  async_retry_task_callback_(spec, /*delay_ms=*/0);
+  return std::nullopt;
+}
+```
+
+### 33.2 MarkGeneratorFailedAndResubmit — Streaming Generator 中断重建
+
+```cpp
+// task_manager.cc:473-496
+void TaskManager::MarkGeneratorFailedAndResubmit(const TaskID &task_id) {
+  TaskSpecification spec;
+  {
+    absl::MutexLock lock(&mu_);
+    auto it = submissible_tasks_.find(task_id);
+    auto &task_entry = it->second;
+
+    // ★ 先设为 FAILED（原因：GENERATOR_TASK_FAILED_FOR_OBJECT_RECONSTRUCTION）
+    rpc::RayErrorInfo error_info;
+    error_info.set_error_type(
+        rpc::ErrorType::GENERATOR_TASK_FAILED_FOR_OBJECT_RECONSTRUCTION);
+    SetTaskStatus(task_entry, rpc::TaskStatus::FAILED, error_info);
+
+    SetupTaskEntryForResubmit(task_entry);
+    spec = task_entry.spec_;
+  }
+  // ★ 不需要 UpdateReferencesForResubmit
+  // 因为 CompletePendingTask / FailPendingTask 没有被调用
+  // RemoveFinishedTaskReferences 从未发生
+  async_retry_task_callback_(spec, /*delay_ms=*/0);
+}
+```
+
+### 33.3 两者的关系
+
+| | ResubmitTask | MarkGeneratorFailedAndResubmit |
+|---|---|---|
+| **调用者** | `ObjectRecoveryManager::ReconstructObject` | `queue_generator_resubmit_` 回调（generator 完成后） |
+| **适用场景** | 普通 task 完成/失败后，或 streaming generator 还在运行时排队 | streaming generator 需要中断执行进行 recovery |
+| **状态变更** | 已完成/已失败的任务 → `SetupTaskEntryForResubmit` | 正在运行的 generator → 设 FAILED → `SetupTaskEntryForResubmit` |
+| **依赖更新** | 调用 `UpdateReferencesForResubmit`（TryMarkFreedObjectInUseAgain） | **不调用**（RemoveFinishedTaskReferences 未发生） |
+| **互斥性** | 不是严格互斥，而是上下游关系 | 由 `ResubmitTask` 通过 `queue_generator_resubmit_` 触发 |
+
+**调用流程**：
+
+```
+ObjectRecoveryManager::ReconstructObject
+  → ResubmitTask(task_id)
+    ├─ 普通 task → SetupTaskEntryForResubmit + UpdateReferencesForResubmit + async_retry
+    └─ streaming generator 正在运行 → queue_generator_resubmit_(spec)
+         → generator 完成后回调
+           → MarkGeneratorFailedAndResubmit(task_id)
+             → SetStatus(FAILED, GENERATOR_TASK_FAILED_FOR_OBJECT_RECONSTRUCTION)
+             → SetupTaskEntryForResubmit + async_retry
+```
+
+### 33.4 SetupTaskEntryForResubmit — 共享的重建准备逻辑
+
+```cpp
+// task_manager.cc:413-436
+void TaskManager::SetupTaskEntryForResubmit(TaskEntry &task_entry) {
+  task_entry.MarkRetry();  // ★ AttemptNumber +1
+  SetTaskStatus(task_entry, rpc::TaskStatus::PENDING_ARGS_AVAIL, ...);
+  num_pending_tasks_++;
+  total_lineage_footprint_bytes_ -= task_entry.lineage_footprint_bytes_;
+  task_entry.lineage_footprint_bytes_ = 0;
+  if (task_entry.num_retries_left_ > 0) {
+    task_entry.num_retries_left_--;
+  }
+}
+```
+
+### 33.5 UpdateReferencesForResubmit — 依赖对象重新可用
+
+```cpp
+// task_manager.cc:438-472
+void TaskManager::UpdateReferencesForResubmit(const TaskSpecification &spec,
+                                               std::vector<ObjectID> *task_deps) {
+  // 收集任务依赖
+  for (size_t i = 0; i < spec.NumArgs(); i++) {
+    if (spec.ArgByRef(i)) {
+      task_deps->emplace_back(spec.ArgObjectId(i));
+    }
+  }
+  reference_counter_.UpdateResubmittedTaskReferences(*task_deps);
+
+  // ★ 重新标记 freed 对象为可用
+  for (const auto &task_dep : *task_deps) {
+    bool was_freed = reference_counter_.TryMarkFreedObjectInUseAgain(task_dep);
+    if (was_freed) {
+      // 之前被 free 的依赖对象 → recovery 需要重新使用
+      in_memory_store_.Delete({task_dep});  // 删除 freed 标记
+    }
+  }
+}
+```
+
+### 33.6 HandleReportGeneratorItemReturns — Streaming Generator Return 过滤
+
+```cpp
+// task_manager.cc:779-879
+bool TaskManager::HandleReportGeneratorItemReturns(
+    const rpc::ReportGeneratorItemReturnsRequest &request, ...) {
+  const auto &generator_id = ObjectID::FromBinary(request.generator_id());
+  int64_t item_index = request.item_index();
+  int64_t attempt_number = request.attempt_number();
+
+  {
+    absl::MutexLock lock(&mu_);
+    auto it = submissible_tasks_.find(task_id);
+    if (it->second.spec_.AttemptNumber() > attempt_number) {
+      // ★ 过滤：当前 attempt_number > 报告的 attempt_number
+      // 来自上一次执行（已被 resubmit）的 stale 报告 → 忽略
+      execution_signal_callback(
+          Status::NotFound("Stale object reports from the previous attempt."), -1);
+      return false;
+    }
+  }
+
+  const auto store_in_plasma_ids = GetTaskReturnObjectsToStoreInPlasma(task_id);
+
+  if (request.has_returned_object()) {
+    const auto object_id = ObjectID::FromBinary(returned_object.object_id());
+    auto index_not_used_yet = stream_it->second.InsertToStream(object_id, item_index);
+    // ★ InsertToStream 返回 false → 对象已被消费 → 不重新注册
+    if (index_not_used_yet) {
+      reference_counter_.OwnDynamicStreamingTaskReturnRef(object_id, generator_id);
+    }
+    reference_counter_.UpdateObjectPendingCreation(object_id, false);
+    HandleTaskReturn(object_id, returned_object, worker_node_id,
+                     /*store_in_plasma=*/store_in_plasma_ids.contains(object_id));
+  }
+
+  if (stream_it->second.IsObjectConsumed(item_index)) {
+    // ★ 已消费的对象 → 直接返回 false
+    execution_signal_callback(Status::OK(), total_consumed);
+    return false;
+  }
+  // ... 背压逻辑
+}
+```
+
+### 33.7 GetTaskReturnObjectsToStoreInPlasma — 首次执行 vs Recovery 过滤
+
+```cpp
+// task_manager.cc:1533-1557
+absl::flat_hash_set<ObjectID> TaskManager::GetTaskReturnObjectsToStoreInPlasma(
+    const TaskID &task_id, bool *first_execution_out) const {
+  absl::flat_hash_set<ObjectID> store_in_plasma_ids = {};
+  auto it = submissible_tasks_.find(task_id);
+  bool first_execution = it->second.num_successful_executions_ == 0;
+  if (!first_execution) {
+    // ★ 非首次执行（Recovery）→ 只存储之前在 plasma 中的对象
+    store_in_plasma_ids = it->second.reconstructable_return_ids_;
+  }
+  // 首次执行 → 空集合 → 按正常逻辑决定（大对象进 plasma，小对象直接返回）
+  return store_in_plasma_ids;
+}
+```
+
+**Recovery 时的过滤**：只有 `reconstructable_return_ids_` 中的对象才会被存入 plasma，其他对象直接返回 in-memory。这避免了重建时产生不必要的 plasma 对象。
+
+### 33.8 Streaming Generator Recovery 完整流程
+
+```
+① OOM / 节点死亡 → 对象丢失
+  → Owner: RecoverObject → ResubmitTask(task_id)
+
+② ResubmitTask:
+  → generator 还在运行 → queue_generator_resubmit_(spec)
+  → generator 完成/失败 → MarkGeneratorFailedAndResubmit:
+    → SetStatus(FAILED, GENERATOR_TASK_FAILED_FOR_OBJECT_RECONSTRUCTION)
+    → SetupTaskEntryForResubmit → AttemptNumber +1
+    → async_retry_task_callback_ → 重新提交任务
+
+③ 重执行产生新 return objects
+  → HandleReportGeneratorItemReturns:
+    → 过滤 stale 报告（attempt_number < 当前 AttemptNumber）
+    → InsertToStream → 已消费的对象不重新注册
+    → GetTaskReturnObjectsToStoreInPlasma → 只存 reconstructable_return_ids_
+    → HandleTaskReturn → in_plasma=true: UpdateObjectPinnedAtRaylet
+                     → in_plasma=false: in_memory_store_.Put
+
+④ 新产生的"无用"对象（已消费的不需要恢复）
+  → InsertToStream 返回 false → 不调用 OwnDynamicStreamingTaskReturnRef
+  → AddObjectOutOfScopeOrFreedCallback 分支2 → return false → 立即 eviction
+  → 从 Plasma 中清除
+```
+
+---
+
+## 34. Push/Pull 数据到达后如何通知 HandleObjectAdded
+
+### 34.1 Push 路径
+
+```
+远端 HandlePush → ReceivePullChunk / ReceiveReplicationPushChunk
+  → buffer_pool_.CreateChunk → EnsureBufferExists
+    → store_client_->CreateAndSpillIfNeeded
+      → [IPC: CreateRequest] → PlasmaStore HandleCreateObjectRequest
+        → CreateObject → SealObjects (最后一个 chunk)
+          → add_object_callback_(object_info, source)
+            → [post 到 raylet 主线程]
+              → ObjectManager::HandleObjectAdded
+                → ReportObjectAdded → PullManager::PinNewObjectIfNeeded
+              → NodeManager::HandleObjectLocal
+```
+
+### 34.2 Pull 路径
+
+```
+PullManager → send_pull_request_ → gRPC PullRequest
+  → 远端 ObjectManager::HandlePull → Push
+    → 本地 ReceivePullChunk
+      → CreateChunk → CreateAndSpillIfNeeded → [IPC: CreateRequest]
+      → WriteChunk (逐 chunk)
+      → 最后 chunk: Seal → [IPC: SealRequest]
+        → PlasmaStore::SealObjects → add_object_callback_
+          → HandleObjectAdded + HandleObjectLocal
+```
+
+### 34.3 CreateOwnedAndIncrementLocalRef 路径
+
+```
+CoreWorker::PutInLocalPlasmaStore / AllocateReturnObject → Create
+  → PlasmaClient::CreateAndSpillIfNeeded → [IPC: CreateRequest]
+    → PlasmaStore::HandleCreateObjectRequest → CreateObject → AddToClientObjectIds
+  → Python: write_to → Seal
+    → PlasmaClient::Seal → [IPC: SealRequest]
+      → PlasmaStore::SealObjects → add_object_callback_
+        → HandleObjectAdded + HandleObjectLocal
+```
+
+### 34.4 add_object_callback_ — 统一通知入口
+
+```cpp
+// main.cc:806-812
+[&](const ray::ObjectInfo &object_info, plasma::flatbuf::ObjectSource source) {
+  main_service.post([&]() {
+    object_manager->HandleObjectAdded(object_info);
+    node_manager->HandleObjectLocal(object_info, source);
+  }, "ObjectManager.ObjectAdded");
+}
+```
+
+**所有路径最终都经过 `SealObjects` → `add_object_callback_`**：
+- Push 接收：最后一个 chunk 写完 → Seal
+- Pull 接收：最后一个 chunk 写完 → Seal
+- Worker 创建：Create + Write + Seal
+
+Seal 之前对象处于 `PLASMA_CREATED` 状态，不可 Get、不可 spill、不可淘汰。Seal 后变为 `PLASMA_SEALED`，触发所有后续逻辑（pin、上报、通知依赖等待者）。
+
+---
+
+## 35. available_memory_bytes 与 RayParams 内存配置详解
+
+### 35.1 计算链路
+
+```python
+# utils.py:527-586
+def resolve_object_store_memory(available_memory_bytes, object_store_memory=None):
+    if object_store_memory is None:
+        object_store_memory = available_memory_bytes * DEFAULT_OBJECT_STORE_MEMORY_PROPORTION
+        # ★ 默认 30% 的可用内存给 Plasma Store
+    # Linux 上：上限为 /dev/shm 大小
+    return object_store_memory
+
+# resource_and_label_spec.py:377-386
+available_memory_bytes = estimate_available_memory()
+object_store_memory = resolve_object_store_memory(available_memory_bytes)
+memory = available_memory_bytes - object_store_memory
+# ★ memory 作为调度资源，供 worker 进程使用
+```
+
+### 35.2 available_memory_bytes 的来源
+
+```python
+# utils.py — estimate_available_memory()
+# 优先使用 cgroup memory.limit_in_bytes（容器环境）
+# 如果 cgroup 值异常（如 9.2EB）→ fallback 到 /proc/meminfo MemTotal
+# 这就是 cgroup memory limit invalid 导致 OOM killer 计算错误的根因
+```
+
+### 35.3 三个内存参数的关系
+
+| 参数 | 用途 | 传递路径 |
+|------|------|---------|
+| `available_memory_bytes` | 计算 object_store_memory 和 memory 的源值 | Python 层计算 |
+| `object_store_memory` | Plasma Store 共享内存大小 | `--object-store-memory` → raylet → plasma store |
+| `memory` | 调度资源（worker 进程可用内存） | `--memory` → raylet 资源调度 |
+
+**关系**：`memory = available_memory_bytes - object_store_memory`
+
+### 35.4 cgroup memory limit 对 OOM killer 的影响
+
+```
+当 cgroup memory limit 未有效设置时：
+  → /sys/fs/cgroup/memory/memory.limit_in_bytes 返回 9223372036854771712 (~9.2 EB)
+  → estimate_available_memory() 用此值作为 available_memory_bytes
+  → object_store_memory = 9.2EB * 0.3 → 远超实际内存
+  → memory = 9.2EB - 200GB → 仍为 ~9.2EB
+  → raylet 认为有无限内存 → 过度调度 worker → OOM
+
+修复：
+  → 检测 cgroup memory limit 的有效性
+  → 无效时 fallback 到 /proc/meminfo MemTotal
+  → 或使用 cgroup v2 memory.max
+```
 
 ---
 
