@@ -32,6 +32,12 @@
 - [22. HandleObjectMissing vs HandleObjectFreed](#22-handleobjectmissing-vs-handleobjectfreed)
 - [23. Pull 依赖对象的完整生命周期](#23-pull-依赖对象的完整生命周期)
 - [24. CancelPull 的必要性](#24-cancelpull-的必要性)
+- [25. PlasmaClient::Release → SendReleaseRequest → Server RemoveReference 完整 IPC 链路](#25-plasmaclientrelease--sendreleaserequest--server-removereference-完整-ipc-链路)
+- [26. Owner Ref 深度分析：AddObjectOutOfScopeOrFreedCallback 与 Lineage 机制](#26-owner-ref-深度分析addobjectoutofscopeorfreedcallback-与-lineage-机制)
+- [27. Recovery 场景：Streaming Generator Return Objects 完整分析](#27-recovery-场景streaming-generator-return-objects-完整分析)
+- [28. HandleObjectMissing 对 spilled 条目的 Bug 分析与修复](#28-handleobjectmissing-对-spilled-条目的-bug-分析与修复)
+- [29. Pull 对象不会走 PinObjectsAndWaitForFree](#29-pull-对象不会走-pinobjectsandwaitforfree)
+- [30. 完整代码索引（补充二）](#30-完整代码索引补充二)
 
 ---
 
@@ -3613,3 +3619,812 @@ PullManager pin ──(PinLeaseArgs 接管)──→ PinLeaseArgs pin ──(lea
 | `active_object_pull_requests_` | PullManager | 占用 admission control 配额 | 新 pull 被限流 |
 
 Pull 完成后如果不 CancelPull，这些资源永远不会被清理。
+
+---
+
+## 25. PlasmaClient::Release → SendReleaseRequest → Server RemoveReference 完整 IPC 链路
+
+### 25.1 Client 端：PlasmaClient::Release
+
+```cpp
+// client.cc:487-530
+Status PlasmaClient::Release(const ObjectID &object_id) {
+  std::lock_guard<std::recursive_mutex> guard(client_mutex_);
+  const auto object_entry = objects_in_use_.find(object_id);
+  RAY_CHECK(object_entry != objects_in_use_.end());
+
+  object_entry->second->count -= 1;  // ★ count 递减
+  RAY_CHECK_GE(object_entry->second->count, 0);
+
+  if (object_entry->second->count == 0) {  // ★ 只有 count==0 才发 IPC
+    RAY_RETURN_NOT_OK(MarkObjectUnused(object_id));   // 从 objects_in_use_ 移除
+    RAY_RETURN_NOT_OK(SendReleaseRequest(store_conn_, object_id, may_unmap));
+    // ★ SendReleaseRequest 通过 Unix domain socket 发送 PlasmaReleaseRequest flatbuffer
+  }
+  return Status::OK();
+}
+```
+
+**关键**：count > 0 的 Release 是静默的，不发 IPC。只有 count 归零时才通知 server。
+
+### 25.2 IPC 消息：SendReleaseRequest
+
+```cpp
+// protocol.cc:SendReleaseRequest
+// 构造 PlasmaReleaseRequest flatbuffer:
+//   object_id: 被释放的对象 ID
+//   may_unmap: 客户端是否知道此对象用了 fallback-allocated fd
+// 通过 store_conn_ (Unix domain socket) 发送给 Plasma Store
+```
+
+### 25.3 Server 端：ProcessClientMessage → PlasmaReleaseRequest
+
+```cpp
+// store.cc:433-451
+case fb::MessageType::PlasmaReleaseRequest: {
+    bool may_unmap;
+    ObjectID object_id;
+    ReadReleaseRequest(input, input_size, &object_id, &may_unmap);
+    bool should_unmap = ReleaseObject(object_id, client);  // ★ client 标识释放者
+    if (!may_unmap) {
+      RAY_CHECK(!should_unmap)
+          << "Plasma client thinks a mmap should not be unmapped but server thinks so.";
+    }
+    if (may_unmap) {
+      RAY_RETURN_NOT_OK(
+          SendReleaseReply(client, object_id, should_unmap, PlasmaError::OK));
+    }
+  } break;
+```
+
+**may_unmap vs should_unmap**：
+- `may_unmap`：client 端判断（基于是否知道有 fallback fd）
+- `should_unmap`：server 端判断（基于 `RemoveFromClientObjectIds` → `MarkObjectAsUnused` → fallback fd refcount 归零）
+- server 回复 `should_unmap` 给 client，client 据此决定是否 munmap
+
+### 25.4 ReleaseObject → RemoveFromClientObjectIds → RemoveReference
+
+```cpp
+// store.cc:265-273
+bool PlasmaStore::ReleaseObject(const ObjectID &object_id,
+                                const std::shared_ptr<Client> &client) {
+  auto entry = object_lifecycle_mgr_.GetObject(object_id);
+  if (entry != nullptr) {
+    return RemoveFromClientObjectIds(object_id, client);
+  }
+  return false;
+}
+
+// store.cc:247-262
+bool PlasmaStore::RemoveFromClientObjectIds(const ObjectID &object_id,
+                                            const std::shared_ptr<Client> &client) {
+  auto &object_ids = client->GetObjectIDs();
+  auto it = object_ids.find(object_id);
+  if (it != object_ids.end()) {
+    bool should_unmap = client->MarkObjectAsUnused(object_id);
+    object_lifecycle_mgr_.RemoveReference(object_id);  // ★ server ref -1
+    return should_unmap;
+  } else {
+    return false;
+  }
+}
+```
+
+### 25.5 RemoveReference → EndObjectAccess → 加入 LRU
+
+```cpp
+// obj_lifecycle_mgr.cc:148-168
+bool ObjectLifecycleManager::RemoveReference(const ObjectID &object_id) {
+  auto entry = object_store_->GetObject(object_id);
+  entry->ref_count_--;
+  if (entry->ref_count_ > 0) {
+    return true;  // 还有其他 client 在用
+  }
+  // ref_count == 0
+  eviction_policy_->EndObjectAccess(object_id);  // 加入 LRU → 可淘汰
+  if (earger_deletion_objects_.count(object_id) > 0) {
+    DeleteObjectInternal(object_id);  // 立即删除
+  }
+  return true;
+}
+```
+
+### 25.6 DeleteObjectInternal → delete_object_callback_ → 通知 raylet
+
+```cpp
+// obj_lifecycle_mgr.cc:245-258
+void ObjectLifecycleManager::DeleteObjectInternal(const ObjectID &object_id) {
+  auto entry = object_store_->GetObject(object_id);
+  bool aborted = entry->state_ == ObjectState::PLASMA_CREATED;
+  stats_collector_->OnObjectDeleting(*entry);
+  earger_deletion_objects_.erase(object_id);
+  eviction_policy_->RemoveObject(object_id);
+  object_store_->DeleteObject(object_id);  // 释放内存 + 从 object_table_ 移除
+
+  if (!aborted) {
+    delete_object_callback_(object_id);  // ★ 通知 raylet
+  }
+}
+```
+
+### 25.7 delete_object_callback_ 的连接
+
+```cpp
+// main.cc:808-816
+[&](const ray::ObjectID &object_id) {
+  main_service.post(
+      [&object_manager, &node_manager, object_id]() {
+        object_manager->HandleObjectDeleted(object_id);
+        node_manager->HandleObjectMissing(object_id);
+      },
+      "ObjectManager.ObjectDeleted");
+}
+```
+
+**从 plasma store 线程 post 到 raylet 主线程**，执行两个操作：
+1. `HandleObjectDeleted`：清理本地 bookkeeping，上报 Owner `ReportObjectRemoved`，重置 pull 重试计时器
+2. `HandleObjectMissing`：通知 LeaseDependencyManager 对象不再本地，增加依赖此对象的 lease 的 missing_dependencies
+
+### 25.8 HandleObjectDeleted 完整代码
+
+```cpp
+// object_manager.cc:200-212
+void ObjectManager::HandleObjectDeleted(const ObjectID &object_id) {
+  auto it = local_objects_.find(object_id);
+  RAY_CHECK(it != local_objects_.end());
+  auto object_info = it->second.object_info;
+  local_objects_.erase(it);
+  used_memory_ -= object_info.data_size + object_info.metadata_size;
+  RAY_CHECK(!local_objects_.empty() || used_memory_ == 0);
+  object_directory_->ReportObjectRemoved(object_id, self_node_id_, object_info);
+  pull_manager_->ResetRetryTimer(object_id);
+}
+```
+
+### 25.9 HandleObjectMissing 完整代码
+
+```cpp
+// node_manager.cc:2454-2469
+void NodeManager::HandleObjectMissing(const ObjectID &object_id) {
+  const auto waiting_lease_ids = lease_dependency_manager_.HandleObjectMissing(object_id);
+  // ... 日志
+}
+
+// lease_dependency_manager.cc:276-298
+std::vector<LeaseID> LeaseDependencyManager::HandleObjectMissing(
+    const ray::ObjectID &object_id) {
+  RAY_CHECK(local_objects_.erase(object_id));
+  std::vector<LeaseID> waiting_lease_ids;
+  auto object_entry = required_objects_.find(object_id);
+  if (object_entry != required_objects_.end()) {
+    for (auto &dependent_lease_id : object_entry->second.dependent_leases) {
+      auto &lease_entry = queued_lease_requests_[dependent_lease_id];
+      if (lease_entry->num_missing_dependencies_ == 0) {
+        waiting_lease_ids.push_back(dependent_lease_id);
+      }
+      lease_entry->IncrementMissingDependencies();  // ★ 依赖计数 +1
+    }
+  }
+  return waiting_lease_ids;
+}
+```
+
+### 25.10 完整链路总结
+
+```
+PlasmaClient::Release (client count -1)
+  → count == 0?
+    ├─ No → 静默返回，不发 IPC
+    └─ Yes → MarkObjectUnused (从 objects_in_use_ 移除)
+           → SendReleaseRequest [Unix socket IPC]
+             → PlasmaStore::ProcessClientMessage (PlasmaReleaseRequest)
+               → ReleaseObject(object_id, client)
+                 → RemoveFromClientObjectIds
+                   → client->MarkObjectAsUnused (从 client object_ids 移除)
+                   → RemoveReference (server ref -1)
+                     → ref > 0? → 返回
+                     → ref == 0?
+                       → EndObjectAccess (加入 LRU，可淘汰)
+                       → 或 EvictObjects/DeleteObjectInternal:
+                         → object_store_->DeleteObject (释放内存)
+                         → delete_object_callback_ [post 到 raylet 主线程]
+                           → HandleObjectDeleted (上报 Owner, 清理 bookkeeping)
+                           → HandleObjectMissing (通知 lease 依赖缺失)
+```
+
+---
+
+## 26. Owner Ref 深度分析：AddObjectOutOfScopeOrFreedCallback 与 Lineage 机制
+
+### 26.1 LineageReconstructionEligibility 枚举
+
+```cpp
+// reference_counter_interface.h:36-49
+enum class LineageReconstructionEligibility {
+  ELIGIBLE,                    // 可通过重执行 task 来恢复对象
+  INELIGIBLE_PUT,              // ray.put() 创建，没有 task lineage 可重放
+  INELIGIBLE_NO_RETRIES,       // max_retries=0，任务不允许重试
+  INELIGIBLE_LINEAGE_EVICTED,  // lineage 因内存压力被 evict
+  INELIGIBLE_LINEAGE_DISABLED,  // 系统禁用了 lineage pinning
+  INELIGIBLE_REF_NOT_FOUND,    // ref table 中找不到
+};
+```
+
+**ELIGIBLE 的含义**：这个对象可以通过重新执行产生它的 task 来恢复。前提是 task 的 lineage（依赖链）还在，且 task 还允许重试。
+
+**lineage_eligibility_ 的设置**：
+
+```cpp
+// task_manager.cc:268-275 — AddPendingTask 中
+if (!spec.IsActorCreationTask()) {
+  LineageReconstructionEligibility lineage_eligibility;
+  if (max_retries == 0) {
+    lineage_eligibility = LineageReconstructionEligibility::INELIGIBLE_NO_RETRIES;
+  } else {
+    lineage_eligibility = LineageReconstructionEligibility::ELIGIBLE;  // ★ 通常情况
+  }
+  // ... 传递给 AddOwnedObject
+}
+```
+
+**streaming generator return objects 继承 generator 的 eligibility**：
+
+```cpp
+// reference_counter.cc:240-274 — OwnDynamicStreamingTaskReturnRef
+void ReferenceCounter::OwnDynamicStreamingTaskReturnRef(const ObjectID &object_id,
+                                                        const ObjectID &generator_id) {
+  auto outer_it = object_id_refs_.find(generator_id);
+  RAY_CHECK(outer_it->second.owned_by_us_);
+  RAY_UNUSED(AddOwnedObjectInternal(object_id,
+                                    {},
+                                    owner_address,
+                                    outer_it->second.call_site_,
+                                    /*object_size=*/-1,
+                                    outer_it->second.lineage_eligibility_,  // ★ 继承
+                                    /*add_local_ref=*/true,
+                                    std::optional<NodeID>(),
+                                    /*tensor_transport=*/std::nullopt));
+}
+```
+
+### 26.2 OutOfScope 与 ShouldDelete — lineage_eligibility_ 的影响
+
+```cpp
+// reference_counter.h:197-215
+bool OutOfScope(bool lineage_pinning_enabled) const {
+  bool in_scope = RefCount() > 0;
+  bool is_nested = !nested().contained_in_borrowed_ids.empty();
+  bool has_borrowers = !borrow().borrowers.empty();
+  bool was_stored_in_objects = !borrow().stored_in_objects.empty();
+
+  bool has_lineage_references = false;
+  if (lineage_pinning_enabled && owned_by_us_ &&
+      lineage_eligibility_ != LineageReconstructionEligibility::ELIGIBLE) {
+    // ★ 只有非 ELIGIBLE 时 lineage_ref_count 才影响 OutOfScope
+    has_lineage_references = lineage_ref_count > 0;
+  }
+  // ELIGIBLE 时 has_lineage_references 永远是 false
+
+  return !(in_scope || is_nested || has_nested_refs_to_report || has_borrowers ||
+           was_stored_in_objects || has_lineage_references);
+}
+
+// reference_counter.h:217-224
+bool ShouldDelete(bool lineage_pinning_enabled) const {
+  if (lineage_pinning_enabled) {
+    return OutOfScope(lineage_pinning_enabled) && (lineage_ref_count == 0);
+    // ★ OutOfScope=true 但 lineage_ref_count > 0 → ShouldDelete=false
+  } else {
+    return OutOfScope(lineage_pinning_enabled);
+  }
+}
+```
+
+**为什么 ELIGIBLE 不看 lineage_ref_count，非 ELIGIBLE 要看**：
+
+| eligibility | RefCount=0, lineage_ref>0 | OutOfScope | Plasma 副本 | 含义 |
+|-------------|---------------------------|------------|-------------|------|
+| ELIGIBLE | has_lineage_references=false | **true** | 释放（eviction） | 可重建，不需要保留副本 |
+| INELIGIBLE_PUT | has_lineage_references=true | **false** | 保留 | 不可重建，必须保留副本 |
+| INELIGIBLE_NO_RETRIES | has_lineage_references=true | **false** | 保留 | 不可重试，必须保留副本 |
+
+**核心区别**：ELIGIBLE 对象丢了可以重建，所以 `OutOfScope=true` 时即使 `lineage_ref_count>0` 也释放 Plasma 副本。但 `ShouldDelete` 仍要求 `lineage_ref_count==0` — ref 记录保留在 `object_id_refs_` 中，只是 Plasma 副本被释放了。非 ELIGIBLE 对象不能重建，必须保留 Plasma 副本到 `lineage_ref_count==0`。
+
+### 26.3 AddObjectOutOfScopeOrFreedCallback — 四分支详细逻辑
+
+```cpp
+// reference_counter.cc:581-595
+bool ReferenceCounter::AddObjectOutOfScopeOrFreedCallback(
+    const ObjectID &object_id, const std::function<void(const ObjectID &)> callback) {
+  absl::MutexLock lock(&mutex_);
+  auto it = object_id_refs_.find(object_id);
+
+  // ─── 分支1: 对象不在 ref table 中 ───
+  if (it == object_id_refs_.end()) {
+    return false;  // 对象已完全 GC（从 ref table 中删除）
+  }
+
+  // ─── 分支2: 对象已 OutOfScope 但不能 Delete ───
+  else if (it->second.OutOfScope(lineage_pinning_enabled_) &&
+           !it->second.ShouldDelete(lineage_pinning_enabled_)) {
+    // OutOfScope=true 但 lineage_ref_count > 0（仅 ELIGIBLE 对象）
+    // OnObjectOutOfScopeOrFreed 已经执行过 → callbacks 已清空
+    // 注册新 callback 永远不会被触发 → 必须返回 false → 立即 unpin
+    return false;
+  }
+
+  // ─── 分支3: 对象已被 freed ───
+  else if (freed_objects_.contains(object_id)) {
+    // 应用层主动 free 了对象（如 ray.internal.free）
+    return false;  // 立即 unpin
+  }
+
+  // ─── 分支4: 对象还在 scope → 注册回调 ───
+  it->second.on_object_out_of_scope_or_freed_callbacks.emplace_back(callback);
+  return true;  // 注册成功，等 OutOfScope 时触发
+}
+```
+
+**为什么分支2不能只判断 OutOfScope**：
+
+如果只判断 `OutOfScope` 就返回 false，情况 B（`OutOfScope && ShouldDelete`）也会返回 false → 立即 unpin。但此时 `DeleteReferenceInternal` 可能还没执行，`OnObjectOutOfScopeOrFreed` 也还没被调用。虽然立即 unpin 也能释放 raylet 的 Plasma 副本，但跳过了正常的 callback 流程，可能导致其他已注册的 callback 未被正确触发。
+
+`OutOfScope && !ShouldDelete` 精确区分了：
+- **不能注册 callback**：`OnObjectOutOfScopeOrFreed` 已执行过，callbacks 已清空（情况 A：ELIGIBLE + lineage_ref>0）
+- **可以注册 callback**：`DeleteReferenceInternal` 还没执行，callbacks 还没被触发（情况 B：RefCount>0）
+
+所有分支的精确条件：
+
+| 分支 | 条件 | 返回值 | 含义 |
+|------|------|--------|------|
+| 1 | `object_id_refs_` 中找不到 | false | 对象已完全 GC（从 ref table 中删除） |
+| 2 | `OutOfScope && !ShouldDelete` | false | RefCount=0 但 lineage_ref>0（仅 ELIGIBLE） → callbacks 已清空，立即 unpin |
+| 3 | 在 `freed_objects_` 中 | false | 应用层主动 free → 立即 unpin |
+| 4 | 其他（还在 scope） | true | 注册回调，等 OutOfScope 时触发 |
+
+### 26.4 DeleteReferenceInternal — 完整代码
+
+```cpp
+// reference_counter.cc:466-503
+void ReferenceCounter::DeleteReferenceInternal(ReferenceTable::iterator it,
+                                               std::vector<ObjectID> *deleted) {
+  const ObjectID id = it->first;
+
+  if (it->second.RefCount() == 0 && it->second.publish_ref_removed) {
+    PublishRefRemovedInternal(id);
+    it->second.publish_ref_removed = false;
+  }
+
+  if (it->second.OutOfScope(lineage_pinning_enabled_)) {
+    // 递归处理 nested 对象
+    for (const auto &inner_id : it->second.nested().contains) {
+      auto inner_it = object_id_refs_.find(inner_id);
+      if (inner_it != object_id_refs_.end()) {
+        if (it->second.owned_by_us_) {
+          RAY_CHECK(inner_it->second.mutable_nested()->contained_in_owned.erase(id));
+        } else {
+          RAY_CHECK(inner_it->second.mutable_nested()->contained_in_borrowed_ids.erase(id));
+        }
+        DeleteReferenceInternal(inner_it, deleted);
+      }
+    }
+    OnObjectOutOfScopeOrFreed(it);  // ★ 触发 eviction callbacks
+    if (deleted != nullptr) {
+      deleted->push_back(id);
+    }
+  }
+
+  if (it->second.ShouldDelete(lineage_pinning_enabled_)) {
+    ReleaseLineageReferences(it);  // 递归减少依赖对象的 lineage_ref_count
+    EraseReference(it);            // 从 object_id_refs_ 中删除
+  }
+}
+```
+
+**关键**：`OutOfScope` 和 `ShouldDelete` 是两个独立判断。ELIGIBLE 对象可能 `OutOfScope=true`（触发 eviction，释放 Plasma 副本）但 `ShouldDelete=false`（`lineage_ref_count>0`，ref 记录保留）。
+
+### 26.5 OnObjectOutOfScopeOrFreed — 触发并清空 callbacks
+
+```cpp
+// reference_counter.cc:563-571
+void ReferenceCounter::OnObjectOutOfScopeOrFreed(ReferenceTable::iterator it) {
+  for (const auto &callback : it->second.on_object_out_of_scope_or_freed_callbacks) {
+    callback(it->first);  // ★ 触发所有已注册的回调
+  }
+  it->second.on_object_out_of_scope_or_freed_callbacks.clear();  // ★ 清空
+  UpdateOwnedObjectCounters(it->first, it->second, /*decrement=*/true);
+  UnsetObjectPrimaryCopy(it);  // pinned_at_node_id_.reset()
+  UpdateOwnedObjectCounters(it->first, it->second, /*decrement=*/false);
+}
+```
+
+### 26.6 FreePlasmaObjects — 应用层主动 free
+
+```cpp
+// reference_counter.cc:358-376
+void ReferenceCounter::FreePlasmaObjects(const std::vector<ObjectID> &object_ids) {
+  absl::MutexLock lock(&mutex_);
+  for (const ObjectID &object_id : object_ids) {
+    auto it = object_id_refs_.find(object_id);
+    if (it == object_id_refs_.end()) {
+      continue;
+    }
+    freed_objects_.insert(object_id);  // ★ 标记为 freed
+    if (!it->second.owned_by_us_) {
+      continue;
+    }
+    OnObjectOutOfScopeOrFreed(it);  // 立即触发 eviction
+  }
+}
+```
+
+**触发路径**：`ray.internal.free(object_id)` → `DeleteImpl` → `FreePlasmaObjects`（应用层主动 free）
+
+### 26.7 TryMarkFreedObjectInUseAgain — Recovery 时重新使用
+
+```cpp
+// reference_counter.cc:349-354
+bool ReferenceCounter::TryMarkFreedObjectInUseAgain(const ObjectID &object_id) {
+  absl::MutexLock lock(&mutex_);
+  if (!object_id_refs_.contains(object_id)) {
+    return false;
+  }
+  return freed_objects_.erase(object_id) != 0u;  // ★ 从 freed 集合中移除
+}
+```
+
+在 `UpdateReferencesForResubmit` 中被调用（`task_manager.cc:460`）—— recovery 重提交时，之前被 free 的依赖对象需要重新使用，清除 freed 标记。
+
+### 26.8 EraseReference — 从 ref table 中完全删除
+
+```cpp
+// reference_counter.cc:505-525
+void ReferenceCounter::EraseReference(ReferenceTable::iterator it) {
+  object_info_publisher_->PublishFailure(
+      rpc::ChannelType::WORKER_OBJECT_LOCATIONS_CHANNEL, it->first.Binary());
+
+  RAY_CHECK(it->second.ShouldDelete(lineage_pinning_enabled_));
+  // ... 清理 reconstructable 索引
+  freed_objects_.erase(it->first);  // ★ 从 freed 集合中移除
+  // ... 更新计数器
+  for (const auto &callback : it->second.object_ref_deleted_callbacks) {
+    callback(it->first);
+  }
+  object_id_refs_.erase(it);  // ★ 从 ref table 中删除
+  ShutdownIfNeeded();
+}
+```
+
+### 26.9 RemoveSubmittedTaskReferences — lineage_ref_count 递减
+
+```cpp
+// reference_counter.cc:308-322
+void ReferenceCounter::RemoveSubmittedTaskReferences(
+    const std::vector<ObjectID> &argument_ids,
+    bool release_lineage,
+    std::vector<ObjectID> *deleted) {
+  for (const ObjectID &argument_id : argument_ids) {
+    auto it = object_id_refs_.find(argument_id);
+    if (it == object_id_refs_.end()) {
+      return;
+    }
+    it->second.submitted_task_ref_count--;
+    if (release_lineage) {  // ★ 关键分支
+      if (it->second.lineage_ref_count > 0) {
+        it->second.lineage_ref_count--;  // ★ 递减
+      }
+    }
+    if (it->second.RefCount() == 0) {
+      DeleteReferenceInternal(it, deleted);
+    }
+  }
+}
+```
+
+**`release_lineage` 的来源**：任务不可再重试时 `release_lineage=true`（如 max_retries 耗尽），此时 lineage_ref_count 才递减。任务仍可重试时 `release_lineage=false`，lineage 保留。
+
+### 26.10 object_id_refs_ 和 freed_objects_ 完整更新生命周期
+
+#### 增加到 object_id_refs_
+
+| 路径 | 函数 | 场景 |
+|------|------|------|
+| `AddOwnedObject` | `AddOwnedObjectInternal` | 对象首次创建 |
+| `OwnDynamicStreamingTaskReturnRef` | `AddOwnedObjectInternal` | streaming generator return 首次上报 |
+| `AddBorrowedObject` | emplace | 借用对象 |
+| `AddLocalReference` | emplace（如不存在） | 本地引用 |
+
+#### 从 object_id_refs_ 中删除（EraseReference）
+
+**完整条件**：`RefCount() == 0` 且 `OutOfScope == true` 且 `ShouldDelete == true`（即 `lineage_ref_count == 0`）
+
+| 场景 | lineage_eligibility_ | 触发 |
+|------|---------------------|------|
+| 应用层释放 + lineage 已归零 | 任何 | `RemoveLocalReference` → `RefCount==0` → `DeleteReferenceInternal` → `ShouldDelete=true` → `EraseReference` |
+| 应用层释放 + ELIGIBLE + lineage>0 | ELIGIBLE | `OutOfScope=true`（eviction 触发）但 `ShouldDelete=false` → ref 保留 → 等 `lineage_ref_count==0` |
+| 应用层释放 + INELIGIBLE + lineage>0 | INELIGIBLE | `OutOfScope=false` → ref 保留 → 等 `lineage_ref_count==0` |
+
+#### freed_objects_ 的增加
+
+| 路径 | 函数 | 场景 |
+|------|------|------|
+| `FreePlasmaObjects` | `freed_objects_.insert(obj)` | `ray.internal.free` / `SealExisting(pin_object=false)` |
+
+#### freed_objects_ 的移除
+
+| 路径 | 函数 | 场景 |
+|------|------|------|
+| `EraseReference` | `freed_objects_.erase(it->first)` | 对象完全 GC 时清理 |
+| `TryMarkFreedObjectInUseAgain` | `freed_objects_.erase(object_id)` | recovery 重提交时重新使用 |
+
+### 26.11 完整生命周期图
+
+```
+对象创建:
+  AddOwnedObject → object_id_refs_.insert(obj)
+  freed_objects_: 无
+
+应用层使用中:
+  RefCount > 0 → OutOfScope = false
+  → Plasma 副本保留
+  → object_id_refs_ 中有
+
+应用层释放 (del obj):
+  RemoveLocalReference → local_ref_count-- → RefCount == 0
+
+  ┌─ ELIGIBLE 对象:
+  │   OutOfScope = true (不看 lineage_ref)
+  │   → OnObjectOutOfScopeOrFreed → eviction → Plasma 副本释放
+  │   → ShouldDelete = (lineage_ref == 0)?
+  │     ├─ yes → EraseReference → object_id_refs_.erase(obj) + freed_objects_.erase(obj)
+  │     └─ no  → 保留在 object_id_refs_ 中 (无 Plasma 副本, 等 lineage 归零)
+  │
+  └─ INELIGIBLE 对象:
+      OutOfScope = false (lineage_ref > 0 阻止)
+      → 不触发 eviction → Plasma 副本保留
+      → 等待 lineage_ref_count 归零 → OutOfScope=true → eviction → EraseReference
+
+应用层主动 free (ray.internal.free):
+  FreePlasmaObjects:
+  → freed_objects_.insert(obj) ★ 标记为 freed
+  → OnObjectOutOfScopeOrFreed → eviction → Plasma 副本释放
+  → ref 保留在 object_id_refs_ 中 (保留 ownership)
+  → 后续 AddObjectOutOfScopeOrFreedCallback 分支3 → return false → 立即 unpin
+
+lineage 最终释放:
+  RemoveSubmittedTaskReferences(release_lineage=true) → lineage_ref_count--
+  → lineage_ref_count == 0:
+    → ShouldDelete = true
+    → EraseReference:
+      → object_id_refs_.erase(obj)
+      → freed_objects_.erase(obj)
+
+recovery 重提交时:
+  TryMarkFreedObjectInUseAgain(obj):
+  → freed_objects_.erase(obj) → 对象重新可用
+```
+
+### 26.12 状态完整对照表
+
+| RefCount | lineage_ref | eligibility | OutOfScope | ShouldDelete | 在 ref_table | Plasma 副本 |
+|----------|-----------|-------------|------------|--------------|-------------|-------------|
+| >0 | 任何值 | 任何 | false | false | 是 | 保留 |
+| 0 | >0 | ELIGIBLE | **true** | false | 是 | 释放(eviction) |
+| 0 | 0 | ELIGIBLE | true | **true** | 删除 | 释放(eviction) |
+| 0 | >0 | INELIGIBLE_PUT | **false** | false | 是 | **保留** |
+| 0 | 0 | INELIGIBLE_PUT | true | **true** | 删除 | 释放(eviction) |
+
+---
+
+## 27. Recovery 场景：Streaming Generator Return Objects 完整分析
+
+### 27.1 场景假设
+
+- Task 产生 3 个 return objects: obj1, obj2, obj3
+- obj1 已被应用层消费（Python ref 释放），但 lineage_ref_count > 0
+- obj2, obj3 仍被应用层持有
+- generator 的 lineage_eligibility_ = ELIGIBLE（max_retries > 0）
+- 执行节点 NodeA 被 kill → Owner 触发 recovery → NodeB 重新执行
+
+### 27.2 NodeA Kill 后 Owner 端状态
+
+```
+ResetObjectsOnRemovedNode(NodeA):
+  obj1: pinned_at_node_id_ 已 reset → 不在 objects_to_recover_ 中
+  obj2: pinned_at == NodeA → UnsetObjectPrimaryCopy → objects_to_recover_
+  obj3: 同 obj2
+```
+
+### 27.3 NodeB 重新执行，创建 obj1/obj2/obj3
+
+```
+NodeB executor: Create+Seal obj1/obj2/obj3
+  → HandleObjectAdded (NodeB)
+  → PinObjectIDs(owner_address, generator_id)
+  → NodeB raylet pin → 订阅 owner 的 WORKER_OBJECT_EVICTION
+```
+
+### 27.4 Owner 收到订阅请求 — ProcessSubscribeForObjectEviction
+
+```
+Owner Worker:
+  → ProcessSubscribeForObjectEviction:
+    → TemporarilyOwnGeneratorReturnRefIfNeeded(generator_id, obj_id):
+      → InsertToStream:
+        obj1: item_index(0) < next_index_ → 已消费 → return false
+        obj2: 未消费 → return true → 临时拥有
+        obj3: 同 obj2
+
+    → AddObjectOutOfScopeOrFreedCallback(obj_id, unpin_object):
+      obj1: 分支2 → OutOfScope=true(ELIGIBLE,不看lineage), ShouldDelete=false(lineage>0) → return false
+        ★ 立即 unpin_object(obj1) → Publish WORKER_OBJECT_EVICTION
+        → NodeB raylet 收到 → ReleaseFreedObject → Plasma 删除 obj1 ★
+
+      obj2: 分支4 → OutOfScope=false(RefCount>0) → return true
+        → 注册回调，等 RefCount 归零时触发
+
+      obj3: 同 obj2
+```
+
+### 27.5 关键分析：obj1 为什么立即被清除
+
+对 ELIGIBLE 的 streaming generator return objects：
+
+1. obj1 的 RefCount=0（应用层已释放），lineage_ref_count>0
+2. `lineage_eligibility_ = ELIGIBLE` → `OutOfScope` 中 `has_lineage_references=false`
+3. `OutOfScope = true` → `OnObjectOutOfScopeOrFreed` 已在之前被调用过 → callbacks 已清空
+4. `AddObjectOutOfScopeOrFreedCallback` 分支2返回 false → 立即 unpin
+5. NodeB 上 obj1 被 ReleaseFreedObject → 从 Plasma 中清除
+
+**obj1 不会泄漏**：虽然 ref 记录仍保留在 owner 的 `object_id_refs_` 中（`ShouldDelete=false`），但 Plasma 副本不保留在 NodeB 上。
+
+### 27.6 obj1 在 Owner 端的最终清理
+
+```
+任务不可再重试 → release_lineage=true → lineage_ref_count--
+  → lineage_ref_count == 0 → ShouldDelete = true
+  → DeleteReferenceInternal:
+    → OutOfScope → OnObjectOutOfScopeOrFreed → eviction callbacks
+    → ShouldDelete=true → ReleaseLineageReferences → EraseReference
+      → object_id_refs_.erase(obj1) + freed_objects_.erase(obj1)
+```
+
+### 27.7 obj1 在 NodeB 上的清除时机总结
+
+| obj1 在 owner 端的状态 | AddObjectOutOfScopeOrFreedCallback 返回 | NodeB 上 obj1 何时清除 |
+|----------------------|--------------------------------------|---------------------|
+| 已从 object_id_refs_ 中删除（完全 GC） | false（分支1） | 立即 eviction |
+| 在 freed_objects_ 中（应用层主动 free） | false（分支3） | 立即 eviction |
+| RefCount=0, lineage_ref>0, ELIGIBLE | false（分支2） | 立即 eviction |
+| RefCount=0, lineage_ref>0, INELIGIBLE_PUT | true（分支4） | 延迟 → lineage 释放后 eviction |
+| RefCount>0（应用层还在用） | true（分支4） | 延迟 → ref 归零后 eviction |
+
+---
+
+## 28. HandleObjectMissing 对 spilled 条目的 Bug 分析与修复
+
+### 28.1 问题描述
+
+`HandleObjectMissing` 由 `delete_object_callback_`（LRU evict）触发。原实现对 spilled 条目直接 erase + unsubscribe，导致整个 Scheme C（spill 后可恢复）失效：
+
+```
+HandleObjectMissing (原实现):
+  对 spilled replicated entry:
+    → spilled_object_ids_.erase(object_id)  // ★ spill URL 丢失
+    → Unsubscribe(object_id)                  // ★ 取消 owner 订阅
+```
+
+### 28.2 Bug 产生的连锁后果
+
+```
+1. spill URL 丢失
+   → GetSpilledReplicatedObjectURL 返回 ""
+   → Recovery 无法 restore（找不到数据源）
+
+2. IsSpilledReplicatedObject 返回 false
+   → Push 不跳过 spilled replicated 对象
+   → 走 unfulfilled_push_requests_ 等待 → 超时
+
+3. NM 补调 ReportObjectAdded
+   → 把节点加回 owner locations
+   → 但下一秒 HandleObjectMissing 又清了 spill 条目
+   → 循环：加进去又被移除
+```
+
+### 28.3 修复方案
+
+**HandleObjectMissing 对 spilled 条目改为 no-op**（保留 spill 条目和订阅），只有 HandleObjectFreed（owner GC）或 ReleasePins 才真正清理：
+
+```
+HandleObjectMissing (修复后):
+  if (IsSpilledReplicatedObject(object_id)):
+    → return  // ★ 保留 spill 条目和订阅，不做任何操作
+  // 非 spilled 对象正常处理
+  → erased = spilled_object_ids_.erase(object_id)
+  → ...
+```
+
+### 28.4 HandleObjectMissing vs HandleObjectFreed 语义对比
+
+| | HandleObjectMissing | HandleObjectFreed（ReleaseFreedObject） |
+|---|---|---|
+| **触发** | LRU evict → `delete_object_callback_` | owner GC → eviction pub/sub → `subscription_callback` |
+| **语义** | "内存中没了，磁盘副本仍有效" | "对象生命周期结束，磁盘副本也应该删除" |
+| **对 spilled entry** | **保留**（修复后 no-op） | 删除（`spilled_object_pending_delete_` 入队） |
+| **对 `spilled_replicated_bytes_current_`** | 不减 | 减（磁盘占用释放） |
+| **对 subscription** | 保留不变 | 取消订阅 |
+| **是否触发磁盘删除** | 否 | 是 |
+
+---
+
+## 29. Pull 对象不会走 PinObjectsAndWaitForFree
+
+### 29.1 确认
+
+Pull 来的对象（PullManager pin / PinLeaseArgs）**不会**走 `PinObjectsAndWaitForFree`。只有以下场景才触发 `PinObjectsAndWaitForFree`：
+
+| 场景 | 入口 | 说明 |
+|------|------|------|
+| Put（owner 本地小对象） | `CoreWorker::PutInLocalPlasmaStore` → `PinObjectIDs` | Create + Seal + Pin |
+| SealExisting（task 返回值） | `SealExisting` → `PinObjectIDs` | Create + Seal + Pin |
+| PinExistingReturnObject | `PinExistingReturnObject` → `PinObjectIDs` | 已有对象 + Pin |
+| Restore（spill 恢复后） | `OnObjectSpilled` 后恢复 | 恢复到 Plasma 后重新 Pin |
+
+**Pull 路径的保护链**：
+```
+PullManager::TryPinObject (临时 pin)
+  → PinLeaseArgsIfMemoryAvailable (lease 级 pin)
+    → CleanupLease → ReleaseLeaseArgs → 无保护 → LRU 可淘汰
+```
+
+**关键区别**：PullManager 不订阅 owner 的 `WORKER_OBJECT_EVICTION`，不上报 owner 的 `pinned_at_node_id_`。Pull 来的临时对象 lease 完成后即可被 LRU 淘汰。
+
+### 29.2 Pull 对象 LRU 后的 notification 流程
+
+```
+Plasma LRU 淘汰 Pull 来的对象:
+  → DeleteObjectInternal → delete_object_callback_
+    → HandleObjectDeleted: ReportObjectRemoved → Owner 从 locations 移除此节点
+    → HandleObjectMissing: LeaseDependencyManager 依赖缺失 +1
+```
+
+Pull 对象被淘汰后，如果该对象还被 lease 依赖，LeaseDependencyManager 会增加 missing_dependencies，触发重新 pull。
+
+---
+
+## 30. 完整代码索引（补充二）
+
+### Owner Ref 完整代码
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `reference_counter_interface.h` | 36 | `LineageReconstructionEligibility` | enum 定义 |
+| `reference_counter.h` | 197 | `OutOfScope()` | 判断对象是否 out of scope |
+| `reference_counter.h` | 217 | `ShouldDelete()` | 判断是否可删除 ref |
+| `reference_counter.h` | 247 | `lineage_eligibility_` | 继承自 generator |
+| `reference_counter.h` | 253 | `lineage_ref_count` | lineage 引用计数 |
+| `reference_counter.h` | 263 | `on_object_out_of_scope_or_freed_callbacks` | eviction 回调列表 |
+| `reference_counter.h` | 727 | `object_id_refs_` | 核心引用表 |
+| `reference_counter.h` | 734 | `freed_objects_` | 主动 freed 集合 |
+| `reference_counter.cc` | 581 | `AddObjectOutOfScopeOrFreedCallback` | 四分支逻辑 |
+| `reference_counter.cc` | 466 | `DeleteReferenceInternal` | OutOfScope → eviction + 可能 Erase |
+| `reference_counter.cc` | 563 | `OnObjectOutOfScopeOrFreed` | 触发 + 清空 callbacks |
+| `reference_counter.cc` | 358 | `FreePlasmaObjects` | 主动 freed + eviction |
+| `reference_counter.cc` | 349 | `TryMarkFreedObjectInUseAgain` | recovery 重新使用 |
+| `reference_counter.cc` | 505 | `EraseReference` | 从 ref table 完全删除 |
+| `reference_counter.cc` | 308 | `RemoveSubmittedTaskReferences` | lineage_ref_count 递减 |
+| `reference_counter.cc` | 240 | `OwnDynamicStreamingTaskReturnRef` | 继承 generator eligibility |
+| `task_manager.cc` | 268 | `AddPendingTask` | max_retries → eligibility 设置 |
+
+### delete_object_callback_ 完整代码
+
+| 文件 | 行号 | 函数 | 说明 |
+|------|------|------|------|
+| `common.h` | 246 | `DeleteObjectCallback` | type 定义 |
+| `store.h` | 251 | `delete_object_callback_` | PlasmaStore 成员 |
+| `store.cc` | 85 | 构造函数传给 ObjectLifecycleManager | |
+| `obj_lifecycle_mgr.cc` | 245 | `DeleteObjectInternal` | 调用 delete_object_callback_ |
+| `main.cc` | 808 | delete_object_callback_ 实现 | HandleObjectDeleted + HandleObjectMissing |
+| `object_manager.cc` | 200 | `HandleObjectDeleted` | 清理 + 上报 + 重置 pull |
+| `node_manager.cc` | 2454 | `HandleObjectMissing` | 通知 lease 依赖缺失 |
+| `lease_dependency_manager.cc` | 276 | `HandleObjectMissing` | IncrementMissingDependencies |
