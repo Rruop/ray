@@ -10,6 +10,7 @@
 - [2. Client Count 详解](#2-client-count-详解)
 - [3. Server ref_count 详解](#3-server-ref_count-详解)
   - [3.5 Server 端多 Client 管理架构](#35-server-端多-client-管理架构)
+    - [3.5.1~3.5.15 Socket监听/Client创建/消息循环/分发/引用注册释放/断连清理/fd管理](#35-server-端多-client-管理架构)
 - [4. Owner Ref 详解](#4-owner-ref-详解)
 - [5. 三套计数的联动关系](#5-三套计数的联动关系)
 - [6. 完整链路 1：Put（owner 本地小对象）](#6-完整链路-1putowner-本地小对象)
@@ -286,133 +287,473 @@ void EvictionPolicy::EndObjectAccess(const ObjectID &object_id) {
 
 PlasmaStore 是**单进程单线程**，通过一个 Unix domain socket 监听，所有 PlasmaClient 都连到同一个 socket。Server 端不关心"Worker"还是"Raylet"的身份标签，只认 `Client*` 指针（即 socket 连接）。
 
-#### 3.5.1 每个 PlasmaClient 连接时，Server 创建独立的 Client 对象
+#### 3.5.1 Unix Domain Socket 监听 — DoAccept
 
 ```cpp
-// store.cc:502 — 持续监听 Unix socket 的新连接
+// store.cc:502-505
 void PlasmaStore::DoAccept() {
-  acceptor_.async_accept(socket_,
-      boost::bind(&PlasmaStore::ConnectClient, this, placeholders::error));
+  acceptor_.async_accept(
+      socket_,
+      boost::bind(&PlasmaStore::ConnectClient, this, boost::asio::placeholders::error));
 }
+```
 
-// store.cc:304 — 每个新连接创建一个 Client 对象
+**机制**：`acceptor_` 是 boost::asio 的 `local::stream_protocol::acceptor`，绑定在 `/tmp/plasma_store_socket` 上。`async_accept` 是非阻塞的——有新连接时回调 `ConnectClient`，没有时挂起不消耗 CPU。`DoAccept` 在 `ConnectClient` 末尾再次调用（line 326），形成**循环监听**。
+
+#### 3.5.2 新连接到达 — ConnectClient 创建 Client 对象
+
+```cpp
+// store.cc:303-327
 void PlasmaStore::ConnectClient(const boost::system::error_code &error) {
-  auto new_connection = Client::Create(
-      [this](const std::shared_ptr<Client> &client, MessageType msg_type, const vector<uint8_t> &msg) {
-        return ProcessClientMessage(client, msg_type, msg);
-      },
-      [this](const std::shared_ptr<Client> &client, const error_code &err) {
-        HandleClientConnectionError(client, err);
-      },
-      std::move(socket_));
-  new_connection->ProcessMessages();
-  DoAccept();
+  if (!error) {
+    auto new_connection = Client::Create(
+        /*message_handler=*/
+        [this](const std::shared_ptr<Client> &client,
+               fb::MessageType message_type,
+               const std::vector<uint8_t> &message) -> Status {
+          return ProcessClientMessage(client, message_type, message);
+        },
+        /*connection_error_handler=*/
+        [this](const std::shared_ptr<Client> &client,
+               const boost::system::error_code &err) -> void {
+          return HandleClientConnectionError(client, err);
+        },
+        std::move(socket_));
+
+    // Start receiving messages.
+    new_connection->ProcessMessages();
+  }
+
+  if (error != boost::asio::error::operation_aborted) {
+    DoAccept();  // 继续等待下一个连接
+  }
 }
 ```
 
-#### 3.5.2 Client 对象持有自己的 object_ids 集合
+**关键**：两个 lambda 闭包决定了这个 Client 的整个生命周期：
+- **message_handler**：每条消息到达时调用 `ProcessClientMessage(client, ...)` — `client` 参数标识了"谁发的"
+- **connection_error_handler**：socket 错误/断连时调用 `HandleClientConnectionError(client, ...)`
+
+`std::move(socket_)` 将 accept 得到的 socket 移交给 Client，此后这个 socket 的所有读写都由 Client 对象管理。
+
+#### 3.5.3 Client::Create — 消息处理 lambda 桥接
 
 ```cpp
-// connection.h:42
-class Client : public ray::ClientConnection, public ClientInterface {
-  std::unordered_set<ray::ObjectID> object_ids;
-  std::string name = "anonymous_client";
-
-  const std::unordered_set<ray::ObjectID> &GetObjectIDs() override { return object_ids; }
-
-  void MarkObjectAsUsed(const ObjectID &object_id, ...) override {
-    const auto [_, inserted] = object_ids.insert(object_id);
-  }
-
-  bool MarkObjectAsUnused(const ObjectID &object_id) override {
-    auto it = object_ids.find(object_id);
-    if (it != object_ids.end()) {
-      object_ids.erase(it);
-      return should_unmap;
-    }
-    return false;
-  }
-};
-```
-
-#### 3.5.3 消息到达时自动携带 Client 身份
-
-ProcessMessages 从 socket 读消息，回调时把 `shared_ptr<Client>` 传出来：
-
-```cpp
-// connection.cc — Client::Create
-std::shared_ptr<Client> Client::Create(PlasmaStoreMessageHandler message_handler, ...) {
+// connection.cc:83-111
+std::shared_ptr<Client> Client::Create(
+    PlasmaStoreMessageHandler message_handler,
+    PlasmaStoreConnectionErrorHandler connection_error_handler,
+    ray::local_stream_socket &&socket) {
   ray::MessageHandler ray_message_handler =
-      [message_handler](const std::shared_ptr<ray::ClientConnection> &client, ...) {
-        message_handler(std::static_pointer_cast<Client>(client), msg_type, msg);
-        client->ProcessMessages();
+      [message_handler](const std::shared_ptr<ray::ClientConnection> &client,
+                        int64_t message_type,
+                        const std::vector<uint8_t> &message) {
+        Status s = message_handler(std::static_pointer_cast<Client>(client),
+                                   static_cast<MessageType>(message_type),
+                                   message);
+        if (!s.ok()) {
+          if (!s.IsDisconnected()) {
+            RAY_LOG(ERROR) << "Fail to process client message. " << s.ToString();
+          }
+          client->Close();
+        } else {
+          client->ProcessMessages();  // ★ 处理成功 → 重新发起异步读
+        }
       };
+
+  ray::ConnectionErrorHandler ray_connection_error_handler =
+      [connection_error_handler](const std::shared_ptr<ray::ClientConnection> &client,
+                                 const boost::system::error_code &error) {
+        connection_error_handler(std::static_pointer_cast<Client>(client), error);
+      };
+
+  return std::make_shared<Client>(
+      PrivateTag{}, ray_message_handler, ray_connection_error_handler, std::move(socket));
 }
 ```
 
-#### 3.5.4 ProcessClientMessage 根据 Client* 分发
+**桥接层**：`ray::MessageHandler` 的签名是 `(shared_ptr<ClientConnection>, int64_t, vector<uint8_t>)`，Plasma 的是 `(shared_ptr<Client>, MessageType, vector<uint8_t>)`。这个 lambda 做了两件事：
+1. `std::static_pointer_cast<Client>` — 从基类指针向下转型为 Plasma Client
+2. 处理成功后调用 `client->ProcessMessages()` — **重新发起异步读**，形成消息处理循环
+
+#### 3.5.4 ProcessMessages — 异步读循环
 
 ```cpp
-// store.cc:349
-Status PlasmaStore::ProcessClientMessage(const std::shared_ptr<Client> &client,
-                                        MessageType msg_type, const vector<uint8_t> &msg) {
-  switch (msg_type) {
-    case PlasmaCreateRequest:
-      HandleCreateObjectRequest(client, msg, ...);
-      break;
-    case PlasmaGetRequest:
-      ProcessGetRequest(client, object_ids, timeout);
-      break;
-    case PlasmaReleaseRequest:
-      ReleaseObject(object_id, client);
-      break;
-    ...
+// client_connection.cc:373-404
+void ClientConnection::ProcessMessages() {
+  std::vector<boost::asio::mutable_buffer> header{
+      boost::asio::buffer(&read_cookie_, sizeof(read_cookie_)),
+      boost::asio::buffer(&read_type_, sizeof(read_type_)),
+      boost::asio::buffer(&read_length_, sizeof(read_length_)),
+  };
+  boost::asio::async_read(
+      ServerConnection::socket_,
+      header,
+      boost::bind(&ClientConnection::ProcessMessageHeader,
+                  shared_ClientConnection_from_this(),
+                  boost::asio::placeholders::error));
+}
+
+// client_connection.cc:474-487
+void ClientConnection::ProcessMessage(const boost::system::error_code &error) {
+  auto this_ptr = shared_ClientConnection_from_this();
+  if (error) {
+    return connection_error_handler_(std::move(this_ptr), error);
   }
+  if (closed_) { return; }
+  message_handler_(std::move(this_ptr), read_type_, read_message_);
+  // ★ message_handler_ 就是 Client::Create 中的 ray_message_handler
+  //   处理成功后重新调 ProcessMessages()，形成循环
 }
 ```
 
-#### 3.5.5 同一对象在不同 Client 中的 AddToClientObjectIds
+**异步读循环**：
+```
+ProcessMessages (async_read header)
+  → ProcessMessageHeader (async_read body)
+    → ProcessMessage (message_handler_)
+      → Client::Create lambda → ProcessClientMessage(client, ...)
+        → 成功 → ProcessMessages() [下一轮循环]
+        → 失败 → Close()
+```
+
+**Client 对象的存活保证**：每次 async_read 都通过 `shared_ClientConnection_from_this()` 持有 `shared_ptr<Client>`。只要 socket 连接在、有消息要读，`shared_ptr<Client>` 就不会释放。
+
+#### 3.5.5 ProcessClientMessage — 消息分发（完整 switch/case）
 
 ```cpp
-// store.cc:133
-void PlasmaStore::AddToClientObjectIds(const ObjectID &object_id, ...,
+// store.cc:370-499
+Status PlasmaStore::ProcessClientMessage(const std::shared_ptr<Client> &client,
+                                         fb::MessageType type,
+                                         const std::vector<uint8_t> &message) {
+  absl::MutexLock lock(&mutex_);
+  const uint8_t *input = const_cast<uint8_t *>(message.data());
+  size_t input_size = message.size();
+
+  switch (type) {
+  case fb::MessageType::PlasmaCreateRequest: {
+    const auto &object_id = GetCreateRequestObjectId(message);
+    const auto &request = flatbuffers::GetRoot<fb::PlasmaCreateRequest>(input);
+    const size_t object_size = request->data_size() + request->metadata_size();
+
+    auto handle_create = [this, client, message](
+                             bool fallback_allocator,
+                             PlasmaObject *result) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+      mutex_.AssertHeld();
+      return HandleCreateObjectRequest(client, message, fallback_allocator, result);
+    };
+
+    if (request->try_immediately()) {
+      auto result_error = create_request_queue_.TryRequestImmediately(
+          object_id, client, handle_create, object_size);
+      // ... 发送 CreateReply + fd
+    } else {
+      auto req_id = create_request_queue_.AddRequest(
+          object_id, client, handle_create, object_size);
+      ProcessCreateRequests();
+      ReplyToCreateClient(client, object_id, req_id);
+    }
+  } break;
+
+  case fb::MessageType::PlasmaCreateRetryRequest: {
+    auto request = flatbuffers::GetRoot<fb::PlasmaCreateRetryRequest>(input);
+    const auto &object_id = ObjectID::FromBinary(request->object_id()->str());
+    ReplyToCreateClient(client, object_id, request->request_id());
+  } break;
+
+  case fb::MessageType::PlasmaAbortRequest: {
+    ObjectID object_id;
+    ReadAbortRequest(input, input_size, &object_id);
+    RAY_CHECK(AbortObject(object_id, client) == 1);
+    RAY_RETURN_NOT_OK(SendAbortReply(client, object_id));
+  } break;
+
+  case fb::MessageType::PlasmaGetRequest: {
+    std::vector<ObjectID> object_ids_to_get;
+    int64_t timeout_ms;
+    ReadGetRequest(input, input_size, object_ids_to_get, &timeout_ms);
+    ProcessGetRequest(client, object_ids_to_get, timeout_ms);
+  } break;
+
+  case fb::MessageType::PlasmaReleaseRequest: {
+    bool may_unmap;
+    ObjectID object_id;
+    ReadReleaseRequest(input, input_size, &object_id, &may_unmap);
+    bool should_unmap = ReleaseObject(object_id, client);
+    // ★ ReleaseObject → RemoveFromClientObjectIds → RemoveReference
+    if (may_unmap) {
+      RAY_RETURN_NOT_OK(
+          SendReleaseReply(client, object_id, should_unmap, PlasmaError::OK));
+    }
+  } break;
+
+  case fb::MessageType::PlasmaDeleteRequest: {
+    std::vector<ObjectID> object_ids;
+    ReadDeleteRequest(input, input_size, &object_ids);
+    for (auto &object_id : object_ids) {
+      error_codes.push_back(object_lifecycle_mgr_.DeleteObject(object_id));
+    }
+    RAY_RETURN_NOT_OK(SendDeleteReply(client, object_ids, error_codes));
+  } break;
+
+  case fb::MessageType::PlasmaContainsRequest: {
+    // 检查对象是否 sealed
+  } break;
+
+  case fb::MessageType::PlasmaSealRequest: {
+    ObjectID object_id;
+    ReadSealRequest(input, input_size, &object_id);
+    SealObjects({object_id});
+    RAY_RETURN_NOT_OK(SendSealReply(client, object_id, PlasmaError::OK));
+  } break;
+
+  case fb::MessageType::PlasmaConnectRequest: {
+    RAY_RETURN_NOT_OK(SendConnectReply(client, allocator_.GetFootprintLimit()));
+  } break;
+
+  case fb::MessageType::PlasmaDisconnectClient: {
+    DisconnectClient(client);
+    return Status::Disconnected("The Plasma Store client is disconnected.");
+  } break;
+
+  default:
+    RAY_LOG(FATAL) << "Invalid Plasma message type";
+  }
+  return Status::OK();
+}
+```
+
+**所有消息都携带 Client 身份**：switch 的每个 case 都使用入口参数 `client` — 这就是从 socket 连接中自动识别的 client，不是消息内容中指定的。
+
+#### 3.5.6 ProcessGetRequest — Get 请求入队
+
+```cpp
+// store.cc:238-245
+void PlasmaStore::ProcessGetRequest(const std::shared_ptr<Client> &client,
+                                    const std::vector<ObjectID> &object_ids,
+                                    int64_t timeout_ms) {
+  for (const auto &object_id : object_ids) {
+    RAY_LOG(DEBUG) << "Adding get request " << object_id;
+  }
+  get_request_queue_.AddRequest(client, object_ids, timeout_ms);
+}
+```
+
+Get 请求不立即处理，而是入 `get_request_queue_`。当对象 sealed 后，queue 的回调触发 `AddToClientObjectIds`。
+
+#### 3.5.7 GetRequestQueue 回调 — 连接到 AddToClientObjectIds
+
+```cpp
+// store.cc:104-110 — PlasmaStore 构造函数中 get_request_queue_ 的初始化回调
+[this](const ObjectID &object_id,
+       std::optional<MEMFD_TYPE> fallback_allocated_fd,
+       const auto &request) ABSL_NO_THREAD_SAFETY_ANALYSIS {
+  mutex_.AssertHeld();
+  this->AddToClientObjectIds(
+      object_id, fallback_allocated_fd, request->client_);
+},
+```
+
+**调用时机**：当一个 Get 请求等待的对象被 Seal 时（`MarkObjectSealed` → `ReturnFromGet`），queue 遍历所有等待此对象的请求，对每个 client 调用此回调。`request->client_` 就是发起 Get 的那个 Client。
+
+#### 3.5.8 AddToClientObjectIds — Client 首次引用时 server ref +1
+
+```cpp
+// store.cc:136-147
+void PlasmaStore::AddToClientObjectIds(const ObjectID &object_id,
+                                       std::optional<MEMFD_TYPE> fallback_allocated_fd,
                                        const std::shared_ptr<ClientInterface> &client) {
   auto &object_ids = client->GetObjectIDs();
   if (object_ids.find(object_id) != object_ids.end()) {
-    return;
+    return;  // ★ 该 Client 已持有此对象 → 不重复 +1
   }
-  object_lifecycle_mgr_.AddReference(object_id);
-  client->MarkObjectAsUsed(object_id, ...);
+  RAY_CHECK(object_lifecycle_mgr_.AddReference(object_id));  // server ref +1
+  client->MarkObjectAsUsed(object_id, fallback_allocated_fd); // 加入 Client 的 set
 }
 ```
 
-#### 3.5.6 RemoveFromClientObjectIds 只移除指定 client 的引用
+**幂等性**：同一 Client 对同一对象多次调用 `AddToClientObjectIds`，只有第一次会 `AddReference`。后续调用直接 return（`object_ids.find` 命中）。
+
+**两个调用入口**：
+
+| 入口 | 位置 | 场景 |
+|------|------|------|
+| `CreateObject` 中 | `store.cc:191` | 新建对象后立即注册 creator client |
+| Get 请求回调中 | `store.cc:108` | 对象 sealed 后注册 getter client |
+
+#### 3.5.9 RemoveFromClientObjectIds — Client 退出时 server ref -1
 
 ```cpp
-// store.cc:247
+// store.cc:247-262
 bool PlasmaStore::RemoveFromClientObjectIds(const ObjectID &object_id,
                                             const std::shared_ptr<Client> &client) {
   auto &object_ids = client->GetObjectIDs();
   auto it = object_ids.find(object_id);
   if (it != object_ids.end()) {
-    client->MarkObjectAsUnused(object_id);
-    object_lifecycle_mgr_.RemoveReference(object_id);
+    bool should_unmap = client->MarkObjectAsUnused(object_id);
+    RAY_LOG(DEBUG) << "Object " << object_id
+                   << " no longer in use by client, should_unmap = " << should_unmap;
+    object_lifecycle_mgr_.RemoveReference(object_id);  // server ref -1
+    return should_unmap;  // 返回 true 表示 client 需要munmap此fd
+  } else {
+    return false;  // 该 Client 不持有此对象 → 什么都不做
   }
 }
 ```
 
-#### 3.5.7 Client 断连时清理所有引用
+**只移除指定 Client 的引用**：如果 Worker Client 释放了对象，Raylet Client 的引用不受影响。
+
+#### 3.5.10 ReleaseObject — ReleaseRequest 的处理入口
 
 ```cpp
-// store.cc — HandleClientConnectionError
-void PlasmaStore::HandleClientConnectionError(const std::shared_ptr<Client> &client, ...) {
-  for (const auto &object_id : client->GetObjectIDs()) {
-    object_lifecycle_mgr_.RemoveReference(object_id);
+// store.cc:265-273
+bool PlasmaStore::ReleaseObject(const ObjectID &object_id,
+                                const std::shared_ptr<Client> &client) {
+  auto entry = object_lifecycle_mgr_.GetObject(object_id);
+  if (entry != nullptr) {
+    return RemoveFromClientObjectIds(object_id, client);
   }
+  return false;
 }
 ```
 
-#### 3.5.8 Server 引用计数机制总结
+#### 3.5.11 Client 断连 — HandleClientConnectionError → DisconnectClient
+
+```cpp
+// store.cc:362-367
+void PlasmaStore::HandleClientConnectionError(const std::shared_ptr<Client> &client,
+                                              const boost::system::error_code &error) {
+  absl::MutexLock lock(&mutex_);
+  RAY_LOG(WARNING) << "Disconnecting client due to connection error with code "
+                   << error.value() << ": " << error.message();
+  DisconnectClient(client);
+}
+
+// store.cc:330-359
+void PlasmaStore::DisconnectClient(const std::shared_ptr<Client> &client) {
+  client->Close();
+  RAY_LOG(DEBUG) << "Disconnecting client on fd " << client;
+
+  // Release all the objects that the client was using.
+  absl::flat_hash_map<ObjectID, const LocalObject *> sealed_objects;
+  auto &object_ids = client->GetObjectIDs();
+  for (const auto &object_id : object_ids) {
+    auto entry = object_lifecycle_mgr_.GetObject(object_id);
+    if (entry == nullptr) {
+      continue;
+    }
+    if (entry->Sealed()) {
+      sealed_objects[object_id] = entry;  // 已Seal：收集后统一释放
+    } else {
+      object_lifecycle_mgr_.AbortObject(object_id);  // 未Seal：直接abort
+    }
+  }
+
+  // Remove all of the client's GetRequests.
+  get_request_queue_.RemoveGetRequestsForClient(client);
+
+  for (const auto &[object_id, _] : sealed_objects) {
+    RemoveFromClientObjectIds(object_id, client);  // server ref -1 (每个对象)
+  }
+
+  create_request_queue_.RemoveDisconnectedClientRequests(client);
+}
+```
+
+**关键逻辑**：
+1. 已 Seal 的对象：遍历 `client->GetObjectIDs()` 逐个 `RemoveFromClientObjectIds` → `RemoveReference`
+2. 未 Seal 的对象（client 正在 Create 但还没 Seal）：`AbortObject` — 回收内存分配
+3. 同时清理该 client 的所有 pending Get/Create 请求
+
+**为什么先收集再释放**：不能在遍历 `object_ids` 时直接 `RemoveFromClientObjectIds`，因为 `MarkObjectAsUnused` 会从 `object_ids` set 中 erase 元素，**使迭代器失效**。所以先收集到 `sealed_objects` map，遍历完后再统一释放。
+
+#### 3.5.12 Client 类完整定义 — object_ids set + fallback fd 管理
+
+```cpp
+// connection.h:42-51 — 抽象接口
+class ClientInterface {
+ public:
+  virtual ~ClientInterface() = default;
+  virtual ray::Status SendFd(MEMFD_TYPE fd) = 0;
+  virtual const std::unordered_set<ray::ObjectID> &GetObjectIDs() = 0;
+  virtual void MarkObjectAsUsed(const ray::ObjectID &object_id,
+                                std::optional<MEMFD_TYPE> fallback_allocated_fd) = 0;
+  virtual bool MarkObjectAsUnused(const ray::ObjectID &object_id) = 0;
+};
+
+// connection.h:54-157 — 具体实现
+class Client : public ray::ClientConnection, public ClientInterface {
+ public:
+  const std::unordered_set<ray::ObjectID> &GetObjectIDs() override { return object_ids; }
+
+  void MarkObjectAsUsed(const ray::ObjectID &object_id,
+                        std::optional<MEMFD_TYPE> fallback_allocated_fd) override {
+    const auto [_, inserted] = object_ids.insert(object_id);
+    if (inserted) {
+      RAY_CHECK(!object_ids_to_fallback_allocated_fds_.contains(object_id));
+      if (fallback_allocated_fd.has_value()) {
+        MEMFD_TYPE fd = fallback_allocated_fd.value();
+        object_ids_to_fallback_allocated_fds_[object_id] = fd;
+        fallback_allocated_fds_ref_count_[fd] += 1;  // fd 引用计数 +1
+      }
+    } else {
+      // Already inserted, idempotent call.
+      const auto iter = object_ids_to_fallback_allocated_fds_.find(object_id);
+      if (fallback_allocated_fd.has_value()) {
+        RAY_CHECK(iter != object_ids_to_fallback_allocated_fds_.end() &&
+                  iter->second == fallback_allocated_fd.value());
+      } else {
+        RAY_CHECK(iter == object_ids_to_fallback_allocated_fds_.end());
+      }
+    }
+  }
+
+  bool MarkObjectAsUnused(const ray::ObjectID &object_id) override {
+    size_t erased = object_ids.erase(object_id);  // ★ 从 set 移除
+    if (erased == 0) {
+      return false;  // 不持有此对象 → 什么都不做
+    }
+    auto fd_iter = object_ids_to_fallback_allocated_fds_.find(object_id);
+    if (fd_iter == object_ids_to_fallback_allocated_fds_.end()) {
+      return false;  // 无 fallback fd
+    }
+    MEMFD_TYPE fd = fd_iter->second;
+    object_ids_to_fallback_allocated_fds_.erase(fd_iter);
+
+    auto ref_cnt_iter = fallback_allocated_fds_ref_count_.find(fd);
+    RAY_CHECK(ref_cnt_iter != fallback_allocated_fds_ref_count_.end());
+    size_t &ref_cnt = ref_cnt_iter->second;
+    RAY_CHECK_GT(ref_cnt, static_cast<size_t>(0));
+    ref_cnt -= 1;
+    if (ref_cnt == 0) {
+      fallback_allocated_fds_ref_count_.erase(ref_cnt_iter);
+      used_fds_.erase(fd);  // 下次 SendFd 会重新发送此 fd
+      return true;  // ★ 返回 true → 通知 client munmap 此 fd
+    }
+    return false;
+  }
+
+  std::string name = "anonymous_client";
+
+ private:
+  absl::flat_hash_set<MEMFD_TYPE> used_fds_;
+  std::unordered_set<ray::ObjectID> object_ids;  // ★ 核心：此 Client 在用哪些对象
+  absl::flat_hash_map<MEMFD_TYPE, size_t> fallback_allocated_fds_ref_count_;  // fd → 引用数
+  absl::flat_hash_map<ray::ObjectID, MEMFD_TYPE> object_ids_to_fallback_allocated_fds_;
+};
+```
+
+**三层数据结构**：
+
+| 数据结构 | 用途 | 操作 |
+|---------|------|------|
+| `object_ids` | 此 Client 在用哪些对象 | `MarkObjectAsUsed` insert / `MarkObjectAsUnused` erase |
+| `object_ids_to_fallback_allocated_fds_` | 哪些对象用了 fallback fd | insert / erase（与 object_ids 同步） |
+| `fallback_allocated_fds_ref_count_` | 每个 fallback fd 的引用计数 | +1 / -1（归零时通知 client munmap） |
+
+**Fallback fd 机制**：当 Plasma Store 主内存（dlmalloc）分配失败时，使用 fallback allocator（memfd_create）分配。fallback fd 需要跨进程 mmap 共享，所以 Client 需要跟踪哪些 fd 对应哪些对象，释放时判断是否可以 munmap。
+
+#### 3.5.13 Server 引用计数机制总结
 
 **server ref_count = 有几个 Client 的 `object_ids` set 中包含该对象**
 
@@ -440,7 +781,7 @@ server X.ref_count = 2
 server 只看"该 Client 是否在 object_ids 中"，不看 client count 具体值。
 ```
 
-#### 3.5.9 完整数值关系示例
+#### 3.5.14 完整数值关系示例
 
 ```
               Worker Client              Raylet Client           server
@@ -474,7 +815,7 @@ Raylet ReleaseFreedObject:
     → EndObjectAccess → 加入 LRU
 ```
 
-#### 3.5.10 PlasmaStore 维护多 Client 的运行模型
+#### 3.5.15 PlasmaStore 维护多 Client 的运行模型
 
 Server 不需要一个显式的 `vector<Client>` 来"维护"——每个 `Client::ProcessMessages()` 通过 **boost::asio 异步回调** 保持存活。只要 socket 连接在、有消息要读，`shared_ptr<Client>` 就不会释放。Client 断连时 `HandleClientConnectionError` 清理引用。
 
