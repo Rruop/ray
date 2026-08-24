@@ -798,20 +798,166 @@ RAY_BACKEND_LOG_LEVEL=debug ray job submit ...
 
 如果要改 raylet 的日志级别，需要重启集群时设置，无法对运行中的集群动态修改。
 
+## grant_or_reject 对 raylet 行为的影响
+
+`grant_or_reject` 标志决定了 raylet 端在无法调度 lease 时的行为，是理解整个死锁机制的关键。
+
+### Driver 端设值逻辑
+
+```cpp
+// normal_task_submitter.cc:313-330
+const bool is_spillback = (raylet_address != nullptr);
+// ...
+raylet_client->RequestWorkerLease(
+    lease_spec.GetMessage(),
+    /*grant_or_reject=*/is_spillback,
+    ...);
+```
+
+| 场景 | raylet_address | is_spillback | grant_or_reject |
+|------|---------------|-------------|-----------------|
+| Driver 首次选节点（locality-aware） | nullptr → 选后赋值 | false | false |
+| 本地 raylet redirect 后重试 | 非空 | true | true |
+
+### raylet 端行为
+
+**ClusterLeaseManager::ScheduleOnNode**（`cluster_lease_manager.cc:422-435`）：
+
+| grant_or_reject | raylet 无法本地调度时 | driver 收到的回复 | driver 行为 |
+|-----------------|---------------------|-------------------|------------|
+| true (spillback) | 立即 reject | `reply.rejected()=true` | `RequestNewWorkerIfNeeded()` 本地重试 |
+| false (locality) | 设 `retry_at_raylet_address` redirect | redirect 地址 | 去新 raylet 重试 |
+
+**LocalLeaseManager::Spillback**（`local_lease_manager.cc:674-708`）：
+
+- `grant_or_reject=true` → reject，driver 重新本地选节点
+- `grant_or_reject=false` → redirect，设置 `retry_at_raylet_address` 让 driver 去 redirect
+
+**关键**：`grant_or_reject=false` 时 raylet 不会 reject，而是 redirect。但在远端节点已死场景中，raylet 根本没机会执行 Spillback（请求卡在 gRPC 层），所以 neither reject nor redirect。
+
+## Driver 端 Locality-Aware 选节点完整代码逻辑
+
+Driver 首次选节点时 `raylet_address == nullptr`，使用 `LocalityAwareLeasePolicy::GetBestNodeForLease()`（`lease_policy.cc:24-87`）：
+
+### 优先级链
+
+1. **Spread 策略** → 直接用 `fallback_rpc_address_`（head 节点）
+2. **Node Affinity（硬亲和/label selector）** → 用指定节点地址
+3. **Node Affinity Scheduling Strategy** → 用指定节点地址
+4. **数据本地性选择（默认路径）** → `GetBestNodeIdForLease()`
+
+### GetBestNodeIdForLease 逻辑
+
+```cpp
+// lease_policy.cc:60-87
+std::optional<NodeID> LocalityAwareLeasePolicy::GetBestNodeIdForLease(
+    const LeaseSpecification &spec) {
+  const auto object_ids = spec.GetDependencyIds();
+  absl::flat_hash_map<NodeID, uint64_t> bytes_local_table;
+  uint64_t max_bytes = 0;
+  std::optional<NodeID> max_bytes_node;
+  for (const ObjectID &object_id : object_ids) {
+    if (auto locality_data = locality_data_provider_.GetLocalityData(object_id)) {
+      for (const NodeID &node_id : locality_data->nodes_containing_object) {
+        auto &bytes = bytes_local_table[node_id];
+        bytes += locality_data->object_size;
+        if (bytes > max_bytes) {
+          max_bytes = bytes;
+          max_bytes_node = node_id;  // 选中本地性最好的节点
+        }
+      }
+    }
+  }
+  return max_bytes_node;
+}
+```
+
+1. 遍历 lease 的所有依赖对象 `spec.GetDependencyIds()`
+2. 对每个对象查 `locality_data_provider_.GetLocalityData(object_id)`，获取该对象在哪些节点上有本地副本及其大小
+3. 统计每个节点上的**本地对象字节总和**
+4. 选字节数最大的节点返回
+5. 如果没有 locality 信息（如无依赖对象），返回 `std::nullopt`，fallback 到 head 节点
+
+**关键**：Driver 首次选节点时 `is_spillback = false`，`grant_or_reject = false`。这决定了后续 raylet 端在无法调度时不会 reject。
+
 ## 代码关键文件
 
 | 文件 | 路径 | 关键内容 |
 |------|------|----------|
-| NormalTaskSubmitter | `src/ray/core_worker/task_submission/normal_task_submitter.cc` | RequestNewWorkerIfNeeded, is_spillback, spillback callback |
+| NormalTaskSubmitter | `src/ray/core_worker/task_submission/normal_task_submitter.cc` | RequestNewWorkerIfNeeded, is_spillback, spillback callback, ReturnWorkerLease, OnWorkerIdle |
 | TaskManager | `src/ray/core_worker/task_manager.cc` | FailPendingTask |
-| LeasePolicy | `src/ray/core_worker/lease_policy.cc` | LocalityAwareLeasePolicy::GetBestNodeForLease, GetBestNodeIdForLease |
+| LeasePolicy | `src/ray/core_worker/lease_policy.cc` | LocalityAwareLeasePolicy::GetBestNodeForLease, GetBestNodeIdForLease, LocalLeasePolicy |
 | RetryableGrpcClient | `src/ray/rpc/retryable_grpc_client.cc` | CheckChannelStatus, Retry, 超时扫描, channel 状态处理 |
 | RetryableGrpcClient Header | `src/ray/rpc/retryable_grpc_client.h` | INVOKE_RETRYABLE_RPC_CALL 宏, RetryableGrpcRequest::Create, executor/回调 |
-| RayletClient | `src/ray/raylet_rpc_client/raylet_client.cc` | RequestWorkerLease, method_timeout_ms |
+| RayletClient | `src/ray/raylet_rpc_client/raylet_client.cc` | RequestWorkerLease, ReturnWorkerLease, method_timeout_ms |
 | ClientCall | `src/ray/rpc/client_call.h` | ClientCallImpl 构造函数, gRPC deadline 设置 |
 | RayLog | `src/ray/util/logging.cc` | InitSeverityThreshold, RAY_BACKEND_LOG_LEVEL |
 | RayletClientPool | `src/ray/raylet_rpc_client/raylet_client_pool.cc` | GetDefaultUnavailableTimeoutCallback, Disconnect |
 | CoreWorkerProcess | `src/ray/core_worker/core_worker_process.cc` | RayletClientPool 创建, callback 绑定 |
+| NodeManager | `src/ray/raylet/node_manager.cc` | HandleReturnWorkerLease, HandleWorkerAvailable, CleanupLease, DisconnectClient |
+| ClusterLeaseManager | `src/ray/raylet/scheduling/cluster_lease_manager.cc` | ScheduleOnNode, grant_or_reject 决定 reject/redirect |
+| LocalLeaseManager | `src/ray/raylet/scheduling/local_lease_manager.cc` | GrantScheduledLeasesToWorkers, PinLeaseArgsIfMemoryAvailable, Spillback, TrySpillback, SpillWaitingLeases, CleanupLease, ReleaseWorkerResources |
+| RayConfig | `src/ray/common/ray_config_def.h` | max_task_args_memory_fraction=0.7 |
+| Raylet Main | `src/ray/raylet/main.cc` | max_pinned_lease_arguments_bytes 计算 |
+
+## pinned 内存超限场景的补充分析
+
+本案例（Job 6e00000/77000000）还暴露了 raylet 端的另一个死锁场景——pinned lease args 内存超限。当 `pinned_lease_arguments_bytes_ > max_pinned_lease_arguments_bytes_` 时：
+
+### 死锁代码路径
+
+```
+PinLeaseArgsIfMemoryAvailable 返回 false (pinned 超限)
+  → lease 设为 WAITING_FOR_AVAILABLE_PLASMA_MEMORY
+  → ❌ 不调 TrySpillback（设计遗漏，CPU 不足和 class cap 超限时才会 TrySpillback）
+  → ❌ 不 reject（grant_or_reject=false 时 Spillback() 才 reject，但没走到）
+  → ❌ 不 redirect（同上）
+  → 不回复 driver（没有 send_reply_callback）
+  → 等待其他 lease 释放 args 后重新调度
+  → 但泄漏的 args 永远不释放
+  → Driver 端 RetryableGrpcClient (method_timeout_ms=-1) 永不超时
+  → callback 永远不触发
+  → 死锁
+```
+
+### 等待其他 lease 释放 args 的后续流程
+
+重新调度的触发点（`ScheduleAndGrantLeases()` 被调用的场景）：
+
+| 触发场景 | 代码位置 |
+|---------|---------|
+| 新 lease 入队 | `local_lease_manager.cc:96` |
+| 依赖对象就绪 | `local_lease_manager.cc:733` |
+| Worker 归还 | `node_manager.cc:1371` |
+| 资源变更 | `node_manager.cc:2070` |
+
+正常流程：`ReturnWorkerLease → HandleWorkerAvailable → CleanupLease → ReleaseLeaseArgs → ScheduleAndGrantLeases → PinLeaseArgsIfMemoryAvailable 成功 → Grant`
+
+### SpillWaitingLeases 补救机制及其局限
+
+每次 `ScheduleAndGrantLeases()` 都执行 `SpillWaitingLeases()`，遍历 waiting 队列尝试溢出到远程节点。但有以下局限：
+
+1. `exclude_local_node` 由 `LeaseDependenciesBlocked` 决定——WAITING_FOR_AVAILABLE_PLASMA_MEMORY 的 lease 依赖对象已在本地，`LeaseDependenciesBlocked` 返回 false，调度器可能仍选本地节点
+2. `GetBestSchedulableNode` 不感知远端节点的 pinned args 内存占用
+3. `grant_or_reject=false` 时走 redirect 而非 reject
+
+### Bug 1 修正：HandleReturnWorkerLease 与 ReleaseLeaseArgs
+
+原始在线排查文档说 `HandleReturnWorkerLease` "❌ 缺少 ReleaseLeaseArgs"——经过代码追踪，正常路径（`worker_exiting=false`）实际上**通过 `HandleWorkerAvailable → CleanupLease → ReleaseLeaseArgs` 间接调用了 `ReleaseLeaseArgs`**：
+
+```
+HandleReturnWorkerLease (disconnect_worker=false, worker_exiting=false)
+  → ReleaseWorker(lease_id)       // 仅从 leased_workers_ map 移除，不清除 GrantLeaseId
+  → ReleaseWorkerResources(worker) // 释放 CPU，ClearAllocatedInstances
+  → HandleWorkerAvailable(worker)  // node_manager.cc:2114
+    → !worker->GetGrantedLeaseId().IsNil()  // true（ReleaseWorker 没清 GrantLeaseId）
+    → CleanupLease(worker)         // node_manager.cc:2362
+      → local_lease_manager_.CleanupLease(worker, &lease)
+        → RemoveFromGrantedLeasesIfExists()  // ✅
+        → ReleaseLeaseArgs()                // ✅
+```
+
+但 `worker_exiting=true` 路径跳过 `HandleWorkerAvailable`，不调 `CleanupLease`，不调 `ReleaseLeaseArgs`，是泄漏候选路径。详细分析见 [Job-77000000 排查报告](./06-故障排查/Job-77000000-PENDING_NODE_ASSIGNMENT排查报告.md) 第四节。
 
 ## 结论
 
