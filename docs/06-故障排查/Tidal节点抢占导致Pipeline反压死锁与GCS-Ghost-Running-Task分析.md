@@ -295,6 +295,14 @@ WorkerID GetWorkerID(const rpc::TaskEvents &task_event) {
 
 **情况 C（最可能产生 ghost 的场景）**：
 
+**关键背景**：FAILED 事件是在 **Driver 端** 的 event buffer 中上报的，RUNNING 事件是在 **Worker 端** 的 event buffer 中上报的。它们不在同一个 buffer 中，只在 GCS 端通过 `MergeFrom` 合并。
+
+| 事件 | 上报端 | 代码路径 |
+|------|--------|---------|
+| RUNNING | Worker 端 | `ExecuteTask` → `RecordTaskStatusEventIfNeeded(RUNNING)` → Worker 的 `task_event_buffer_` |
+| SUBMITTED_TO_WORKER | Driver 端 | `MarkTaskWaitingForExecution` → `SetTaskStatus(SUBMITTED_TO_WORKER)` → Driver 的 `task_event_buffer_` |
+| FAILED | Driver 端 | `CompletePendingTask` / `FailOrRetryPendingTask` → `SetTaskStatus(FAILED)` → `RecordTaskStatusEventIfNeeded(FAILED)` → Driver 的 `task_event_buffer_` |
+
 GCS 的 `UpdateExistingTaskAttempt` 使用 `MergeFrom` 合并事件：
 
 ```cpp
@@ -302,17 +310,54 @@ GCS 的 `UpdateExistingTaskAttempt` 使用 `MergeFrom` 合并事件：
 void UpdateExistingTaskAttempt(...) {
   auto &existing_task = loc->GetTaskEventsMutable();
   existing_task.MergeFrom(task_events);  // 后到的事件覆盖先到的
-  UpdateIndex(loc);
+  UpdateIndex(loc);  // 合并后重新计算索引
 }
 ```
 
-当 GCS 收到来自 worker 端的 RUNNING 事件（`state_updates` 包含 `pid` 但**不含** `worker_id`）和来自 driver 端的 SUBMITTED_TO_WORKER 事件（`state_updates` 包含 `worker_id`）时，`MergeFrom` 的行为取决于 protobuf 合并规则：
-- `state_updates` 中的 `worker_id` 不会被 RUNNING 事件覆盖（因为 RUNNING 事件不含 `worker_id` 字段）
-- `state_updates` 中的 `state_ts_ns` 会被 RUNNING 事件的新状态条目追加
+**事件到达顺序无关——只要两方事件最终都到达 GCS，合并结果一致**：
 
-**但如果时序是**：RUNNING 事件先到达 GCS（worker 本地 flush），而 SUBMITTED_TO_WORKER 事件后到达（driver 经过 raylet 中转），则 GCS 先用 RUNNING 事件创建 task event（此时 `worker_id` 为 Nil），后续 SUBMITTED_TO_WORKER 事件通过 `MergeFrom` 合并时**应该**补上 `worker_id` 并触发 `UpdateIndex`。
+- SUBMITTED_TO_WORKER 先到 → GCS 创建 entry（含 worker_id）→ `worker_index_` 有此 task
+- RUNNING 后到 → MergeFrom → worker_id 保留（RUNNING 不含 worker_id 不覆盖）→ 无问题
+- **或反过来**：RUNNING 先到 → GCS 创建 entry（无 worker_id）→ SUBMITTED_TO_WORKER 后到 → MergeFrom → worker_id 被补上 → `UpdateIndex` 重新计算 → 加入 `worker_index_` → **也无问题**
 
-**但如果 SUBMITTED_TO_WORKER 事件因为某种原因没有到达 GCS**（例如 driver 端的 task_event_buffer 也没来得及 flush，或 GCS 事件被 GC 淘汰），则 task 在 GCS 中永远是 RUNNING + `worker_id` = Nil → `MarkTasksFailedOnWorkerDead` 找不到 → **ghost RUNNING**。
+**但如果 SUBMITTED_TO_WORKER 永远不到 GCS**，则 task 在 GCS 中永远是 RUNNING + `worker_id` = Nil → `MarkTasksFailedOnWorkerDead` 找不到 → **ghost RUNNING**。**到不到是问题，先到后到不是问题。**
+
+SUBMITTED_TO_WORKER 可能不到 GCS 的原因：
+
+1. **Driver 端 event buffer 溢出**：大量 task 并发 + tidal 抢占导致重试风暴 → circular buffer 满 → FIFO 淘汰最早的 SUBMITTED_TO_WORKER 事件
+2. **Buffer 溢出后该 attempt 的所有后续事件也被丢弃**（包括 FAILED）——一旦 attempt 被标记为 dropped，`AddTaskEvent` 检查 `dropped_task_attempts_unreported_.count()` 直接 return
+3. **gRPC 发送失败不重试**：Driver 发送 `dropped_task_attempts` 通知到 GCS 时，如果 gRPC 失败，数据直接丢失，不会重试
+4. **flush 被跳过**：如果上一次 gRPC 还在处理中（`gcs_grpc_in_progress_ > 0`），本次 flush 被跳过
+
+**淘汰后的 task attempt 永远不会变为 FAILED**：GCS 中只有 Worker 端上报的 RUNNING 事件（无 worker_id），没有任何后续状态更新能到达它。Worker dead 时 `MarkTasksFailedOnWorkerDead` 按 worker_id 查不到。唯一的清理路径是 Driver 的 `dropped_task_attempts` 通知到达 GCS 后 `RemoveTaskAttempt` 删除整个 entry。如果 dropped 通知也丢了（gRPC 失败不重试），就是**永久 ghost**。
+
+### 3.3.1 MarkTasksFailedOnWorkerDead 是纯 GCS 侧逻辑
+
+整个 `MarkTasksFailedOnWorkerDead` 机制不涉及 Driver 或 Worker 端的交互：
+
+```
+GCS 收到 worker dead 通知
+  → gcs_server.cc: OnWorkerDead 回调
+  → gcs_task_manager_->OnWorkerDead(worker_id, worker_data)
+  → 延迟 gcs_mark_task_failed_on_worker_dead_delay_ms 后
+  → MarkTasksFailedOnWorkerDead(worker_id)
+  → worker_index_.find(worker_id) → 查找该 worker 上所有 task
+  → 逐个 MarkTaskAttemptFailedIfNeeded
+```
+
+### 3.3.2 worker_id 复用：一个 worker 执行多个 task
+
+一个 worker 进程在其生命周期内可以执行多个 task，因此 `worker_index_` 中一个 `worker_id` 对应一个 **set**（而非单个 task）：
+
+- **Normal task worker**：一个 worker 进程顺序执行多个 task（执行完一个接下一个）
+- **Actor worker**：一个 actor 进程处理多个 actor task（按消息顺序执行）
+
+```cpp
+// worker_index_ 的类型
+std::unordered_map<WorkerID, std::unordered_set<std::shared_ptr<TaskEventLocator>>> worker_index_;
+```
+
+`MarkTasksFailedOnWorkerDead` 遍历 `worker_index_[worker_id]` 这个 set，将该 worker 上**所有未结束的 task** 全部标记 FAILED。
 
 ### 3.4 缺少 `MarkTasksFailedOnNodeDead` 机制
 
