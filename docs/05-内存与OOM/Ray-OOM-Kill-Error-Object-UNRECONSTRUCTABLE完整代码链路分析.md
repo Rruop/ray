@@ -160,26 +160,92 @@ for (const auto &worker : workers) {
 return {{idle_worker_to_kill, /*should_retry=*/false}};  // idle worker 不重试
 ```
 
-### 3.2 正常 Worker 的分组排序逻辑
+### 3.2 分组 key 是 ParentTaskId()，而非 owner 地址
+
+分组的 key 是 **`LeaseSpecification::ParentTaskId()`**，即提交该 task 的父 task 的 TaskID（通常为 Driver 的 TaskID），而不是 worker 的 owner 地址。
 
 ```cpp
-// worker_killing_policy_group_by_owner.cc:111-119
-// 按 owner_id 分组，retriable 的 worker 按真实 owner_id 分组
-// non-retriable 的 worker 全部归入 TaskID::Nil() 组
+// worker_killing_policy_group_by_owner.cc:104-131
+/// Group workers by owner id
+TaskID non_retriable_owner_id = TaskID::Nil();    // ← 所有 non-retriable 归入同一 Nil 组
+std::unordered_map<TaskID, Group> group_map;
+
 for (std::shared_ptr<WorkerInterface> worker : workers) {
-    if (worker->GetGrantedLeaseId().IsNil()) continue;
+    // 跳过没有 granted lease 的 worker（idle worker 不参与分组）
+    if (worker->GetGrantedLeaseId().IsNil()) {
+      continue;
+    }
+
+    // 获取当前 lease 的 IsRetriable() 状态
     bool retriable = worker->GetGrantedLease().GetLeaseSpecification().IsRetriable();
+
+    // ★ 分组 key 选择：
+    //   retriable → 按 ParentTaskId() 分组（通常都是 Driver 的 TaskID）
+    //   non-retriable → 全部归入 TaskID::Nil() 组
     TaskID owner_id =
         retriable ? worker->GetGrantedLease().GetLeaseSpecification().ParentTaskId()
-                  : non_retriable_owner_id;
-    // 加入对应 group
+                  : non_retriable_owner_id;   // TaskID::Nil()
+
+    // 插入对应 group
+    std::unordered_map<TaskID, Group>::iterator it = group_map.find(owner_id);
+    if (it == group_map.end()) {
+        Group group(owner_id, retriable);
+        group.AddToGroup(worker);
+        group_map.emplace(owner_id, std::move(group));
+    } else {
+        Group &group = it->second;
+        group.AddToGroup(worker);
+    }
 }
 ```
 
-### 3.3 IsRetriable 的判断
+**分组规则汇总**：
+
+| Worker 当前 lease 类型 | IsRetriable() | 分组 key | 说明 |
+|------------------------|---------------|----------|------|
+| Normal task (max_retries>0) | true | ParentTaskId() | 通常都映射到 Driver TaskID → 同组 |
+| Actor creation task (max_restarts>0) | true | ParentTaskId() | 也映射到 Driver TaskID → 与 normal task 同组 |
+| Actor creation task (max_restarts=0) | **false** | TaskID::Nil() | 所有 non-retriable 归入 Nil 组 |
+| Normal task (max_retries=0) | **false** | TaskID::Nil() | 所有 non-retriable 归入 Nil 组 |
+| Idle worker（无 lease） | N/A | **跳过，不参与分组** | `GetGrantedLeaseId().IsNil()` → continue |
+
+**关键细节**：
+
+1. **`ParentTaskId()` 的实现**（`lease_spec.cc:172-178`）：
+```cpp
+TaskID LeaseSpecification::ParentTaskId() const {
+    // Set to Nil for driver tasks.
+    if (message_->parent_task_id().empty()) {
+        return TaskID::Nil();
+    }
+    return TaskID::FromBinary(message_->parent_task_id());
+}
+```
+所有由 Driver 直接提交的 task（包括 normal task 和 actor creation task），其 `parent_task_id` 都是 Driver 的 TaskID，因此 retriable 的 worker 会归入同一个 group。
+
+2. **`non_retriable_owner_id = TaskID::Nil()`**：所有 non-retriable 的 worker（无论来自哪个 owner）都归入同一个 Nil 组，这意味着一个 Nil 组可能包含多个不同 owner 的 non-retriable worker。
+
+3. **idle worker 不参与分组**：没有 granted lease 的 worker（`GetGrantedLeaseId().IsNil()`）直接跳过，不计入任何 group 的 `GetAllWorkers().size()`。
+
+4. **同组 retriable 一致性检查**（`worker_killing_policy_group_by_owner.cc:233-240`）：
+```cpp
+void Group::AddToGroup(std::shared_ptr<WorkerInterface> worker) {
+    // ...
+    bool retriable = worker->GetGrantedLease().GetLeaseSpecification().IsRetriable();
+    RAY_CHECK_EQ(retriable_, retriable);  // ★ 同组必须 retriable 一致
+    workers_.push_back(worker);
+}
+```
+由于 ParentTaskId 相同的 retriable worker 和 ParentTaskId 为 Nil 的 non-retriable worker 的 key 不同，它们天然不会进入同一 group。RAY_CHECK 是额外的防御性断言。
+
+### 3.3 IsRetriable 的判断（★ LeaseSpecification 与 TaskSpecification 差异）
+
+#### 3.3.1 LeaseSpecification::IsRetriable() — Killing Policy 使用的版本
+
+Killing Policy 中 `worker->GetGrantedLease().GetLeaseSpecification().IsRetriable()` 调用的是 `LeaseSpecification::IsRetriable()`：
 
 ```cpp
-// lease_spec.cc:149-158
+// lease_spec.cc:149-157
 bool LeaseSpecification::IsRetriable() const {
     if (IsActorCreationTask() && MaxActorRestarts() == 0) {
         return false;   // actor 创建任务 max_restarts=0 → 不可重试
@@ -191,7 +257,88 @@ bool LeaseSpecification::IsRetriable() const {
 }
 ```
 
-**关键**：`ReadArrowJSON->SplitBlocks(7)` 是 normal task，当 `max_retries > 0`（配置为 -1 即无限）时 `IsRetriable()=true`。
+**关键**：`LeaseSpecification` 构造时有 RAY_CHECK 约束：
+
+```cpp
+// lease_spec.cc:26-27
+RAY_CHECK(task_spec.type() == rpc::TaskType::NORMAL_TASK ||
+          task_spec.type() == rpc::TaskType::ACTOR_CREATION_TASK);
+```
+
+`LeaseSpecification` **只处理两种类型**：`NORMAL_TASK` 和 `ACTOR_CREATION_TASK`。**Actor method task (`ACTOR_TASK`) 不会产生独立的 lease** — actor method task 在已创建的 actor worker 上执行，该 worker 持有的 lease 始终是 actor creation task 的 lease。
+
+因此 `LeaseSpecification::IsRetriable()` 的判断逻辑简化为：
+
+| Worker 当前持有的 lease 类型 | IsRetriable() 条件 | 结果 |
+|---|---|---|
+| NORMAL_TASK | max_retries > 0 | **true** |
+| NORMAL_TASK | max_retries == 0 | **false** |
+| ACTOR_CREATION_TASK | max_actor_restarts > 0 | **true** |
+| ACTOR_CREATION_TASK | max_actor_restarts == 0 | **false** |
+| ACTOR_TASK | **不会出现**（无独立 lease） | N/A |
+
+#### 3.3.2 TaskSpecification::IsRetriable() — Task Manager 使用的版本（对比）
+
+注意 `TaskSpecification::IsRetriable()` 与 `LeaseSpecification::IsRetriable()` **不同**：
+
+```cpp
+// task_spec.cc:602-613
+bool TaskSpecification::IsRetriable() const {
+    if (IsActorTask()) {                    // ★ actor method task 始终不可重试
+        return false;
+    }
+    if (IsActorCreationTask() && MaxActorRestarts() == 0) {
+        return false;
+    }
+    if (IsNormalTask() && MaxRetries() == 0) {
+        return false;
+    }
+    return true;
+}
+```
+
+差异：`TaskSpecification` 多了 `IsActorTask()` 的判断（行 603-604），actor method task 直接返回 `false`。但这对 Killing Policy 无影响，因为 Killing Policy 使用的是 `LeaseSpecification`，而 actor worker 持有的是 actor creation task 的 lease。
+
+#### 3.3.3 Actor Worker 的 Lease 生命周期
+
+理解 actor worker 在 Killing Policy 分组中的归属，需要明确 actor worker 的 lease 生命周期：
+
+```
+1. 用户创建 actor (Python 端)
+   → Core Worker 提交 actor creation task (TaskType::ACTOR_CREATION_TASK)
+   → rpc::TaskSpec 包含 actor_creation_task_spec().max_actor_restarts()
+
+2. GCS Actor Manager 注册/创建 actor
+   → GcsActor 构造: lease_spec_ = std::make_unique<LeaseSpecification>(*task_spec_)
+   → LeaseSpecification(task_spec) 构造:
+     - message_->set_type(task_spec.type())           // ACTOR_CREATION_TASK
+     - message_->set_max_actor_restarts(
+           task_spec.actor_creation_task_spec().max_actor_restarts())
+
+3. GcsActorScheduler 请求 worker lease
+   → raylet_client->RequestWorkerLease(
+         actor->GetLeaseSpecification().GetMessage(), ...)
+
+4. Raylet NodeManager 收到 RequestWorkerLease
+   → 创建 RayLease{LeaseSpec} 对象
+   → Worker 被分配 lease 后: worker->GetGrantedLease().GetLeaseSpecification()
+
+5. Actor worker 整个生命周期中：
+   → 初始化时持有 ACTOR_CREATION_TASK 的 lease
+   → 初始化完成后执行 actor method task，但 lease 不变（仍是 creation lease）
+   → 只有当 actor 被销毁或重启时，lease 才会变化
+```
+
+**核心结论**：actor worker 在执行 method task 期间，仍然持有 actor creation task 的 lease。因此 Killing Policy 检查 `IsRetriable()` 时，看的是 `ACTOR_CREATION_TASK` + `max_actor_restarts` 的组合，而非 method task 本身。
+
+| Actor Worker 状态 | GetGrantedLeaseId() | Lease 类型 | IsRetriable() | 分组归属 |
+|---|---|---|---|---|
+| 刚创建，执行 `__init__` | 非 Nil | ACTOR_CREATION_TASK | 取决于 max_actor_restarts | retriable → ParentTaskId() 组; non-retriable → Nil 组 |
+| `__init__` 完成，等待 method task | **Nil**（lease 归还 raylet） | N/A | N/A | **跳过，不参与分组** |
+| 执行 actor method task | 非 Nil | 仍为 ACTOR_CREATION_TASK lease | 同上 | 同上 |
+| Idle（method 执行完，等待下一个） | **Nil**（lease 归还 raylet） | N/A | N/A | **跳过，不参与分组** |
+
+**注意**：Ray Data 中 `MapBatches(QGInferMapper)` 使用 `ActorPool` compute 策略时，MapWorker 在两次 method 调用之间会处于 idle 状态，此时 `GetGrantedLeaseId().IsNil() == true`，Killing Policy 遍历时会被 `continue` 跳过，不计入任何 group 的 size。
 
 ### 3.4 排序策略：优先选择 retriable 的最大 group
 
@@ -228,21 +375,146 @@ bool should_retry =
 
 ### 3.6 在你的场景中为什么 should_retry=false
 
+#### 3.6.1 场景中的 Worker 列表
+
 以 10.80.244.19 节点为例（Top 10 memory users）：
 
 ```
 PID    MEM(GB)    COMMAND
 478    12.17      ray::ReadArrowJSON->SplitBlocks(7)   ← 唯一一个 ReadArrowJSON worker
 57     5.43       raylet
-476    1.52       ray::MapWorker(MapBatches(QGInferMapper))
+476    1.52       ray::MapWorker(MapBatches(QGInferMapper))  ← Actor Worker
 126    0.17       ray::DashboardAgent
 ...
 ```
 
-- ReadArrowJSON->SplitBlocks(7) 的 owner 是 Driver
-- 该 owner group 下**只有 1 个 ReadArrowJSON worker**
-- `selected_group.GetAllWorkers().size() == 1`
-- **`should_retry = 1 > 1 && true = false`**
+**关键前提**：`MapBatches(QGInferMapper)` 使用 `ActorPool` compute 策略，MapWorker 是 **actor**，不是 normal task。
+
+#### 3.6.2 完整分组推理链（★ 关键分析）
+
+之前的分析存在错误：简单地认为"ReadArrowJSON 的 owner 是 Driver，该 owner group 下只有 1 个 ReadArrowJSON worker"，而忽略了 **MapWorker 作为 actor 如何参与分组** 的问题。
+
+实际上，分组结果取决于 **OOM Kill 那一刻每个 worker 的 lease 状态**：
+
+**Step 1: ReadArrowJSON->SplitBlocks(7) 的分组归属**
+
+```
+ReadArrowJSON->SplitBlocks(7):
+  → Normal task, max_retries=-1 (无限)
+  → IsRetriable() = true (max_retries > 0)
+  → 分组 key = ParentTaskId() = Driver TaskID
+  → 归入 Driver group
+```
+
+**Step 2: MapWorker(MapBatches(QGInferMapper)) 的分组归属**
+
+MapWorker 是 actor，其分组归属取决于 **当前是否持有 lease**：
+
+```
+情况 A: MapWorker 正在执行 actor method task
+  → GetGrantedLeaseId().IsNil() = false
+  → Lease 类型: ACTOR_CREATION_TASK (actor worker 持有的是 creation lease)
+  → 如果 max_actor_restarts > 0:
+     IsRetriable() = true
+     分组 key = ParentTaskId() = Driver TaskID
+     → 与 ReadArrowJSON 同组 (Driver group)
+     → group size ≥ 2
+     → should_retry = true  ✗ （与实际不符）
+
+情况 B: MapWorker 正在执行 actor creation task (__init__)
+  → GetGrantedLeaseId().IsNil() = false
+  → Lease 类型: ACTOR_CREATION_TASK
+  → 如果 max_actor_restarts == 0:
+     IsRetriable() = false
+     分组 key = TaskID::Nil()
+     → 与 ReadArrowJSON 不同组
+     → ReadArrowJSON 独占 Driver group, size = 1
+     → should_retry = false  ✓
+
+情况 C: MapWorker idle（method 执行完毕，等待下一个 method task）
+  → GetGrantedLeaseId().IsNil() = true
+  → Killing Policy 遍历时 continue 跳过
+  → 不计入任何 group 的 size
+  → ReadArrowJSON 独占 Driver group, size = 1
+  → should_retry = false  ✓
+
+情况 D: MapWorker 正在执行 actor method task, 但 max_actor_restarts == 0
+  → GetGrantedLeaseId().IsNil() = false
+  → Lease 类型: ACTOR_CREATION_TASK (creation lease)
+  → IsRetriable() = false (max_actor_restarts == 0)
+  → 分组 key = TaskID::Nil()
+  → 与 ReadArrowJSON 不同组
+  → ReadArrowJSON 独占 Driver group, size = 1
+  → should_retry = false  ✓
+```
+
+#### 3.6.3 本场景的实际分组结果
+
+在 Ray Data 的 `ActorPool` compute 策略中，MapWorker 在两次 method 调用之间会短暂处于 idle 状态（归还 lease 给 raylet）。当 OOM Killer 触发时，最可能的情况是：
+
+**MapWorker 处于 idle 状态（情况 C）**：
+
+```
+Killing Policy 遍历 workers:
+  PID 478 (ReadArrowJSON):
+    → GetGrantedLeaseId().IsNil() = false (正在执行)
+    → IsRetriable() = true (normal task, max_retries=-1)
+    → 分组 key = Driver TaskID
+    → 加入 Driver group
+
+  PID 476 (MapWorker):
+    → GetGrantedLeaseId().IsNil() = true (idle, 等待下一个 method task)
+    → continue ← 跳过，不计入任何 group
+
+  PID 126 (DashboardAgent):
+    → GetGrantedLeaseId().IsNil() = true (idle)
+    → continue ← 跳过
+
+分组结果:
+  Driver group: [ReadArrowJSON->SplitBlocks(7)]   size = 1
+  Nil group: (无 non-retriable worker)
+
+排序后:
+  selected_group = Driver group (retriable 优先)
+  selected_group.GetAllWorkers().size() == 1
+  should_retry = 1 > 1 && true = false  ✓
+```
+
+**即使 MapWorker 正在执行 method task（情况 A），需要同时满足**：
+1. `max_actor_restarts > 0`（使 IsRetriable() = true）
+2. `ParentTaskId() == Driver TaskID`（与 ReadArrowJSON 同 key）
+
+在 Ray Data 的 ActorPool 中，actor 的 `max_actor_restarts` 通常为 **0**（默认值），因为 actor pool 的容错由 Ray Data 层面处理（重新创建 actor），而非依赖 Ray actor restart 机制。此时即使 MapWorker 正在执行 method task，也属于 **情况 D**：IsRetriable()=false → Nil group → 不与 ReadArrowJSON 同组。
+
+#### 3.6.4 应排除的情况 A 的进一步分析
+
+如果 `max_actor_restarts > 0` 且 MapWorker 正在执行 method task，两者同组：
+
+```
+Driver group: [ReadArrowJSON->SplitBlocks(7), MapWorker(MapBatches)]
+  → size = 2
+  → should_retry = 2 > 1 && true = true
+
+此时:
+  fail_immediately = false
+  → RetryTaskIfPossible() 被调用
+  → OOM retry: num_oom_retries_left_ (默认 3)
+  → 重试 3 次后 num_oom_retries_left_ == 0
+  → will_retry = false
+  → 最终仍调用 FailPendingTask()
+
+最终结果相同（task spec 被删除、error object 传播），但中间路径不同：
+  - should_retry=true → 经过 retry 后 OOM quota 耗尽 → FailPendingTask
+  - should_retry=false → 跳过 retry 直接 FailPendingTask
+```
+
+但在本场景中，**情况 A 不成立**，因为：
+1. Ray Data ActorPool 中 `max_actor_restarts` 默认为 0
+2. OOM Kill 那一刻 MapWorker 大概率处于 idle 状态
+
+#### 3.6.5 小结
+
+**should_retry=false 的根本原因**：MapWorker 是 actor，在 OOM Kill 触发时大概率处于 idle 状态（无 lease），不参与 Killing Policy 的分组，导致 ReadArrowJSON 独占 Driver group，group size=1。即使 MapWorker 正在执行 method task，由于 `max_actor_restarts=0`（Ray Data ActorPool 默认），MapWorker 归入 Nil group 而非 Driver group，ReadArrowJSON 仍然独占 Driver group。
 
 ### 3.7 should_retry 设计意图
 
@@ -259,6 +531,16 @@ Ray 的设计逻辑是：
 1. 该 owner 的所有 task 无法继续执行——没有替代 worker
 2. 短期内节点内存压力不会因为 retry 而缓解——retry 会在同节点重新调度同一 task，大概率再次 OOM
 3. Ray 认为这只会导致反复 OOM 循环，不如直接 fail，让上层决定如何处理
+
+**Actor Worker 对 should_retry 判断的影响**（本场景关键）：
+
+| MapWorker 状态 | 是否参与分组 | 对 Driver group size 的影响 | should_retry |
+|---|---|---|---|
+| Idle (无 lease) | 不参与（continue 跳过） | 无贡献 → size=1 | **false** |
+| 执行 method, max_restarts=0 | 归入 Nil 组 | 无贡献 → size=1 | **false** |
+| 执行 method, max_restarts>0 | 归入 Driver 组 | 贡献+1 → size≥2 | **true** |
+| 执行 `__init__`, max_restarts=0 | 归入 Nil 组 | 无贡献 → size=1 | **false** |
+| 执行 `__init__`, max_restarts>0 | 归入 Driver 组 | 贡献+1 → size≥2 | **true** |
 
 ---
 
@@ -1281,9 +1563,18 @@ Eviction Stats:
 
 | 文件 | 关键函数/逻辑 | 行号 |
 |------|---------------|------|
-| `src/ray/raylet/worker_killing_policy_group_by_owner.cc` | `SelectWorkersToKill`, `should_retry` 判断 | 100-172 |
+| `src/ray/raylet/worker_killing_policy_group_by_owner.cc` | `SelectWorkersToKill`, 分组逻辑, `should_retry` 判断 | 33-172 |
+| `src/ray/raylet/worker_killing_policy_group_by_owner.cc` | `Group::AddToGroup` (retriable 一致性检查) | 233-240 |
+| `src/ray/raylet/worker_killing_policy_group_by_owner.cc` | `Group::GetAllWorkers`, `Group::IsRetriable` | 227, 256-258 |
 | `src/ray/raylet/node_manager.cc` | `SetWorkerFailureReason`, `DestroyWorker`, `HandleGetWorkerFailureCause` | 3096-3130, 3281-3292, 717-728 |
-| `src/ray/common/lease/lease_spec.cc` | `IsRetriable()` | 149-158 |
+| `src/ray/common/lease/lease_spec.cc` | `LeaseSpecification` 构造 (RAY_CHECK 类型约束) | 24-66 |
+| `src/ray/common/lease/lease_spec.cc` | `IsRetriable()` | 149-157 |
+| `src/ray/common/lease/lease_spec.cc` | `IsActorCreationTask()`, `IsNormalTask()` | 80-86 |
+| `src/ray/common/lease/lease_spec.cc` | `MaxActorRestarts()`, `MaxRetries()` | 139-147 |
+| `src/ray/common/lease/lease_spec.cc` | `ParentTaskId()` | 172-178 |
+| `src/ray/common/task/task_spec.cc` | `TaskSpecification::IsRetriable()` (含 IsActorTask 判断) | 602-613 |
+| `src/ray/gcs/actor/gcs_actor.h` | `GcsActor` 构造 (LeaseSpecification 创建) | 76-179 |
+| `src/ray/gcs/actor/gcs_actor_scheduler.cc` | `RequestWorkerLease` (发送 LeaseSpec 到 raylet) | 261-268 |
 | `src/ray/core_worker/task_submission/normal_task_submitter.cc` | `HandleGetWorkerFailureCause` | 626-704 |
 | `src/ray/core_worker/task_manager.cc` | `FailOrRetryPendingTask` | 1348-1374 |
 | `src/ray/core_worker/task_manager.cc` | `RetryTaskIfPossible` (OOM retry) | 1137-1215 |
