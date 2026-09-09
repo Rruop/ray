@@ -56,6 +56,41 @@
   - [12.3 Placement Group 场景下的 GPU 分配](#123-placement-group-场景下的-gpu-分配)
   - [12.4 资源模型对比表](#124-资源模型对比表)
 - [十三、最终 Raylet 内存状态](#十三最终-raylet-内存状态)
+- [十四、CUDA_VISIBLE_DEVICES 设置者与调用链详解](#十四cuda_visible_devices-设置者与调用链详解)
+  - [14.1 谁设置了 CUDA_VISIBLE_DEVICES](#141-谁设置了-cuda_visible_devices)
+  - [14.2 调用入口：Cython 任务执行包装器](#142-调用入口cython-任务执行包装器)
+  - [14.3 中间层：读取分配给当前任务的 GPU ID](#143-中间层读取分配给当前任务的-gpu-id)
+  - [14.4 最终写入：NvidiaGPUAcceleratorManager](#144-最终写入nvidiagpuacceleratormanager)
+  - [14.5 执行后清理（仅普通任务）](#145-执行后清理仅普通任务)
+  - [14.6 完整时序图](#146-完整时序图)
+- [十五、GPU 编号来源：NVML 检测 vs Ray 内部索引](#十五gpu-编号来源nvml-检测-vs-ray-内部索引)
+  - [15.1 Ray 不是直接获取底层硬件 GPU 编号](#151-ray-不是直接获取底层硬件-gpu-编号)
+  - [15.2 具体映射示例](#152-具体映射示例)
+  - [15.3 总结](#153-总结)
+- [十六、RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO 与空字符串问题](#十六ray_accel_env_var_override_on_zero-与空字符串问题)
+  - [16.1 问题环境变量定义](#161-问题环境变量定义)
+  - [16.2 默认行为：override_on_zero=True](#162-默认行为override_on_zerotrue)
+  - [16.3 完整因果链：num_gpus=0 导致空字符串](#163-完整因果链num_gpus0-导致空字符串)
+  - [16.4 环境变量控制开关](#164-环境变量控制开关)
+- [十七、CUDA_VISIBLE_DEVICES 空字符串 vs 未设置的语义差异](#十七cuda_visible_devices-空字符串-vs-未设置的语义差异)
+  - [17.1 关键区别](#171-关键区别)
+  - [17.2 NVML 对 CUDA_VISIBLE_DEVICES 的行为](#172-nvml-对-cuda_visible_devices-的行为)
+- [十八、Actor + vLLM 子进程场景的 CUDA_VISIBLE_DEVICES 问题](#十八actor--vllm-子进程场景的-cuda_visible_devices-问题)
+  - [18.1 问题描述](#181-问题描述)
+  - [18.2 Actor 场景的特殊性](#182-actor-场景的特殊性)
+  - [18.3 num_gpus=1 时的正常流程](#183-num_gpus1-时的正常流程)
+  - [18.4 对比表](#184-对比表)
+  - [18.5 解决方案](#185-解决方案)
+- [十九、K8s NVIDIA Device Plugin 的 GPU 重新编号](#十九k8s-nvidia-device-plugin-的-gpu-重新编号)
+  - [19.1 K8s 中 GPU 编号从 0 开始](#191-k8s-中-gpu-编号从-0-开始)
+  - [19.2 K8s 场景下 num_gpus=1 与 Ray 的配合](#192-k8s-场景下-num_gpus1-与-ray-的配合)
+  - [19.3 K8s 场景下 num_gpus=0 的问题](#193-k8s-场景下-num_gpus0-的问题)
+  - [19.4 Ray Train 的 share_cuda_visible_devices 机制（补充）](#194-ray-train-的-share_cuda_visible_devices-机制补充)
+- [二十、关键条件逻辑完整总结](#二十关键条件逻辑完整总结)
+  - [20.1 所有环境变量控制开关](#201-所有环境变量控制开关)
+  - [20.2 Task 类型与 CUDA_VISIBLE_DEVICES 行为](#202-task-类型与-cuda_visible_devices-行为)
+  - [20.3 GPU 编号流转全链路](#203-gpu-编号流转全链路)
+  - [20.4 问题速查表](#204-问题速查表)
 
 ---
 
@@ -2509,3 +2544,553 @@ local_resources_.available:
       }
       // idx_best_fit 就是选中的 GPU 索引
   }
+```
+
+---
+
+## 十四、CUDA_VISIBLE_DEVICES 设置者与调用链详解
+
+### 14.1 谁设置了 CUDA_VISIBLE_DEVICES
+
+`CUDA_VISIBLE_DEVICES` 由 **Ray 框架自动设置**，任务代码本身不需要关心。设置者是 Python 层的 `NvidiaGPUAcceleratorManager`，调用链如下：
+
+```
+Cython 任务执行包装器 (_raylet.pyx:2104-2105)
+    ↓
+set_visible_accelerator_ids() (utils.py:270-297)
+    ↓
+get_accelerator_ids() → get_accelerator_ids_for_accelerator_resource() (worker.py:1095-1129)
+    ↓  从 C++ CoreWorker::resource_ids_ 获取 GPU 实例索引
+    ↓  经双重映射：内部索引 → 物理 GPU ID
+    ↓
+NvidiaGPUAcceleratorManager.set_current_process_visible_accelerator_ids() (nvidia_gpu.py:92-101)
+    ↓
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  (或 "2,5" 等物理 GPU ID)
+```
+
+### 14.2 调用入口：Cython 任务执行包装器
+
+**文件：`python/ray/_raylet.pyx:2100-2109`**
+
+```python
+# 非 actor 任务执行前自动调用
+if (<int>task_type != <int>TASK_TYPE_ACTOR_TASK):
+    original_visible_accelerator_env_vars = ray._private.utils.set_visible_accelerator_ids()
+    omp_num_threads_overriden = ray._private.utils.set_omp_num_threads_if_unset()
+else:
+    original_visible_accelerator_env_vars = None
+    omp_num_threads_overriden = False
+```
+
+这是在任务函数真正执行**之前**，由 Ray 的任务执行框架自动插入的调用。用户的代码看不到这一步。
+
+### 14.3 中间层：读取分配给当前任务的 GPU ID
+
+**文件：`python/ray/_private/utils.py:270-297`**
+
+```python
+def set_visible_accelerator_ids() -> Mapping[str, Optional[str]]:
+    original_visible_accelerator_env_vars = {}
+    override_on_zero = env_bool(
+        ray._private.accelerators.RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO_ENV_VAR,
+        True,
+    )
+    for resource_name, accelerator_ids in (
+        ray.get_runtime_context().get_accelerator_ids().items()
+    ):
+        # accelerator_ids 就是从 C++ 层拿到的 Ray 内部 GPU 索引
+        # 经 worker.py 双重映射后变成物理 GPU ID
+        if not override_on_zero and len(accelerator_ids) == 0:
+            continue
+        env_var = ray._private.accelerators.get_accelerator_manager_for_resource(
+            resource_name
+        ).get_visible_accelerator_ids_env_var()  # "CUDA_VISIBLE_DEVICES"
+        original_visible_accelerator_env_vars[env_var] = os.environ.get(env_var, None)
+        ray._private.accelerators.get_accelerator_manager_for_resource(
+            resource_name
+        ).set_current_process_visible_accelerator_ids(accelerator_ids)
+    return original_visible_accelerator_env_vars
+```
+
+`get_accelerator_ids()` 的数据来源链：
+
+```
+C++ CoreWorker::resource_ids_  (raylet 分配的 GPU 实例索引)
+    ↓
+Cython resource_ids()  (桥接 C++ → Python)
+    ↓
+worker.get_accelerator_ids_for_accelerator_resource()  (内部索引 → 物理 GPU ID 映射)
+    ↓
+返回 ["2", "5"] 这样的物理 GPU ID 列表
+```
+
+### 14.4 最终写入：NvidiaGPUAcceleratorManager
+
+**文件：`python/ray/_private/accelerators/nvidia_gpu.py:92-101`**
+
+```python
+@staticmethod
+def set_current_process_visible_accelerator_ids(
+    visible_cuda_devices: List[str],
+) -> None:
+    if env_bool(NOSET_CUDA_VISIBLE_DEVICES_ENV_VAR, False):
+        return  # RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1 时跳过
+    os.environ[
+        NvidiaGPUAcceleratorManager.get_visible_accelerator_ids_env_var()
+    ] = ",".join([str(i) for i in visible_cuda_devices])
+```
+
+就是一行 `os.environ["CUDA_VISIBLE_DEVICES"] = "2,5"`，写入当前 worker 进程的环境变量。
+
+### 14.5 执行后清理（仅普通任务）
+
+**文件：`python/ray/_raylet.pyx:2212-2218`**
+
+```python
+if (<int>task_type == <int>TASK_TYPE_NORMAL_TASK):
+    if original_visible_accelerator_env_vars:
+        ray._private.utils.reset_visible_accelerator_env_vars(original_visible_accelerator_env_vars)
+    if omp_num_threads_overriden:
+        os.environ.pop("OMP_NUM_THREADS", None)
+```
+
+普通任务执行完后，`CUDA_VISIBLE_DEVICES` 会被**恢复为执行前的值**，因为 worker 进程会被复用给下一个任务。
+
+### 14.6 完整时序图
+
+```
+Raylet 分配 GPU 索引 [0, 3] 给任务
+        ↓
+CoreWorker 存储 resource_ids_ = {GPU: [(0, 1.0), (3, 1.0)]}
+        ↓
+Cython 执行包装器拦截任务执行
+        ↓
+set_visible_accelerator_ids() 被调用
+        ↓
+  ├── get_accelerator_ids()
+  │     └── core_worker.resource_ids() → [0, 3]
+  │     └── 双重映射: 0→"2", 3→"7" (假设原始 CUDA_VISIBLE_DEVICES=2,5,7,9)
+  │
+  ├── os.environ["CUDA_VISIBLE_DEVICES"] = "2,7"  ← NvidiaGPUAcceleratorManager 写入
+  │
+  └── 记录原始值 "2,5,7,9" 用于恢复
+        ↓
+用户的任务函数开始执行（此时 torch.cuda.device_count() == 2，只看到 GPU 2 和 7）
+        ↓
+任务执行完毕
+        ↓
+reset_visible_accelerator_env_vars() → os.environ["CUDA_VISIBLE_DEVICES"] = "2,5,7,9"
+```
+
+---
+
+## 十五、GPU 编号来源：NVML 检测 vs Ray 内部索引
+
+### 15.1 Ray 不是直接获取底层硬件 GPU 编号
+
+Ray 的 GPU 编号不是从机器底层直接获取硬件编号，而是有**两层编号系统**并通过映射关联：
+
+**第1层：GPU 数量检测 — NVML（非 nvidia-smi）**
+
+**文件：`python/ray/_private/accelerators/nvidia_gpu.py:46-56`**
+
+```python
+@staticmethod
+def get_current_node_num_accelerators() -> int:
+    import ray._private.thirdparty.pynvml as pynvml
+    pynvml.nvmlInit()
+    device_count = pynvml.nvmlDeviceGetCount()  # 读取所有物理 GPU 数量
+    pynvml.nvmlShutdown()
+    return device_count
+```
+
+NVML 的 `nvmlDeviceGetCount()` **无视 `CUDA_VISIBLE_DEVICES`**，直接从驱动层获取物理 GPU 总数（比如机器有 8 张卡，返回 8）。
+
+**第2层：CUDA_VISIBLE_DEVICES 截断数量**
+
+**文件：`python/ray/_private/resource_and_label_spec.py:433-443`**
+
+```python
+num_accelerators = accelerator_manager.get_current_node_num_accelerators()  # NVML: 8
+visible_accelerator_ids = accelerator_manager.get_current_process_visible_accelerator_ids()
+if visible_accelerator_ids is not None:
+    num_accelerators = min(num_accelerators, len(visible_accelerator_ids))  # min(8, 2) = 2
+```
+
+如果启动 Ray 前设了 `CUDA_VISIBLE_DEVICES=2,5`，Ray 只会注册 **2** 个 GPU 资源（不是 8）。
+
+**第3层：Ray 内部编号 — 自己创建的顺序索引 0, 1, 2...**
+
+**文件：`src/ray/common/scheduling/resource_instance_set.cc:29-43`**
+
+Raylet 收到 `GPU,2` 后，GPU 是"单位实例资源"（`predefined_unit_instance_resources = "GPU"` 在 `ray_config_def.h:800`），为每个 GPU 创建一个值为 1.0 的实例：
+
+```
+3 张 GPU → [1.0, 1.0, 1.0]，内部索引为 0, 1, 2
+```
+
+这是 Ray 调度器自己的编号，**不等于物理 GPU ID**。
+
+**第4层：双重映射 — 内部索引 → 物理 GPU ID**
+
+Worker 启动时记录原始 `CUDA_VISIBLE_DEVICES`：
+
+**文件：`python/ray/_private/worker.py:466-471`**
+
+```python
+self.original_visible_accelerator_ids = ray._private.utils.get_visible_accelerator_ids()
+```
+
+任务执行时，将 Ray 内部索引映射回物理 ID：
+
+**文件：`python/ray/_private/worker.py:1126-1128`**
+
+```python
+if self.original_visible_accelerator_ids.get(resource_name, None) is not None:
+    original_ids = self.original_visible_accelerator_ids[resource_name]
+    assigned_ids = {str(original_ids[i]) for i in assigned_ids}  # 内部索引 → 物理 ID
+```
+
+### 15.2 具体映射示例
+
+| 场景 | NVML 检测 | CUDA_VISIBLE_DEVICES | Ray 注册 GPU 数 | Ray 内部索引 | 任务设 CUDA_VISIBLE_DEVICES |
+|------|-----------|----------------------|----------------|-------------|---------------------------|
+| 默认（8卡机器） | 8 | 未设置 | 8 | 0,1,2,3,4,5,6,7 | `0,3`（直接用内部索引=物理ID） |
+| 预设 `CUDA_VISIBLE_DEVICES=2,5` | 8 | `2,5` | 2 | 0,1 | 内部0→`2`，内部1→`5` |
+| 预设 `CUDA_VISIBLE_DEVICES=0,1` | 8 | `0,1` | 2 | 0,1 | 内部0→`0`，内部1→`1` |
+
+### 15.3 总结
+
+Ray **不是**直接获取底层硬件 GPU 编号。流程是：
+
+1. **NVML** 检测物理 GPU 总数（绕过 CUDA_VISIBLE_DEVICES）
+2. **CUDA_VISIBLE_DEVICES** 截断实际可用数量
+3. **Ray 调度器** 为每张 GPU 创建自己的顺序索引（0, 1, 2, ...）
+4. **Worker 执行任务时**，用原始 `CUDA_VISIBLE_DEVICES` 做映射：Ray 内部索引 `i` → 原始列表第 `i` 个物理 GPU ID
+
+这样设计的好处是：Ray 调度器只需要关心"第几张 GPU"的抽象索引，而实际设给进程的 `CUDA_VISIBLE_DEVICES` 始终是正确的物理设备 ID。
+
+---
+
+## 十六、RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO 与空字符串问题
+
+### 16.1 问题环境变量定义
+
+**文件：`python/ray/_private/accelerators/accelerator.py:4-15`**
+
+```python
+# https://github.com/ray-project/ray/issues/54868
+# In the future, ray will avoid overriding the accelerator ids environment variables
+# when the number of accelerators is zero.
+# For example, when this environment variable is set, if a user sets `num_gpus=0`
+# in the `ray.init()` call, the environment variable `CUDA_VISIBLE_DEVICES` will
+# not be set to an empty string.
+#
+# This environment variable is used to disable this behavior temporarily.
+# And to avoid breaking changes, this environment variable is set to True by default
+# to follow the previous behavior.
+#
+RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO_ENV_VAR = "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"
+```
+
+这个环境变量控制当 `num_gpus=0` 时，Ray 是否仍然覆盖 `CUDA_VISIBLE_DEVICES`。
+
+### 16.2 默认行为：override_on_zero=True
+
+**文件：`python/ray/_private/utils.py:279-288`**
+
+```python
+override_on_zero = env_bool(
+    ray._private.accelerators.RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO_ENV_VAR,
+    True,   # ← 默认 True，num_gpus=0 时也会覆盖
+)
+for resource_name, accelerator_ids in ...:
+    if not override_on_zero and len(accelerator_ids) == 0:
+        continue  # False 时跳过，不设置
+    # ↓ True 时 accelerator_ids=[] → 写入 ""
+    manager.set_current_process_visible_accelerator_ids(accelerator_ids)
+```
+
+**文件：`python/ray/_private/accelerators/nvidia_gpu.py:99-101`**
+
+```python
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in visible_cuda_devices])
+# [] → ",".join([]) → ""   ← 空字符串！
+```
+
+当 `accelerator_ids = []`（0 个 GPU）时，`",".join([])` 结果是空字符串 `""`，因此 `CUDA_VISIBLE_DEVICES` 被设为 `""`。
+
+### 16.3 完整因果链：num_gpus=0 导致空字符串
+
+```
+Actor 创建时 num_gpus=0
+    ↓
+set_visible_accelerator_ids() 被调用
+    ↓
+accelerator_ids = [] （0 个 GPU）
+    ↓
+override_on_zero 默认 True → 不跳过
+    ↓
+NvidiaGPUAcceleratorManager.set_current_process_visible_accelerator_ids([])
+    ↓
+os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([]) = ""   ← 空字符串！
+    ↓
+Actor 进程中 CUDA_VISIBLE_DEVICES="" 永久固化（Actor 不重置）
+    ↓
+子进程（如 vLLM）继承 CUDA_VISIBLE_DEVICES=""
+    ↓
+vLLM GPU 检测异常
+```
+
+### 16.4 环境变量控制开关
+
+| 环境变量 | 值 | 效果 |
+|---------|---|------|
+| `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO` | `True`（默认） | `num_gpus=0` 时设 `CUDA_VISIBLE_DEVICES=""` |
+| `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO` | `False`/`0` | `num_gpus=0` 时不覆盖 `CUDA_VISIBLE_DEVICES` |
+| `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES` | `1` | Ray 完全不修改 `CUDA_VISIBLE_DEVICES`（无论 num_gpus 多少） |
+
+---
+
+## 十七、CUDA_VISIBLE_DEVICES 空字符串 vs 未设置的语义差异
+
+### 17.1 关键区别
+
+| `CUDA_VISIBLE_DEVICES` 状态 | CUDA Runtime 行为 | NVML 行为 | vLLM 可能的行为 |
+|---|---|---|---|
+| **未设置** | 看到所有 GPU | 看到所有 GPU | 看到所有 GPU |
+| **`""`** (空字符串) | 看到 **0** 个 GPU | 看到所有 GPU（NVML 无视此变量） | **可能**用 NVML 检测，认为看到所有 GPU |
+| **`"2,5"`** | 只看到 GPU 2,5 | 看到所有 GPU | 应该只看到 2,5 |
+
+**核心问题**：`CUDA_VISIBLE_DEVICES=""` 对 CUDA Runtime 意味着 0 个 GPU，但 NVML 无视此变量。如果应用程序（如 vLLM）的 GPU 检测走了 NVML 路径（和 Ray 一样用 `pynvml.nvmlDeviceGetCount()`），就会认为有 N 张 GPU，但实际 CUDA 调用会失败。
+
+### 17.2 NVML 对 CUDA_VISIBLE_DEVICES 的行为
+
+**文件：`python/ray/_private/accelerators/nvidia_gpu.py:46-56`**
+
+```python
+def get_current_node_num_accelerators() -> int:
+    import ray._private.thirdparty.pynvml as pynvml
+    pynvml.nvmlInit()
+    device_count = pynvml.nvmlDeviceGetCount()  # ← NVML 完全无视 CUDA_VISIBLE_DEVICES
+    pynvml.nvmlShutdown()
+    return device_count
+```
+
+NVML 的 `nvmlDeviceGetCount()` 报告的是**驱动层可见的物理 GPU 总数**，不受 `CUDA_VISIBLE_DEVICES` 影响。这是 Ray 和 vLLM 可能出现检测不一致的根源。
+
+---
+
+## 十八、Actor + vLLM 子进程场景的 CUDA_VISIBLE_DEVICES 问题
+
+### 18.1 问题描述
+
+在 K8s 环境中，Ray Actor 以 `num_gpus=0` 创建，然后在 Actor 内部启动 vLLM 子进程。此时：
+
+1. Ray 将 `CUDA_VISIBLE_DEVICES` 设为空字符串 `""`
+2. vLLM 子进程继承 `CUDA_VISIBLE_DEVICES=""`
+3. vLLM 可能通过 NVML 检测到所有 GPU，但 CUDA Runtime 实际无法访问
+4. 即使 K8s 设备文件隔离阻止了跨 GPU 访问，vLLM 的 GPU 检测逻辑已经出错
+
+### 18.2 Actor 场景的特殊性
+
+**文件：`python/ray/_raylet.pyx:2100-2109`**
+
+```python
+if (<int>task_type != <int>TASK_TYPE_ACTOR_TASK):
+    # 只有非 actor 任务才每次执行前设置+执行后恢复
+    original_visible_accelerator_env_vars = ray._private.utils.set_visible_accelerator_ids()
+else:
+    # Actor 方法调用 → 不做任何操作，继承创建时的值
+    original_visible_accelerator_env_vars = None
+```
+
+**文件：`python/ray/_raylet.pyx:2212-2218`**
+
+```python
+if (<int>task_type == <int>TASK_TYPE_NORMAL_TASK):
+    if original_visible_accelerator_env_vars:
+        ray._private.utils.reset_visible_accelerator_env_vars(original_visible_accelerator_env_vars)
+```
+
+Actor 只在**创建时**（ACTOR_CREATION_TASK）设置一次 `CUDA_VISIBLE_DEVICES`，之后所有 Actor 方法调用都**不再重置**。所以如果 Actor 创建时 `num_gpus=0`，`CUDA_VISIBLE_DEVICES=""` 就**永久固化**在这个 Actor 进程中，所有子进程（包括 vLLM）都会继承。
+
+### 18.3 num_gpus=1 时的正常流程
+
+```
+Actor 创建 num_gpus=1
+    ↓
+Raylet 分配 1 个 GPU 实例，内部索引 0
+    ↓
+set_visible_accelerator_ids() 被调用
+    ↓
+accelerator_ids = ["0"] （或映射后的物理 ID，如 "2"）
+    ↓
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"   ← 有效值，非空字符串
+    ↓
+Actor 内启动 vLLM 子进程
+    ↓
+vLLM 继承 CUDA_VISIBLE_DEVICES="0"
+    ↓
+vLLM 正确检测到 1 张 GPU ✅
+```
+
+### 18.4 对比表
+
+| 场景 | `CUDA_VISIBLE_DEVICES` | vLLM 行为 |
+|------|----------------------|-----------|
+| `num_gpus=0` | `""` (空字符串) | NVML 检测到 N 张 GPU，CUDA 调用失败 ❌ |
+| `num_gpus=1` | `"0"` | 只看到 1 张 GPU，正常工作 ✅ |
+| `num_gpus=2` | `"0,3"` | 只看到 2 张 GPU，正常工作 ✅ |
+
+### 18.5 解决方案
+
+**方案1**：启动 Ray 前设置环境变量，禁止 num_gpus=0 时覆盖：
+
+```bash
+export RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0
+```
+
+这样 `num_gpus=0` 时 Ray 不会动 `CUDA_VISIBLE_DEVICES`，vLLM 子进程继承的值取决于 K8s 容器原始设置。
+
+**方案2**：在启动 vLLM 子进程前手动修正环境变量：
+
+```python
+import os, subprocess
+
+# 在 Actor 方法中启动 vLLM 前
+if os.environ.get("CUDA_VISIBLE_DEVICES") == "":
+    os.environ.pop("CUDA_VISIBLE_DEVICES", None)  # 删除，让 vLLM 用 K8s 挂载的设备
+    # 或者显式设置目标 GPU
+    # os.environ["CUDA_VISIBLE_DEVICES"] = "2,5"
+
+subprocess.Popen(["python", "-m", "vllm.entrypoints..."], env=os.environ.copy())
+```
+
+**方案3**：给 Actor 分配实际 GPU 数量（`num_gpus=N`），让 Ray 正确设置 `CUDA_VISIBLE_DEVICES` 为具体 GPU ID，而不是空字符串。
+
+---
+
+## 十九、K8s NVIDIA Device Plugin 的 GPU 重新编号
+
+### 19.1 K8s 中 GPU 编号从 0 开始
+
+K8s NVIDIA Device Plugin 会在容器内**重新编号**，分配的 GPU 永远从 0 开始：
+
+| K8s 分配 | 容器内可见 GPU 索引 | 物理卡号 |
+|---------|-------------------|---------|
+| 1 张卡 | 只有 GPU 0 | 无论物理卡号是多少 |
+| 2 张卡 | GPU 0, 1 | 可能是物理卡号 3,7 |
+| N 张卡 | GPU 0, 1, ..., N-1 | 不一定连续 |
+
+这意味着在 K8s 单卡 Pod 中：
+
+| `CUDA_VISIBLE_DEVICES` 设置 | 结果 |
+|-----------------------------|------|
+| `"0"` ✅ | 看到容器内唯一的 GPU |
+| `"1"` ❌ | 找不到 GPU 1 → 0 张可见 GPU |
+| `""` ❌ | 空字符串=0 张可见 GPU |
+| 不设置 ✅ | 默认看到容器内唯一的 GPU 0 |
+
+### 19.2 K8s 场景下 num_gpus=1 与 Ray 的配合
+
+K8s NVIDIA Device Plugin 在容器内重新编号，容器内看到的 GPU 始终从 0 开始。所以 `num_gpus=1` 时 Ray 设 `CUDA_VISIBLE_DEVICES="0"` 与 K8s 的设备挂载完全一致，不存在冲突。
+
+### 19.3 K8s 场景下 num_gpus=0 的问题
+
+当 Actor 以 `num_gpus=0` 创建时，Ray 将 `CUDA_VISIBLE_DEVICES` 设为空字符串 `""`：
+
+- **CUDA Runtime**：`""` = 0 个可见 GPU
+- **NVML**：`""` → NVML 无视，仍报告容器内所有 GPU
+- **K8s 设备文件隔离**：通过 `/dev/nvidia*` 设备文件控制，实际阻止跨 GPU 访问
+
+但 vLLM 等框架如果通过 NVML 检测 GPU 数量，会认为有 N 张 GPU 可用，而实际 CUDA 调用会失败。
+
+### 19.4 Ray Train 的 share_cuda_visible_devices 机制（补充）
+
+对于 Ray Train 分布式训练场景，还有额外的 `CUDA_VISIBLE_DEVICES` 共享机制：
+
+**文件：`python/ray/train/v2/_internal/callbacks/accelerators.py:41-52`**
+
+```python
+def _maybe_share_cuda_visible_devices(self, workers: List["Worker"]):
+    """Set CUDA visible devices environment variables on workers."""
+    share_cuda_visible_devices_enabled = env_bool(
+        ENABLE_SHARE_CUDA_VISIBLE_DEVICES_ENV,
+        self._backend.share_cuda_visible_devices,
+    )
+    if (
+        self._scaling_config._resources_per_worker_not_none.get("GPU", 0) > 0
+        and share_cuda_visible_devices_enabled
+    ):
+        _share_cuda_visible_devices(workers)
+```
+
+Torch/Horovod 后端默认将同节点所有 worker 的 `CUDA_VISIBLE_DEVICES` 设为该节点所有 GPU 的**并集**，以支持 NCCL/Gloo 跨 GPU 通信。
+
+| 后端 | `share_cuda_visible_devices` 默认值 | 说明 |
+|------|----------------------------------|------|
+| 基础 Backend | `False` | 不共享 |
+| `_TorchBackend` | `True` | 共享（支持 NCCL） |
+| `_HorovodBackend` | `True` | 共享（支持 Gloo） |
+| RLlib LearnerGroup | `False`（显式覆盖） | 不共享 |
+
+可通过 `TRAIN_ENABLE_SHARE_CUDA_VISIBLE_DEVICES` 环境变量控制。
+
+---
+
+## 二十、关键条件逻辑完整总结
+
+### 20.1 所有环境变量控制开关
+
+| 环境变量 | 默认值 | 作用 |
+|---------|-------|------|
+| `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO` | `True` | `num_gpus=0` 时是否覆盖 `CUDA_VISIBLE_DEVICES` 为 `""` |
+| `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES` | `False` | 设为 `1` 时 Ray 完全不修改 `CUDA_VISIBLE_DEVICES` |
+| `TRAIN_ENABLE_SHARE_CUDA_VISIBLE_DEVICES` | 依赖后端 | Ray Train 是否共享同节点所有 GPU ID |
+
+### 20.2 Task 类型与 CUDA_VISIBLE_DEVICES 行为
+
+| Task 类型 | 设置 CUDA_VISIBLE_DEVICES | 完成后重置 | resource_ids_ 清除 |
+|-----------|--------------------------|-----------|-------------------|
+| NORMAL_TASK | 每次执行前设置 | 是，恢复原值 | 是 (`core_worker.cc:2967-2968`) |
+| ACTOR_CREATION_TASK | 创建时设置一次 | 否（Actor 生命周期持有） | 否 |
+| ACTOR_TASK | 不设置（沿用创建时的绑定） | 否 | 否 |
+
+### 20.3 GPU 编号流转全链路
+
+```
+物理 GPU（驱动层）
+    NVML: nvmlDeviceGetCount() → 物理总数（无视 CUDA_VISIBLE_DEVICES）
+        ↓
+CUDA_VISIBLE_DEVICES 截断
+    min(NVML_count, len(visible_ids)) → 实际可用数
+        ↓
+Ray 资源注册
+    GPU:N → [1.0, 1.0, ..., 1.0]  内部索引 0..N-1
+        ↓
+Raylet 调度分配
+    allocation[i] = 1.0 → 分配内部索引 i
+        ↓
+RPC 传递
+    resource_mapping { index: i, quantity: 1.0 }
+        ↓
+CoreWorker 存储
+    resource_ids_ = {GPU: [(i, 1.0)]}
+        ↓
+Python 双重映射
+    original_visible_accelerator_ids[i] → 物理 GPU ID
+        ↓
+设置环境变量
+    os.environ["CUDA_VISIBLE_DEVICES"] = 物理 GPU ID
+```
+
+### 20.4 问题速查表
+
+| 问题 | 根因 | 解决方案 |
+|------|------|---------|
+| vLLM 子进程看到所有 GPU 但 CUDA 调用失败 | `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=True` 导致 `CUDA_VISIBLE_DEVICES=""` | 设置 `RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO=0` |
+| Actor 中 GPU 绑定后无法切换 | Actor 创建后不重设 `CUDA_VISIBLE_DEVICES` | 这是设计行为，确保 GPU 绑定稳定 |
+| Ray 完全不修改 `CUDA_VISIBLE_DEVICES` | — | 设置 `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` |
+| K8s 单卡 Pod 中设 `CUDA_VISIBLE_DEVICES="1"` | K8s 容器内 GPU 从 0 重新编号 | 只能设 `"0"` 或不设 |
+| Ray Train 中 NCCL 无法跨 GPU 通信 | `share_cuda_visible_devices=False` | Torch 后端默认 True，或设 `TRAIN_ENABLE_SHARE_CUDA_VISIBLE_DEVICES=1` |
