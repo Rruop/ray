@@ -841,6 +841,80 @@ ray_my_counter_total{..., deployment="MyDeployment",model="123",replica="MyDeplo
 
 See the [Ray Metrics documentation](collect-metrics) for more details, including instructions for scraping these metrics using Prometheus.
 
+### KESS gRPC inference metrics
+
+When using the Ray Serve Inference framework with KESS gRPC integration, requests bypass the standard HTTP/gRPC proxy and router, entering directly through the `InferenceGateway`'s KESS gRPC server. The gateway acts as both the ingress proxy **and** a deployment replica, so it records both `[H]`-equivalent (ingress-level) and `[D]`-equivalent (deployment-level) metrics within its `_dispatch()` method.
+
+The application contains two deployments:
+
+- **`InferenceGateway`** — receives KESS gRPC requests, dispatches them to the worker via `DeploymentHandle.remote()`, and records ingress + deployment-level metrics manually.
+- **`InferenceWorker`** — processes the request through the agent's `predict()` method. Deployment-level metrics (`[D]`) are recorded automatically by the standard Serve replica path.
+
+The following diagram shows the request flow and where each metric is captured:
+
+```
+                              KESS INFERENCE REQUEST FLOW
+
+  ┌──────────────────────────────────────────────────────────────────────────────┐
+  │                                                                              │
+  │   ┌────────────────────────────────────────────────────────────────────────┐ │
+  │   │              KESS 服务发现 → Client (GrpcClient.Predict)                 │ │
+  │   └───────────────────────────────────┬────────────────────────────────────┘ │
+  │                                       │                                      │
+  │                                       ▼                                      │
+  │   ┌────────────────────────────────────────────────────────────────────────┐ │
+  │   │              INFERENCE GATEWAY (KESS gRPC Server)                     │ │
+  │   │              _dispatch() — KESS gRPC 线程池同步调用                     │ │
+  │   │                                                                        │ │
+  │   │  ── INGRESS 级 (gRPC Proxy 对等 [H]) ──────────────────────────────── │ │
+  │   │                                                                        │ │
+  │   │  ○ ray_serve_num_ongoing_grpc_requests      (while processing)         │ │
+  │   │      Gauge  tags: node_id, node_ip_address                            │ │
+  │   │  ○ ray_serve_num_grpc_requests_total        (on completion)          │ │
+  │   │      Counter  tags: route, method, application, status_code          │ │
+  │   │  ○ ray_serve_grpc_request_latency_ms        (on completion)          │ │
+  │   │      Histogram  tags: method, route, application, status_code        │ │
+  │   │  ○ ray_serve_num_grpc_error_requests_total  (on error)               │ │
+  │   │      Counter  tags: route, error_code, method, application           │ │
+  │   │  ○ ray_serve_num_deployment_grpc_error_requests_total (on error)     │ │
+  │   │      Counter  tags: deployment, error_code, method, route,           │ │
+  │   │                                 application                           │ │
+  │   │                                                                        │ │
+  │   │  ── DEPLOYMENT 级 (Replica 对等 [D]) ────────────────────────────────── │ │
+  │   │                                                                        │ │
+  │   │  ○ ray_serve_replica_processing_queries     (while processing)        │ │
+  │   │      Gauge  tags: deployment, replica, application                    │ │
+  │   │  ○ ray_serve_deployment_request_counter_total (on completion)        │ │
+  │   │      Counter  tags: route, deployment, replica, application           │ │
+  │   │  ○ ray_serve_deployment_processing_latency_ms (on completion)        │ │
+  │   │      Histogram  tags: route, deployment, replica, application        │ │
+  │   │  ○ ray_serve_deployment_error_counter_total   (on exception)          │ │
+  │   │      Counter  tags: route, exception_type, deployment, replica,       │ │
+  │   │                                 application                           │ │
+  │   └───────────────────────────────────┬────────────────────────────────────┘ │
+  │                                       │ DeploymentHandle.remote()           │
+  │                                       ▼                                      │
+  │   ┌────────────────────────────────────────────────────────────────────────┐ │
+  │   │              INFERENCE WORKER (标准 Replica 路径)                       │ │
+  │   │                                                                        │ │
+  │   │  ○ ray_serve_replica_processing_queries     (while processing)        │ │
+  │   │  ○ ray_serve_deployment_request_counter_total (on completion)        │ │
+  │   │  ○ ray_serve_deployment_processing_latency_ms (on completion)        │ │
+  │   │  ○ ray_serve_deployment_error_counter_total   (on exception)          │ │
+  │   │                                                                        │ │
+  │   │  (以上指标由 replica.py 标准路径自动记录)                                 │ │
+  │   └────────────────────────────────────────────────────────────────────────┘ │
+  │                                                                              │
+  └──────────────────────────────────────────────────────────────────────────────┘
+```
+
+Key differences from standard Serve:
+
+- **Ingress metrics**: In standard Serve, `[H]` metrics are recorded by the HTTP/gRPC proxy. In KESS mode, the gateway records equivalent gRPC ingress metrics in `_dispatch()` because requests bypass the proxy.
+- **Deployment metrics**: In standard Serve, `[D]` metrics are recorded by `replica.py:handle_request()`. In KESS mode, both the gateway (manually in `_dispatch()`) and the worker (automatically via standard path) record deployment-level metrics, each tagged with their respective `deployment` name (`InferenceGateway` vs `InferenceWorker`).
+- **Latency semantics**: Gateway latency includes the full end-to-end time (gRPC receive → worker return); Worker latency only includes the agent's `predict()` processing time.
+- **`route` tag**: Gateway records `route="/Predict"` or `route="/BatchPredict"`; Worker records `route=""` (empty) because `DeploymentHandle.remote()` does not go through HTTP routing.
+
 ## Profiling memory
 
 Ray provides two useful metrics to track memory usage: `ray_component_rss_mb` (resident set size) and `ray_component_mem_shared_bytes` (shared memory). Approximate a Serve actor's memory usage by subtracting its shared memory from its resident set size (i.e. `ray_component_rss_mb` - `ray_component_mem_shared_bytes`).
