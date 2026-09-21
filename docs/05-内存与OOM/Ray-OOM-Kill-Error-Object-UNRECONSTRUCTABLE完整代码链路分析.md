@@ -331,14 +331,54 @@ bool TaskSpecification::IsRetriable() const {
 
 **核心结论**：actor worker 在执行 method task 期间，仍然持有 actor creation task 的 lease。因此 Killing Policy 检查 `IsRetriable()` 时，看的是 `ACTOR_CREATION_TASK` + `max_actor_restarts` 的组合，而非 method task 本身。
 
+**★ 修正：Actor Worker 始终持有 lease，不会归还**
+
+之前的分析错误地认为 actor worker 在 method task 执行完成后会归还 lease（`GetGrantedLeaseId().IsNil()=true`）。
+实际上，actor creation task 完成后，`CleanupLease` 调用 `ConvertWorkerToActor`，**不清除 `GrantedLeaseId`**：
+
+```cpp
+// node_manager.cc:2357-2382
+bool NodeManager::CleanupLease(const std::shared_ptr<WorkerInterface> &worker) {
+  ...
+  if (lease_spec.IsActorCreationTask()) {
+    ConvertWorkerToActor(worker, lease);  // 转为 actor，不归还 lease
+  }
+  if (!lease_spec.IsActorCreationTask()) {
+    worker->GrantLeaseId(LeaseID::Nil()); // 只有非 actor 才清除 lease
+  }
+  return !lease_spec.IsActorCreationTask(); // actor: return false → worker_idle=false
+}
+```
+
+actor worker **整个生命周期中始终持有** actor creation task 的 lease（`GetGrantedLeaseId().IsNil()=false`），
+不会因为执行 method task 完成或等待下一个 method task 而归还 lease。
+
 | Actor Worker 状态 | GetGrantedLeaseId() | Lease 类型 | IsRetriable() | 分组归属 |
 |---|---|---|---|---|
-| 刚创建，执行 `__init__` | 非 Nil | ACTOR_CREATION_TASK | 取决于 max_actor_restarts | retriable → ParentTaskId() 组; non-retriable → Nil 组 |
-| `__init__` 完成，等待 method task | **Nil**（lease 归还 raylet） | N/A | N/A | **跳过，不参与分组** |
-| 执行 actor method task | 非 Nil | 仍为 ACTOR_CREATION_TASK lease | 同上 | 同上 |
-| Idle（method 执行完，等待下一个） | **Nil**（lease 归还 raylet） | N/A | N/A | **跳过，不参与分组** |
+| 刚创建，执行 `__init__` | **非 Nil** | ACTOR_CREATION_TASK | 取决于 max_actor_restarts | retriable → ParentTaskId() 组; non-retriable → Nil 组 |
+| `__init__` 完成，等待 method task | **非 Nil**（lease 不归还） | ACTOR_CREATION_TASK | 取决于 max_actor_restarts | **同上，始终参与分组** |
+| 执行 actor method task | **非 Nil** | 仍为 ACTOR_CREATION_TASK lease | 取决于 max_actor_restarts | **同上** |
+| Idle（method 执行完，等待下一个） | **非 Nil**（lease 不归还） | 仍为 ACTOR_CREATION_TASK lease | 取决于 max_actor_restarts | **同上，始终参与分组** |
 
-**注意**：Ray Data 中 `MapBatches(QGInferMapper)` 使用 `ActorPool` compute 策略时，MapWorker 在两次 method 调用之间会处于 idle 状态，此时 `GetGrantedLeaseId().IsNil() == true`，Killing Policy 遍历时会被 `continue` 跳过，不计入任何 group 的 size。
+**★ Ray Data ActorPool 的 max_restarts 默认值**
+
+之前的分析错误地认为 Ray Data ActorPool 中 `max_actor_restarts` 默认为 `0`。
+实际上，`ActorPoolMapOperator._apply_default_remote_args` 将默认值设为 **`-1`（无限重启）**：
+
+```python
+# actor_pool_map_operator.py:595-604
+if "max_restarts" not in ray_remote_args:
+    ray_remote_args["max_restarts"] = -1        # ← 无限重启，不是 0
+if ("max_task_retries" not in ray_remote_args
+    and ray_remote_args.get("max_restarts") != 0):
+    ray_remote_args["max_task_retries"] = -1    # ← 无限 method task 重试
+```
+
+因此 Ray Data ActorPool 场景下，`max_actor_restarts=-1 > 0`，`IsRetriable()=true`，
+actor worker 归入 `ParentTaskId()` 组（Driver group），与 ReadArrowJSON **同组**。
+
+只有用户**显式设置 `max_restarts=0`**（如 `map_batches(..., max_restarts=0)`）时，
+`IsRetriable()` 才为 `false`，actor worker 才归入 Nil 组。
 
 ### 3.4 排序策略：优先选择 retriable 的最大 group
 
@@ -371,7 +411,10 @@ bool should_retry =
 //                              核心条件：同一 owner group 下必须有 >1 个 worker
 ```
 
-**这就是你案例中 `should_retry=false` 的根本原因！**
+**这就是 `should_retry` 判断的核心逻辑。** 在 Ray Data ActorPool 默认配置下
+（`max_restarts=-1`），actor worker 与 ReadArrowJSON 同属 Driver group，group size ≥ 2，
+`should_retry=true`。只有当用户显式设置 `max_restarts=0` 或 Driver group 中仅有 1 个 worker
+时，`should_retry` 才为 `false`。
 
 ### 3.6 在你的场景中为什么 should_retry=false
 
@@ -408,51 +451,37 @@ ReadArrowJSON->SplitBlocks(7):
 
 **Step 2: MapWorker(MapBatches(QGInferMapper)) 的分组归属**
 
-MapWorker 是 actor，其分组归属取决于 **当前是否持有 lease**：
+MapWorker 是 actor，**始终持有** actor creation task 的 lease（不会归还，见 §3.3.3 修正），
+其分组归属取决于 `max_actor_restarts`：
 
 ```
-情况 A: MapWorker 正在执行 actor method task
-  → GetGrantedLeaseId().IsNil() = false
+情况 A: MapWorker（Ray Data ActorPool 默认配置 max_restarts=-1）
+  → GetGrantedLeaseId().IsNil() = false（始终持有 lease）
   → Lease 类型: ACTOR_CREATION_TASK (actor worker 持有的是 creation lease)
-  → 如果 max_actor_restarts > 0:
+  → max_actor_restarts = -1 > 0:
      IsRetriable() = true
      分组 key = ParentTaskId() = Driver TaskID
      → 与 ReadArrowJSON 同组 (Driver group)
      → group size ≥ 2
-     → should_retry = true  ✗ （与实际不符）
+     → should_retry = true
 
-情况 B: MapWorker 正在执行 actor creation task (__init__)
-  → GetGrantedLeaseId().IsNil() = false
+情况 B: MapWorker（用户显式设置 max_restarts=0）
+  → GetGrantedLeaseId().IsNil() = false（始终持有 lease）
   → Lease 类型: ACTOR_CREATION_TASK
-  → 如果 max_actor_restarts == 0:
+  → max_actor_restarts == 0:
      IsRetriable() = false
      分组 key = TaskID::Nil()
      → 与 ReadArrowJSON 不同组
      → ReadArrowJSON 独占 Driver group, size = 1
-     → should_retry = false  ✓
-
-情况 C: MapWorker idle（method 执行完毕，等待下一个 method task）
-  → GetGrantedLeaseId().IsNil() = true
-  → Killing Policy 遍历时 continue 跳过
-  → 不计入任何 group 的 size
-  → ReadArrowJSON 独占 Driver group, size = 1
-  → should_retry = false  ✓
-
-情况 D: MapWorker 正在执行 actor method task, 但 max_actor_restarts == 0
-  → GetGrantedLeaseId().IsNil() = false
-  → Lease 类型: ACTOR_CREATION_TASK (creation lease)
-  → IsRetriable() = false (max_actor_restarts == 0)
-  → 分组 key = TaskID::Nil()
-  → 与 ReadArrowJSON 不同组
-  → ReadArrowJSON 独占 Driver group, size = 1
-  → should_retry = false  ✓
+     → should_retry = false
 ```
 
-#### 3.6.3 本场景的实际分组结果
+#### 3.6.3 本场景的实际分组结果（★ 修正后）
 
-在 Ray Data 的 `ActorPool` compute 策略中，MapWorker 在两次 method 调用之间会短暂处于 idle 状态（归还 lease 给 raylet）。当 OOM Killer 触发时，最可能的情况是：
+**修正前（错误）**：认为 MapWorker 在 idle 时归还 lease，不参与分组。
+**修正后**：MapWorker 始终持有 lease，始终参与分组。
 
-**MapWorker 处于 idle 状态（情况 C）**：
+**Ray Data ActorPool 默认配置下（`max_restarts=-1`）**：
 
 ```
 Killing Policy 遍历 workers:
@@ -463,58 +492,99 @@ Killing Policy 遍历 workers:
     → 加入 Driver group
 
   PID 476 (MapWorker):
-    → GetGrantedLeaseId().IsNil() = true (idle, 等待下一个 method task)
-    → continue ← 跳过，不计入任何 group
-
-  PID 126 (DashboardAgent):
-    → GetGrantedLeaseId().IsNil() = true (idle)
-    → continue ← 跳过
+    → GetGrantedLeaseId().IsNil() = false (★ 始终持有 lease，不归还)
+    → Lease 类型: ACTOR_CREATION_TASK
+    → max_actor_restarts = -1 > 0 → IsRetriable() = true
+    → 分组 key = ParentTaskId() = Driver TaskID
+    → 加入 Driver group
 
 分组结果:
-  Driver group: [ReadArrowJSON->SplitBlocks(7)]   size = 1
+  Driver group: [ReadArrowJSON->SplitBlocks(7), MapWorker(MapBatches)]   size = 2
   Nil group: (无 non-retriable worker)
 
 排序后:
   selected_group = Driver group (retriable 优先)
-  selected_group.GetAllWorkers().size() == 1
-  should_retry = 1 > 1 && true = false  ✓
+  selected_group.GetAllWorkers().size() == 2
+  should_retry = 2 > 1 && true = true
 ```
 
-**即使 MapWorker 正在执行 method task（情况 A），需要同时满足**：
-1. `max_actor_restarts > 0`（使 IsRetriable() = true）
-2. `ParentTaskId() == Driver TaskID`（与 ReadArrowJSON 同 key）
+**★ 这意味着在 Ray Data ActorPool 默认配置下，`should_retry=true`，而非之前分析的 `false`。**
 
-在 Ray Data 的 ActorPool 中，actor 的 `max_actor_restarts` 通常为 **0**（默认值），因为 actor pool 的容错由 Ray Data 层面处理（重新创建 actor），而非依赖 Ray actor restart 机制。此时即使 MapWorker 正在执行 method task，也属于 **情况 D**：IsRetriable()=false → Nil group → 不与 ReadArrowJSON 同组。
+ReadArrowJSON 被 OOM kill 后，会进入 `RetryTaskIfPossible()` 流程，拥有 OOM 重试机会
+（`num_oom_retries_left_` 默认 3 次）。
 
-#### 3.6.4 应排除的情况 A 的进一步分析
+#### 3.6.4 should_retry=true 时的完整路径
 
-如果 `max_actor_restarts > 0` 且 MapWorker 正在执行 method task，两者同组：
+当 `should_retry=true` 时，被 kill 的 ReadArrowJSON worker 的 task 会经历 OOM retry：
 
 ```
-Driver group: [ReadArrowJSON->SplitBlocks(7), MapWorker(MapBatches)]
-  → size = 2
-  → should_retry = 2 > 1 && true = true
-
-此时:
-  fail_immediately = false
-  → RetryTaskIfPossible() 被调用
-  → OOM retry: num_oom_retries_left_ (默认 3)
-  → 重试 3 次后 num_oom_retries_left_ == 0
-  → will_retry = false
-  → 最终仍调用 FailPendingTask()
-
-最终结果相同（task spec 被删除、error object 传播），但中间路径不同：
-  - should_retry=true → 经过 retry 后 OOM quota 耗尽 → FailPendingTask
-  - should_retry=false → 跳过 retry 直接 FailPendingTask
+1. Raylet OOM Kill → should_retry=true (group size=2)
+2. SetWorkerFailureReason(lease_id, OUT_OF_MEMORY, should_retry=true)
+3. Driver HandleGetWorkerFailureCause → fail_immediately=false
+4. FailOrRetryPendingTask(fail_immediately=false)
+   → 调用 RetryTaskIfPossible()
+   → 检查 OOM retry: num_oom_retries_left_ (默认 3)
+   → num_oom_retries_left_ > 0 → will_retry=true, num_oom_retries_left_--
+   → 重新提交 task
+5. 如果 retry 后在同节点再次 OOM:
+   → 同一流程再次触发
+   → num_oom_retries_left_ 继续递减
+6. 重试 3 次后 num_oom_retries_left_ == 0:
+   → will_retry = false
+   → 调用 FailPendingTask()
+   → task spec 从 submissible_tasks_ 中删除
+   → MarkTaskReturnObjectsFailed() → OUT_OF_MEMORY error object
+7. 后续 lineage reconstruction 尝试:
+   → ResubmitTask → submissible_tasks_ 中找不到
+   → OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED
 ```
 
-但在本场景中，**情况 A 不成立**，因为：
-1. Ray Data ActorPool 中 `max_actor_restarts` 默认为 0
-2. OOM Kill 那一刻 MapWorker 大概率处于 idle 状态
+**但注意**：retry 期间，Ray 会将 task 重新调度到**其他可用节点**
+（因为被 kill 的节点仍然内存紧张），如果其他节点有足够内存，task 可以成功执行。
 
-#### 3.6.5 小结
+#### 3.6.5 用户显式设置 max_restarts=0 时的情况
 
-**should_retry=false 的根本原因**：MapWorker 是 actor，在 OOM Kill 触发时大概率处于 idle 状态（无 lease），不参与 Killing Policy 的分组，导致 ReadArrowJSON 独占 Driver group，group size=1。即使 MapWorker 正在执行 method task，由于 `max_actor_restarts=0`（Ray Data ActorPool 默认），MapWorker 归入 Nil group 而非 Driver group，ReadArrowJSON 仍然独占 Driver group。
+如果用户在 `map_batches` 中设置了 `max_restarts=0`（如
+`map_batches(..., max_restarts=0)`），此时 actor worker 的 `IsRetriable()=false`：
+
+```
+Killing Policy 遍历 workers:
+  PID 478 (ReadArrowJSON):
+    → IsRetriable() = true → 分组 key = Driver TaskID → Driver group
+
+  PID 476 (MapWorker, max_restarts=0):
+    → GetGrantedLeaseId().IsNil() = false (始终持有 lease)
+    → Lease 类型: ACTOR_CREATION_TASK
+    → max_actor_restarts == 0 → IsRetriable() = false
+    → 分组 key = TaskID::Nil()
+    → 归入 Nil group（不与 ReadArrowJSON 同组）
+
+分组结果:
+  Driver group: [ReadArrowJSON->SplitBlocks(7)]   size = 1
+  Nil group: [MapWorker(MapBatches)]              size = 1
+
+排序后:
+  selected_group = Driver group (retriable 优先)
+  should_retry = 1 > 1 && true = false
+```
+
+此时 `should_retry=false`，与原文档分析一致。
+
+#### 3.6.6 小结（★ 修正后）
+
+**Ray Data ActorPool 默认配置下（`max_restarts=-1`）**：
+- MapWorker 始终持有 lease，`IsRetriable()=true`，归入 Driver group
+- 与 ReadArrowJSON 同组 → group size ≥ 2 → **`should_retry=true`**
+- OOM kill 后会进入 retry 流程（默认 3 次 OOM retry），有恢复机会
+
+**用户显式设置 `max_restarts=0` 时**：
+- MapWorker `IsRetriable()=false`，归入 Nil group
+- ReadArrowJSON 独占 Driver group → group size = 1 → **`should_retry=false`**
+- OOM kill 后直接 FailPendingTask，无 retry 机会
+
+**之前分析的错误**：
+1. 错误地认为 actor worker idle 时归还 lease → 实际上 actor 始终持有 creation lease
+2. 错误地认为 Ray Data ActorPool 的 `max_restarts` 默认为 0 → 实际默认为 -1（无限）
 
 ### 3.7 should_retry 设计意图
 
@@ -525,22 +595,174 @@ Ray 的设计逻辑是：
 | >1 | true | **true** | 同 group 有其他 worker 可以接替工作，retry 有意义 |
 | =1 | true | **false** | kill 后无替代 worker，retry 大概率在同样条件下再次 OOM |
 | 任意 | false | **false** | task 本身不可重试 |
-| idle worker | N/A | **false** | idle worker 没有 task 需要重试 |
+| idle worker（非 actor，无 lease） | N/A | **false** | idle worker 没有 task 需要重试 |
 
-**当 group size=1 时**：kill 掉唯一的 worker 后：
-1. 该 owner 的所有 task 无法继续执行——没有替代 worker
-2. 短期内节点内存压力不会因为 retry 而缓解——retry 会在同节点重新调度同一 task，大概率再次 OOM
-3. Ray 认为这只会导致反复 OOM 循环，不如直接 fail，让上层决定如何处理
+**★ 注意**：actor worker 不会归还 lease，因此不会出现 "idle actor worker 无 lease" 的情况。
+只有非 actor 的 idle worker（如普通 task worker 完成 task 后等待新 task）才可能
+`GetGrantedLeaseId().IsNil()=true`。
 
-**Actor Worker 对 should_retry 判断的影响**（本场景关键）：
+**Actor Worker 对 should_retry 判断的影响**（★ 修正后）：
 
 | MapWorker 状态 | 是否参与分组 | 对 Driver group size 的影响 | should_retry |
 |---|---|---|---|
-| Idle (无 lease) | 不参与（continue 跳过） | 无贡献 → size=1 | **false** |
-| 执行 method, max_restarts=0 | 归入 Nil 组 | 无贡献 → size=1 | **false** |
-| 执行 method, max_restarts>0 | 归入 Driver 组 | 贡献+1 → size≥2 | **true** |
-| 执行 `__init__`, max_restarts=0 | 归入 Nil 组 | 无贡献 → size=1 | **false** |
-| 执行 `__init__`, max_restarts>0 | 归入 Driver 组 | 贡献+1 → size≥2 | **true** |
+| 任意状态（Ray Data 默认 max_restarts=-1） | **始终参与**（持有 lease） | 贡献+1 → size≥2 | **true** |
+| 任意状态（用户设 max_restarts=0） | 归入 Nil 组 | 无贡献 → size=1 | **false** |
+| 任意状态（用户设 max_restarts=N>0） | 归入 Driver 组 | 贡献+1 → size≥2 | **true** |
+
+### 3.8 实际场景中 should_retry=false 的触发条件
+
+#### 3.8.1 关键前提：Killing Policy 按节点独立执行
+
+`GroupByOwnerIdWorkerKillingPolicy` 的 `SelectWorkersToKill` 由每个节点的 raylet 独立调用，
+**只看自己节点上的 worker**。一个节点上的分组结果不受其他节点上 worker 的影响。
+
+因此，即使集群整体有大量 actor worker（`max_restarts=-1`），如果 OOM 发生的节点上
+**没有 actor worker**，该节点的 Driver group 可能只有 1 个 retriable worker。
+
+#### 3.8.2 两个框架的默认配置分析
+
+##### framework runner（qg_v4）
+
+`pipeline/framework/processors/qg_v4.py` 中的 `map_batches` **没有**显式传 `max_restarts`：
+
+```python
+# qg_v4.py:61-79
+cpu_kw = dict(
+    fn_constructor_kwargs={...},
+    batch_format="pandas",
+    num_cpus=int(p.get("cpu_num_cpus", 1)),
+    num_gpus=0,
+    compute=cpu_compute,
+    batch_size=int(p.get("cpu_batch_size", 8)),
+)
+# ↑ 没有 max_restarts → 走 ActorPool 默认 -1（无限重启）
+```
+
+GPU actor 同理（`gpu_kw` 通过 `ctx.helpers.gpu_map_kwargs` 构建，也没有 `max_restarts`）。
+
+**结论**：两套框架默认配置下，`max_restarts=-1`，actor worker 的 `IsRetriable()=true`，
+只要与 ReadArrowJSON 在同一节点，就会归入 Driver group，group size ≥ 2，`should_retry=true`。
+
+##### fs_ray pipeline
+
+`ops/core/feature_service/fs_ray_pipeline.py` 中的 `map_batches(FsRayActor, ...)` 同样
+没有显式传 `max_restarts`，走默认 `-1`。
+
+#### 3.8.3 should_retry=false 的三种触发场景
+
+**场景 1：ReadArrowJSON 独占节点（★ 最可能）**
+
+ReadArrowJSON 通常在数据所在节点执行（locality 亲和），而 CPU/GPU actor 受
+`scheduler_avoid_gpu_nodes` 和 `scheduling_strategy` 调度到不同节点。
+
+```
+节点 A（数据本地节点）：
+  ReadArrowJSON worker → 12.17GB（内存最大，被 kill）
+  （没有 CPU/GPU actor 在此节点）
+
+Killing Policy 分组（只看节点 A 的 worker）：
+  Driver group = [ReadArrowJSON]  → size = 1
+  should_retry = 1 > 1 && true = false
+  → 直接 FailPendingTask → UNRECONSTRUCTABLE
+```
+
+即使集群其他节点上有大量 `max_restarts=-1` 的 actor worker，它们不参与节点 A 的分组。
+
+这是**实际部署中最常见的触发场景**，尤其是：
+- 数据源节点（存储亲和）与计算节点分离
+- ReadArrowJSON 是节点上唯一的 Ray task worker
+- actor 全部被调度到 GPU 节点或其他 CPU 节点
+
+**场景 2：用户显式设置 `max_restarts=0`**
+
+如果用户代码写了 `map_batches(..., max_restarts=0)`，即使 actor 与 ReadArrowJSON
+在同一节点：
+
+```
+节点 A：
+  ReadArrowJSON worker → IsRetriable() = true → Driver group
+  MapWorker (max_restarts=0) → IsRetriable() = false → Nil group
+
+  Driver group = [ReadArrowJSON]  → size = 1
+  should_retry = false
+```
+
+**从两套框架的代码看**：当前都没有显式设 `max_restarts=0`。早期 qg_v4 迁移报告
+提到过 `max_restarts=3`（有限值，仍 retriable），后被移除走默认 `-1`。
+
+**场景 3：idle worker 优先被 kill（跳过分组逻辑）**
+
+Killing Policy 的第一阶段（`worker_killing_policy_group_by_owner.cc:78-101`）：
+**优先 kill 内存超过阈值且无 lease 的 idle worker**，直接返回 `should_retry=false`。
+
+```cpp
+// worker_killing_policy_group_by_owner.cc:78-101
+// 遍历所有 worker，找 GetGrantedLeaseId().IsNil() 的 idle worker
+if (worker->GetGrantedLeaseId().IsNil()) {
+    if (used_memory > idle_worker_killing_memory_threshold_bytes_ && ...) {
+        idle_worker_to_kill = worker;
+    }
+}
+if (idle_worker_to_kill) {
+    return {{idle_worker_to_kill, /*should_retry=*/false}};  // ← 跳过分组
+}
+```
+
+此场景 kill 的是 idle worker 本身（无 lease），不影响正在执行的 retriable task 的
+`should_retry` 判断。但如果后续 OOM 持续触发，进入分组逻辑后仍可能命中场景 1。
+
+#### 3.8.4 should_retry=true 但仍最终失败的场景
+
+Ray Data ActorPool 默认 `max_restarts=-1`，如果 actor 与 ReadArrowJSON 在同节点，
+`should_retry=true`，进入 OOM retry 流程（默认 3 次）：
+
+```
+1. OOM kill → should_retry=true → RetryTaskIfPossible()
+2. num_oom_retries_left_ = 3 → retry
+3. 如果 retry 被调度到同一节点（Ray 默认在同一 raylet 调度）
+   → 再次 OOM → retry → 再次 OOM
+4. 3 次 retry 耗尽 → num_oom_retries_left_ == 0
+   → will_retry = false
+   → FailPendingTask()
+   → task spec 删除 → UNRECONSTRUCTABLE
+```
+
+**与 `should_retry=false` 的区别**：
+- `should_retry=true`：有 3 次 OOM retry 机会，如果调度到其他节点可能成功恢复
+- `should_retry=false`：直接 fail，无任何 retry 机会
+
+**两者最终结果相同**（如果 retry 全部在同节点 OOM），
+但 `should_retry=true` 给了跨节点恢复的可能性。
+
+#### 3.8.5 跨节点 retry 的关键问题
+
+`RetryTaskIfPossible` 重新提交 task 时，Ray 的调度器会根据资源可用性选择节点：
+
+```cpp
+// task_manager.cc:1137-1215 (RetryTaskIfPossible)
+// OOM retry 时：
+if (num_oom_retries_left_ != 0) {
+    will_retry = true;
+    if (num_oom_retries_left_ > 0) {
+        num_oom_retries_left_--;
+    }
+    // 设置 task 为 FAILED → MarkRetry → 重新提交
+    // async_retry_task_callback_ 重新提交到调度队列
+    // 调度器会根据资源可用性选择节点（不一定在 OOM 节点）
+}
+```
+
+如果 OOM 节点仍然内存紧张，调度器会将 task 调度到其他有资源的节点，task 有机会成功执行。
+但如果所有节点都内存紧张，retry 仍会失败。
+
+#### 3.8.6 小结
+
+| 场景 | should_retry | OOM retry 机会 | 最终结果 | 实际概率 |
+|---|---|---|---|---|
+| ReadArrowJSON 独占 OOM 节点 | **false** | 无 | 直接 UNRECONSTRUCTABLE | **高**（数据亲和调度） |
+| 用户设 max_restarts=0 | **false** | 无 | 直接 UNRECONSTRUCTABLE | 低（默认不设） |
+| idle worker 被 kill | **false** | 无 | idle worker 无需 retry | 仅影响 idle worker |
+| actor 与 ReadArrowJSON 同节点（默认配置） | **true** | 3 次 | retry 成功恢复 / retry 耗尽后 UNRECONSTRUCTABLE | 中（取决于跨节点调度） |
 
 ---
 
@@ -1517,18 +1739,34 @@ Status CoreWorker::PutInLocalPlasmaStore(const RayObject &object,
 
 ## 10. 根因总结与修复建议
 
-### 10.1 根因
+### 10.1 根因（★ 修正后）
 
-**直接原因**：`GroupByOwnerIdWorkerKillingPolicy` 中 `should_retry` 的判断条件为 `group.GetAllWorkers().size() > 1 && group.IsRetriable()`。当 ReadArrowJSON->SplitBlocks(7) 在该节点上只有 1 个 worker 时，`should_retry=false`。
+**直接原因**：`GroupByOwnerIdWorkerKillingPolicy` 中 `should_retry` 的判断条件为
+`group.GetAllWorkers().size() > 1 && group.IsRetriable()`。
+
+**Ray Data ActorPool 默认配置下（`max_restarts=-1`）**：
+
+actor worker 与 ReadArrowJSON 同属 Driver group → group size ≥ 2 → `should_retry=true`。
+此时 OOM kill 后会进入 retry 流程（3 次 OOM retry），如果 retry 期间调度到其他内存充足的
+节点，task 可以成功恢复。**但如果 3 次 OOM retry 都失败**（如同节点反复 OOM），
+最终仍会 `FailPendingTask`，结果与 `should_retry=false` 相同。
+
+**用户显式设置 `max_restarts=0` 时**：
+
+actor worker 归入 Nil group → ReadArrowJSON 独占 Driver group → group size = 1 →
+`should_retry=false` → 直接 `FailPendingTask`，无 retry 机会。
 
 **根本原因**：
 1. 节点内存压力达到 95% → OOM Killer 触发
-2. killing policy 选择 ReadArrowJSON->SplitBlocks(7) worker（内存最大的 retriable task worker）
-3. 该 owner group 下只有 1 个 worker → `should_retry=false` → `fail_immediately=true`
-4. Driver CoreWorker 跳过 retry，直接 `FailPendingTask` → 从 `submissible_tasks_` 中删除 task
+2. killing policy 选择 ReadArrowJSON worker（内存最大的 retriable task worker）
+3. 根据分组结果决定 `should_retry`：
+   - 默认配置（`max_restarts=-1`）：`should_retry=true`，有 3 次 OOM retry 机会
+   - 显式 `max_restarts=0`：`should_retry=false`，直接 fail
+4. 如果 retry 全部失败或直接 fail：`FailPendingTask` → 从 `submissible_tasks_` 中删除 task
 5. 所有输出 ObjectRef 被标记为 OUT_OF_MEMORY error object
 6. 下游 StreamingRepartition、MapBatches 级联标记 error
-7. 后续 lineage reconstruction 尝试恢复 → `submissible_tasks_` 中已无 task → `OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED`
+7. 后续 lineage reconstruction 尝试恢复 → `submissible_tasks_` 中已无 task →
+   `OBJECT_UNRECONSTRUCTABLE_MAX_ATTEMPTS_EXCEEDED`
 
 ### 10.2 为什么 spill 机制未生效
 
@@ -1556,8 +1794,10 @@ Eviction Stats:
 | 减小 SplitBlocks 因子 | `additional_split_factor=3` 而非 7 | 减少每个 ReadArrowJSON task 产出的 block 数和内存占用 |
 | 增加节点内存 | 配置更大内存的节点 | 直接解决内存不足 |
 | 调整 OOM 阈值 | `RAY_memory_usage_threshold=0.97` | 延迟 OOM kill 触发 |
-| 确保 group size > 1 | 调整 task 并行度，使同一 owner 下有多个 worker | 让 `should_retry=true`，允许 OOM retry |
+| 确保 group size > 1 | 保持 Ray Data 默认 `max_restarts=-1`（不要设 0） | 让 `should_retry=true`，允许 OOM retry |
+| 增加 OOM retry 次数 | `ray.init(_system_config={"num_oom_retries_default": 5})` | 更多 OOM retry 机会，提高在其他节点恢复的概率 |
 | 启用 object reconstruction | `object_reconstruction_enabled=True` | 在 worker 被杀后通过 lineage reconstruction 恢复丢失的 plasma object |
+| 显式设置 max_restarts | `map_batches(..., max_restarts=-1)`（默认值） | 确保 actor 可重启，归入 Driver group 参与 should_retry 判断 |
 
 ### 10.4 关键代码文件索引
 
